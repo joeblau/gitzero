@@ -20,12 +20,32 @@ export { Workspace } from "./workspace";
 
 const MAX_WEBHOOK_BYTES = 5 * 1024 * 1024;
 const MAX_ONBOARDING_BODY_BYTES = 16 * 1024;
-const acceptedPullRequestActions = new Set([
+export const SUPPORTED_PULL_REQUEST_ACTIONS = [
+  "assigned",
+  "unassigned",
+  "labeled",
+  "unlabeled",
   "opened",
+  "edited",
+  "closed",
   "reopened",
   "synchronize",
+  "converted_to_draft",
+  "locked",
+  "unlocked",
+  "enqueued",
+  "dequeued",
+  "milestoned",
+  "demilestoned",
   "ready_for_review",
-]);
+  "review_requested",
+  "review_request_removed",
+  "auto_merge_enabled",
+  "auto_merge_disabled",
+] as const;
+const acceptedPullRequestActions = new Set<string>(
+  SUPPORTED_PULL_REQUEST_ACTIONS,
+);
 
 const webhookSchema = z.object({
   action: z.string(),
@@ -43,6 +63,7 @@ const webhookSchema = z.object({
   pull_request: z.object({
     number: z.number().int().positive(),
     draft: z.boolean().nullable(),
+    merged: z.boolean(),
     merge_commit_sha: z
       .string()
       .regex(/^[0-9a-fA-F]{40}$/)
@@ -227,7 +248,7 @@ async function handleGitHubWebhook(
   const parsed = createGitHubWebhookJob(
     JSON.parse(new TextDecoder().decode(body)),
   );
-  if (!acceptedPullRequestActions.has(parsed.action) || parsed.draft === true) {
+  if (!acceptedPullRequestActions.has(parsed.action)) {
     return Response.json(
       { accepted: false, reason: "action_not_runnable" },
       { status: 202 },
@@ -305,6 +326,10 @@ export function createGitHubWebhookJob(input: unknown): {
       head_sha: payload.pull_request.head.sha,
       base_sha: payload.pull_request.base.sha,
       merge_sha: payload.pull_request.merge_commit_sha ?? null,
+      execution_ref:
+        payload.action === "closed" && payload.pull_request.merged
+          ? `refs/heads/${payload.pull_request.base.ref}`
+          : `refs/pull/${payload.pull_request.number}/merge`,
       head_ref: payload.pull_request.head.ref,
       base_ref: payload.pull_request.base.ref,
     },

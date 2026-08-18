@@ -575,6 +575,15 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
     const job = parseJob(claim.job_json);
     try {
       let initializedJob = job;
+      if (initializedJob.pull_request.execution_ref === null) {
+        initializedJob = {
+          ...initializedJob,
+          pull_request: {
+            ...initializedJob.pull_request,
+            execution_ref: `refs/pull/${initializedJob.pull_request.number}/merge`,
+          },
+        };
+      }
       if (initializedJob.pull_request.merge_sha === null) {
         if (!initializedJob.requires_github_token) {
           initializedJob = {
@@ -2132,6 +2141,7 @@ function publicJob(job: QueuedJob): Record<string, unknown> {
     pull_request: job.pull_request.number,
     head_sha: executionSha,
     execution_sha: executionSha,
+    execution_ref: job.pull_request.execution_ref,
     pull_request_head_sha: job.pull_request.head_sha,
     check_run_id: job.check_run_id,
   };

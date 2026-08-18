@@ -74,6 +74,7 @@ const checkRunAnnotationsSchema = z.array(
 const pullRequestMergeSchema = z.object({
   head: z.object({ sha: z.string().regex(/^[0-9a-fA-F]{40}$/) }),
   base: z.object({ sha: z.string().regex(/^[0-9a-fA-F]{40}$/) }),
+  merged: z.boolean(),
   mergeable: z.boolean().nullable(),
   merge_commit_sha: z
     .string()
@@ -475,6 +476,9 @@ export async function fetchPullRequestMergeSnapshot(
       current_head_sha: pullRequest.head.sha,
       current_base_sha: pullRequest.base.sha,
     };
+  }
+  if (pullRequest.merged && pullRequest.merge_commit_sha !== null) {
+    return { status: "ready", merge_sha: pullRequest.merge_commit_sha };
   }
   if (pullRequest.mergeable === false) {
     return { status: "conflicted" };

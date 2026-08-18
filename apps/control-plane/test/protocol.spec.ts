@@ -14,8 +14,8 @@ const baseRequest = {
 };
 
 describe("agent protocol", () => {
-  it("requires protocol v10 run assignments to carry an exact merge snapshot", () => {
-    expect(PROTOCOL_VERSION).toBe(10);
+  it("requires protocol v11 run assignments to carry an exact execution snapshot", () => {
+    expect(PROTOCOL_VERSION).toBe(11);
     const queued = queuedJobSchema.parse({
       id: "11111111-1111-4111-8111-111111111111",
       workspace_id: "7001",
@@ -36,16 +36,44 @@ describe("agent protocol", () => {
       check_run_id: null,
     });
     expect(queued.pull_request.merge_sha).toBeNull();
+    expect(queued.pull_request.execution_ref).toBeNull();
     const run = {
       ...queued,
-      pull_request: { ...queued.pull_request, merge_sha: "3".repeat(40) },
+      pull_request: {
+        ...queued.pull_request,
+        merge_sha: "3".repeat(40),
+        execution_ref: "refs/pull/42/merge",
+      },
       checkout_token: "checkout-token",
       github_api_version: "2022-11-28",
     };
     expect(runSpecSchema.parse(run).pull_request.merge_sha).toBe(
       "3".repeat(40),
     );
+    expect(runSpecSchema.parse(run).pull_request.execution_ref).toBe(
+      "refs/pull/42/merge",
+    );
     expect(runSpecSchema.safeParse(queued).success).toBe(false);
+    expect(
+      runSpecSchema.safeParse({
+        ...run,
+        pull_request: {
+          ...run.pull_request,
+          execution_ref: "refs/heads/main\nforged",
+        },
+      }).success,
+    ).toBe(false);
+    for (const executionRef of [
+      "refs/heads/.hidden",
+      "refs/heads/topic.lock/child",
+    ]) {
+      expect(
+        runSpecSchema.safeParse({
+          ...run,
+          pull_request: { ...run.pull_request, execution_ref: executionRef },
+        }).success,
+      ).toBe(false);
+    }
   });
 
   it("requires an explicit bounded repository token purpose", () => {

@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 10;
+export const PROTOCOL_VERSION = 11;
 
 export const repositoryTokenPurposeSchema = z.enum([
   "shared_source",
@@ -77,6 +77,34 @@ const workflowTokenRequestSchema = z
 
 const uuid = z.string().uuid();
 const sha = z.string().regex(/^[0-9a-fA-F]{40}$/);
+const gitExecutionRef = z
+  .string()
+  .min(1)
+  .refine(
+    (value) =>
+      value.startsWith("refs/") &&
+      new TextEncoder().encode(value).byteLength <= 4_096 &&
+      !Array.from(value).some(
+        (character) =>
+          character <= " " ||
+          character === "\u007f" ||
+          "~^:?*[\\".includes(character),
+      ) &&
+      !value.includes("..") &&
+      !value.includes("@{") &&
+      !value.includes("//") &&
+      !value.endsWith(".") &&
+      !value.endsWith("/") &&
+      value
+        .split("/")
+        .every(
+          (component) =>
+            component.length > 0 &&
+            !component.startsWith(".") &&
+            !component.endsWith(".lock"),
+        ),
+    { message: "execution ref must be a valid fully qualified Git ref" },
+  );
 const repositoryComponent = z
   .string()
   .min(1)
@@ -99,6 +127,7 @@ export const pullRequestSchema = z.object({
   head_sha: sha,
   base_sha: sha,
   merge_sha: sha.nullable().default(null),
+  execution_ref: gitExecutionRef.nullable().default(null),
   head_ref: z.string().min(1),
   base_ref: z.string().min(1),
 });
@@ -126,7 +155,10 @@ export const runSpecSchema = queuedJobSchema
     report_to_github: true,
   })
   .extend({
-    pull_request: pullRequestSchema.extend({ merge_sha: sha }),
+    pull_request: pullRequestSchema.extend({
+      merge_sha: sha,
+      execution_ref: gitExecutionRef,
+    }),
     check_run_id: z.number().int().positive().nullable().optional(),
     checkout_token: z.string(),
     environment_token: z.string().default(""),

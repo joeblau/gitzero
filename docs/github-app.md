@@ -3,7 +3,7 @@
 Create a GitHub App with:
 
 - Repository permissions for maximum workflow compatibility: `Actions: write`, `Artifact metadata: write`, `Attestations: write`, `Checks: write`, `Code quality: write`, `Contents: write`, `Deployments: write`, `Discussions: write`, `Environments: read`, `Issues: write`, `Packages: write`, `Pages: write`, `Pull requests: write`, `Code scanning alerts: write`, `Commit statuses: write`, `Dependabot alerts: read`, `Variables: read`, `Metadata: read`, and `Administration: write`. Every installation token still contains only the exact subset and access levels for one job and repository; granting these capabilities to the App does not place them all in a workflow token. Administrative write is used only by the explicitly confirmed repository-onboarding endpoint. Readiness and private shared-source policy checks request only `administration: read`; webhook processing never requests or uses administrative write access.
-- Subscribe to `Pull request` events.
+- Subscribe to `Pull request` events; GitZero admits all current activity types and lets each existing workflow's default trigger or explicit `types:` filter decide whether it runs, including for draft PRs.
 - Webhook URL: `https://<control-plane>/webhooks/github`.
 - A high-entropy webhook secret.
 

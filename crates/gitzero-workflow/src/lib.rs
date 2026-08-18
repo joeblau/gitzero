@@ -2930,13 +2930,52 @@ jobs:
 
     #[test]
     fn honors_pull_request_activity_types() {
+        let activity_types = [
+            "assigned",
+            "unassigned",
+            "labeled",
+            "unlabeled",
+            "opened",
+            "edited",
+            "closed",
+            "reopened",
+            "synchronize",
+            "converted_to_draft",
+            "locked",
+            "unlocked",
+            "enqueued",
+            "dequeued",
+            "milestoned",
+            "demilestoned",
+            "ready_for_review",
+            "review_requested",
+            "review_request_removed",
+            "auto_merge_enabled",
+            "auto_merge_disabled",
+        ];
         let source = WORKFLOW.replace(
             "pull_request:",
-            "pull_request:\n    types: [ready_for_review]",
+            &format!("pull_request:\n    types: [{}]", activity_types.join(", ")),
         );
         let workflow = parse(&source).expect("parse");
-        assert!(!matches_pull_request(&workflow, "opened", "main", None).expect("opened"));
-        assert!(matches_pull_request(&workflow, "ready_for_review", "main", None).expect("ready"));
+        for action in activity_types {
+            assert!(
+                matches_pull_request(&workflow, action, "main", None).expect("activity type"),
+                "did not match {action}"
+            );
+        }
+        assert!(!matches_pull_request(&workflow, "unknown", "main", None).expect("unknown"));
+    }
+
+    #[test]
+    fn defaults_pull_request_to_opened_synchronize_and_reopened() {
+        let workflow = parse(WORKFLOW).expect("parse");
+        for action in ["opened", "synchronize", "reopened"] {
+            assert!(matches_pull_request(&workflow, action, "main", None).expect("default type"));
+        }
+        for action in ["labeled", "ready_for_review", "closed"] {
+            assert!(!matches_pull_request(&workflow, action, "main", None).expect("explicit type"));
+        }
     }
 
     #[test]

@@ -71,7 +71,7 @@ describe("HTTP entrypoint", () => {
     expect(response.status).toBe(404);
   });
 
-  it("acknowledges a signed webhook without waiting for GitHub API work", async () => {
+  it("accepts a signed nondefault activity for a draft PR without waiting for GitHub API work", async () => {
     const privateKey = await testPrivateKeyPem();
     const originalAppId = env.GITHUB_APP_ID;
     const originalPrivateKey = env.GITHUB_APP_PRIVATE_KEY;
@@ -111,7 +111,7 @@ describe("HTTP entrypoint", () => {
     );
 
     const event = {
-      action: "opened",
+      action: "labeled",
       installation: { id: 7101 },
       repository: {
         id: 9001,
@@ -121,7 +121,8 @@ describe("HTTP entrypoint", () => {
       },
       pull_request: {
         number: 42,
-        draft: false,
+        draft: true,
+        merged: false,
         merge_commit_sha: "3".repeat(40),
         head: { sha: "1".repeat(40), ref: "feature/fast-ack" },
         base: { sha: "2".repeat(40), ref: "main" },
@@ -352,7 +353,7 @@ describe("HTTP entrypoint", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 10,
+          protocol_version: 11,
           agent_id: "readiness-mini",
           name: "readiness-mini",
           version: "0.1.0",
@@ -382,6 +383,7 @@ describe("HTTP entrypoint", () => {
             head_sha: headSha,
             base_sha: "4".repeat(40),
             merge_sha: headSha,
+            execution_ref: "refs/pull/42/merge",
             head_ref: "feature/readiness",
             base_ref: "main",
           },

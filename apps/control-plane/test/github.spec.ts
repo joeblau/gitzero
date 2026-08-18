@@ -242,6 +242,7 @@ describe("pull request merge snapshots", () => {
         return Response.json({
           head: { sha: "A".repeat(40) },
           base: { sha: "B".repeat(40) },
+          merged: false,
           mergeable: true,
           merge_commit_sha: "C".repeat(40),
         });
@@ -281,6 +282,7 @@ describe("pull request merge snapshots", () => {
     let response = {
       head: { sha: "1".repeat(40) },
       base: { sha: "2".repeat(40) },
+      merged: false,
       mergeable: null as boolean | null,
       merge_commit_sha: null as string | null,
     };
@@ -312,7 +314,18 @@ describe("pull request merge snapshots", () => {
     await expect(resolve()).resolves.toEqual({ status: "conflicted" });
     response = {
       ...response,
+      merged: true,
+      mergeable: null,
+      merge_commit_sha: "5".repeat(40),
+    };
+    await expect(resolve()).resolves.toEqual({
+      status: "ready",
+      merge_sha: "5".repeat(40),
+    });
+    response = {
+      ...response,
       head: { sha: "4".repeat(40) },
+      merged: false,
       mergeable: true,
       merge_commit_sha: "3".repeat(40),
     };
@@ -978,6 +991,7 @@ function fixtureJob(): QueuedJob {
       head_sha: "1".repeat(40),
       base_sha: "2".repeat(40),
       merge_sha: "3".repeat(40),
+      execution_ref: "refs/pull/42/merge",
       head_ref: "feature/readiness",
       base_ref: "main",
     },

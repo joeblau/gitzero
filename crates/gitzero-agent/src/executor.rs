@@ -223,7 +223,10 @@ struct RunnerTargeting {
 }
 
 enum ExecutionDisposition {
-    Completed(String),
+    Completed {
+        conclusion: Conclusion,
+        summary: String,
+    },
     Rejected(Vec<RunnerRequirement>),
 }
 
@@ -294,12 +297,13 @@ impl Executor {
         validate_sha(&run.pull_request.head_sha)?;
         validate_sha(&run.pull_request.base_sha)?;
         validate_sha(&run.pull_request.merge_sha)?;
+        validate_execution_ref(&run)?;
         let run_dir = self.config.work_root.join(run.id.to_string());
         let repository_dir = run_dir.join("repository");
         prepare_directory(&run_dir).await?;
         tokio::fs::create_dir_all(&repository_dir).await?;
         let repository = format!("{}/{}", run.repository.owner, run.repository.name);
-        let cache_scope = format!("refs/pull/{}/merge", run.pull_request.number);
+        let cache_scope = run.pull_request.execution_ref.clone();
         let workflow_run_backend_id = run.id.to_string();
         let workflow_job_run_backend_id = Uuid::new_v4().to_string();
         let runtime_token =
@@ -384,9 +388,12 @@ impl Executor {
             )
             .await?;
             if plans.is_empty() {
-                return Ok(ExecutionDisposition::Completed(
-                    "No pull_request workflows were found at the PR merge SHA.".to_owned(),
-                ));
+                return Ok(ExecutionDisposition::Completed {
+                    conclusion: Conclusion::Neutral,
+                    summary:
+                        "No workflows matched this pull_request activity at the execution SHA."
+                            .to_owned(),
+                });
             }
 
             let tool_cache = self.config.work_root.join("_toolcache");
@@ -464,9 +471,10 @@ impl Executor {
                 cancelled_jobs.sort();
                 return Err(RunConcurrencyCancelled(cancelled_jobs.join(", ")).into());
             }
-            Ok(ExecutionDisposition::Completed(format!(
-                "GitZero completed {completed_steps} step(s) successfully."
-            )))
+            Ok(ExecutionDisposition::Completed {
+                conclusion: Conclusion::Success,
+                summary: format!("GitZero completed {completed_steps} step(s) successfully."),
+            })
         }
         .await;
         let artifact_shutdown = artifact_service.shutdown().await;
@@ -482,7 +490,10 @@ impl Executor {
         run.environment_token.clear();
 
         let execution = match execution {
-            Ok(ExecutionDisposition::Completed(summary)) => Ok(summary),
+            Ok(ExecutionDisposition::Completed {
+                conclusion,
+                summary,
+            }) => Ok((conclusion, summary)),
             Ok(ExecutionDisposition::Rejected(requirements)) => {
                 let rejection_send = send(
                     &outbound,
@@ -509,7 +520,7 @@ impl Executor {
         };
 
         let (conclusion, summary) = match execution {
-            Ok(summary) => (Conclusion::Success, summary),
+            Ok((conclusion, summary)) => (conclusion, summary),
             Err(_error) if *cancel.borrow() => (Conclusion::Cancelled, "Run cancelled.".to_owned()),
             Err(error) => {
                 if let Some(timeout) = error.downcast_ref::<RunTimedOut>() {
@@ -3878,7 +3889,8 @@ async fn execute_checkout_step_with_repository(
         )?;
         (
             selected_target.commit(run).to_owned(),
-            (selected_target == CheckoutTarget::Merge).then(|| source_repository_dir.to_owned()),
+            (selected_target == CheckoutTarget::Execution)
+                .then(|| source_repository_dir.to_owned()),
             checkout_output_ref(inputs.get("ref"), run),
         )
     } else {
@@ -4102,7 +4114,10 @@ async fn execute_checkout_step_with_repository(
         command.arg("origin");
         if fetch_depth == 0 {
             command.arg("+refs/heads/*:refs/remotes/origin/*");
-            if checkout_repository.same_repository {
+            if checkout_repository.same_repository
+                && run.pull_request.execution_ref
+                    == format!("refs/pull/{}/merge", run.pull_request.number)
+            {
                 command.arg(format!(
                     "+refs/pull/{}/head:refs/remotes/pull/{}/head",
                     run.pull_request.number, run.pull_request.number
@@ -4423,7 +4438,7 @@ async fn finish_cross_repository_checkout(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckoutTarget {
-    Merge,
+    Execution,
     Head,
     Base,
 }
@@ -4431,7 +4446,7 @@ enum CheckoutTarget {
 impl CheckoutTarget {
     fn commit(self, run: &RunSpec) -> &str {
         match self {
-            Self::Merge => &run.pull_request.merge_sha,
+            Self::Execution => &run.pull_request.merge_sha,
             Self::Head => &run.pull_request.head_sha,
             Self::Base => &run.pull_request.base_sha,
         }
@@ -4443,7 +4458,7 @@ fn checkout_output_ref(input: Option<&String>, run: &RunSpec) -> String {
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
     {
-        None => format!("refs/pull/{}/merge", run.pull_request.number),
+        None => run.pull_request.execution_ref.clone(),
         Some(git_ref)
             if git_ref.eq_ignore_ascii_case(&run.pull_request.merge_sha)
                 || git_ref.eq_ignore_ascii_case(&run.pull_request.head_sha)
@@ -4458,9 +4473,9 @@ fn checkout_output_ref(input: Option<&String>, run: &RunSpec) -> String {
 fn checkout_target(git_ref: &str, run: &RunSpec) -> Option<CheckoutTarget> {
     if git_ref.is_empty()
         || git_ref.eq_ignore_ascii_case(&run.pull_request.merge_sha)
-        || git_ref == format!("refs/pull/{}/merge", run.pull_request.number)
+        || git_ref == run.pull_request.execution_ref
     {
-        Some(CheckoutTarget::Merge)
+        Some(CheckoutTarget::Execution)
     } else if git_ref.eq_ignore_ascii_case(&run.pull_request.head_sha)
         || git_ref == run.pull_request.head_ref
         || git_ref == format!("refs/heads/{}", run.pull_request.head_ref)
@@ -6174,7 +6189,8 @@ fn expression_context_with_variables(
     github_token: Option<&str>,
 ) -> Result<EvaluationContext> {
     let repository = format!("{}/{}", run.repository.owner, run.repository.name);
-    let github_ref = format!("refs/pull/{}/merge", run.pull_request.number);
+    let github_ref = run.pull_request.execution_ref.clone();
+    let github_ref_name = execution_ref_name(run);
     let event = github_event(run);
     let actor = event_scalar(&event, "/sender/login");
     let actor_id = event_scalar(&event, "/sender/id");
@@ -6210,7 +6226,7 @@ fn expression_context_with_variables(
             "graphql_url": "https://api.github.com/graphql",
             "sha": run.pull_request.merge_sha,
             "ref": github_ref,
-            "ref_name": format!("{}/merge", run.pull_request.number),
+            "ref_name": github_ref_name,
             "ref_protected": false,
             "ref_type": "branch",
             "head_ref": run.pull_request.head_ref,
@@ -7049,12 +7065,9 @@ async fn github_environment(
         ("GITHUB_SHA".to_owned(), run.pull_request.merge_sha.clone()),
         (
             "GITHUB_REF".to_owned(),
-            format!("refs/pull/{}/merge", run.pull_request.number),
+            run.pull_request.execution_ref.clone(),
         ),
-        (
-            "GITHUB_REF_NAME".to_owned(),
-            format!("{}/merge", run.pull_request.number),
-        ),
+        ("GITHUB_REF_NAME".to_owned(), execution_ref_name(run)),
         ("GITHUB_REF_PROTECTED".to_owned(), "false".to_owned()),
         ("GITHUB_REF_TYPE".to_owned(), "branch".to_owned()),
         (
@@ -7121,8 +7134,8 @@ fn github_workflow_environment(run: &RunSpec, plan: &ExecutionPlan) -> BTreeMap<
         (
             "GITHUB_WORKFLOW_REF".to_owned(),
             format!(
-                "{repository}/{}@refs/pull/{}/merge",
-                plan.workflow_path, run.pull_request.number
+                "{repository}/{}@{}",
+                plan.workflow_path, run.pull_request.execution_ref
             ),
         ),
         (
@@ -7142,6 +7155,8 @@ fn github_event(run: &RunSpec) -> JsonValue {
         "installation": {"id": run.installation_id},
         "pull_request": {
             "number": run.pull_request.number,
+            "merged": run.pull_request.action == "closed"
+                && run.pull_request.execution_ref.starts_with("refs/heads/"),
             "merge_commit_sha": run.pull_request.merge_sha,
             "head": {"sha": run.pull_request.head_sha, "ref": run.pull_request.head_ref},
             "base": {"sha": run.pull_request.base_sha, "ref": run.pull_request.base_ref}
@@ -7524,6 +7539,44 @@ fn validate_sha(value: &str) -> Result<()> {
         bail!("pull request snapshot SHA must be exactly 40 hexadecimal characters");
     }
     Ok(())
+}
+
+fn validate_execution_ref(run: &RunSpec) -> Result<()> {
+    let merge_ref = format!("refs/pull/{}/merge", run.pull_request.number);
+    let base_ref = format!("refs/heads/{}", run.pull_request.base_ref);
+    let valid = run.pull_request.execution_ref == merge_ref
+        || (run.pull_request.action == "closed" && run.pull_request.execution_ref == base_ref);
+    if !valid || !valid_git_ref(&run.pull_request.execution_ref) {
+        bail!(
+            "pull request execution ref must identify its merge ref or the base ref for a closed event"
+        );
+    }
+    Ok(())
+}
+
+fn valid_git_ref(value: &str) -> bool {
+    value.starts_with("refs/")
+        && value.len() <= 4_096
+        && !value.chars().any(|character| {
+            character <= ' ' || character == '\u{7f}' || "~^:?*[\\".contains(character)
+        })
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value.contains("//")
+        && !value.ends_with('.')
+        && !value.ends_with('/')
+        && value.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        })
+}
+
+fn execution_ref_name(run: &RunSpec) -> String {
+    run.pull_request
+        .execution_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| run.pull_request.execution_ref.strip_prefix("refs/pull/"))
+        .unwrap_or(&run.pull_request.execution_ref)
+        .to_owned()
 }
 
 fn runner_arch() -> &'static str {
@@ -9174,7 +9227,7 @@ jobs:
         for git_ref in ["", &run.pull_request.merge_sha, "refs/pull/1/merge"] {
             assert_eq!(
                 checkout_target(git_ref, &run),
-                Some(CheckoutTarget::Merge),
+                Some(CheckoutTarget::Execution),
                 "rejected safe PR-merge alias {git_ref:?}"
             );
         }
@@ -9229,6 +9282,29 @@ jobs:
             checkout_output_ref(Some(&" main ".to_owned()), &run),
             "main"
         );
+
+        run.pull_request.action = "closed".to_owned();
+        run.pull_request.execution_ref = "refs/heads/main".to_owned();
+        assert!(validate_execution_ref(&run).is_ok());
+        assert_eq!(execution_ref_name(&run), "main");
+        assert_eq!(checkout_target("", &run), Some(CheckoutTarget::Execution));
+        assert_eq!(
+            checkout_target("refs/heads/main", &run),
+            Some(CheckoutTarget::Execution)
+        );
+        assert_eq!(checkout_output_ref(None, &run), "refs/heads/main");
+        run.pull_request.execution_ref = "refs/heads/main\nforged".to_owned();
+        assert!(validate_execution_ref(&run).is_err());
+        run.pull_request.base_ref = ".hidden".to_owned();
+        run.pull_request.execution_ref = "refs/heads/.hidden".to_owned();
+        assert!(validate_execution_ref(&run).is_err());
+        run.pull_request.base_ref = "topic.lock/child".to_owned();
+        run.pull_request.execution_ref = "refs/heads/topic.lock/child".to_owned();
+        assert!(validate_execution_ref(&run).is_err());
+        run.pull_request.base_ref = "main".to_owned();
+        run.pull_request.execution_ref = "refs/heads/main".to_owned();
+        run.pull_request.action = "opened".to_owned();
+        assert!(validate_execution_ref(&run).is_err());
     }
 
     #[test]
@@ -12471,7 +12547,7 @@ jobs:
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn executes_the_exact_pull_request_merge_snapshot_by_default() {
+    async fn executes_exact_pull_request_execution_snapshots_and_activity_filters() {
         let fixture = tempfile::tempdir().expect("fixture tempdir");
         let source = fixture.path().join("source");
         let remote = fixture.path().join("remote.git");
@@ -12489,7 +12565,9 @@ jobs:
             source.join(".github/workflows/merge.yml"),
             r#"
 name: Merge snapshot parity
-on: pull_request
+on:
+  pull_request:
+    types: [opened, closed]
 jobs:
   merge:
     runs-on: macos-latest
@@ -12500,14 +12578,14 @@ jobs:
           show-progress: false
       - run: |
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test "$GITHUB_REF" = refs/pull/1/merge
-          test "$GITHUB_REF_NAME" = 1/merge
+          test "$GITHUB_REF" = "$GITZERO_EXPECTED_REF"
+          test "$GITHUB_REF_NAME" = "$GITZERO_EXPECTED_REF_NAME"
           test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
-          test "$GITHUB_WORKFLOW_REF" = local/fixture/.github/workflows/merge.yml@refs/pull/1/merge
+          test "$GITHUB_WORKFLOW_REF" = "local/fixture/.github/workflows/merge.yml@$GITZERO_EXPECTED_REF"
           test "${{ github.sha }}" = "$GITHUB_SHA"
-          test "${{ github.ref }}" = refs/pull/1/merge
+          test "${{ github.ref }}" = "$GITZERO_EXPECTED_REF"
           test "${{ steps.merge.outputs.commit }}" = "$GITHUB_SHA"
-          test "${{ steps.merge.outputs.ref }}" = refs/pull/1/merge
+          test "${{ steps.merge.outputs.ref }}" = "$GITZERO_EXPECTED_REF"
           test -f head-only.txt
           test -f base-only.txt
       - id: head
@@ -12521,7 +12599,7 @@ jobs:
           test -f head-snapshot/head-only.txt
           test ! -e head-snapshot/base-only.txt
           test -z "${{ steps.head.outputs.ref }}"
-          echo exact-merge-snapshot-parity
+          echo "exact-execution-snapshot-parity:$GITHUB_REF"
 "#,
         )
         .expect("merge workflow");
@@ -12572,11 +12650,17 @@ jobs:
         });
         let mut run = fixture_run(
             Uuid::new_v4(),
-            head_sha,
-            base_sha,
+            head_sha.clone(),
+            base_sha.clone(),
             remote.display().to_string(),
         );
-        run.pull_request.merge_sha = merge_sha;
+        run.pull_request.merge_sha = merge_sha.clone();
+        run.environment.insert(
+            "GITZERO_EXPECTED_REF".to_owned(),
+            "refs/pull/1/merge".to_owned(),
+        );
+        run.environment
+            .insert("GITZERO_EXPECTED_REF_NAME".to_owned(), "1/merge".to_owned());
         let (outbound, mut incoming) = mpsc::channel(256);
         let (_cancel_tx, cancel) = watch::channel(false);
 
@@ -12591,7 +12675,7 @@ jobs:
         assert!(events.iter().any(|message| matches!(
             message,
             AgentMessage::LogChunk { data, .. }
-                if data == "exact-merge-snapshot-parity\n"
+                if data == "exact-execution-snapshot-parity:refs/pull/1/merge\n"
         )));
         assert!(events.iter().any(|message| matches!(
             message,
@@ -12599,6 +12683,73 @@ jobs:
                 conclusion: Conclusion::Success,
                 ..
             }
+        )));
+
+        git(&source, ["push", "origin", "merge-snapshot:main"]);
+        let mut closed_run = fixture_run(
+            Uuid::new_v4(),
+            head_sha.clone(),
+            base_sha.clone(),
+            remote.display().to_string(),
+        );
+        closed_run.pull_request.action = "closed".to_owned();
+        closed_run.pull_request.merge_sha = merge_sha.clone();
+        closed_run.pull_request.execution_ref = "refs/heads/main".to_owned();
+        closed_run.environment.insert(
+            "GITZERO_EXPECTED_REF".to_owned(),
+            "refs/heads/main".to_owned(),
+        );
+        closed_run
+            .environment
+            .insert("GITZERO_EXPECTED_REF_NAME".to_owned(), "main".to_owned());
+        let (outbound, mut incoming) = mpsc::channel(256);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        executor
+            .execute(closed_run, cancel, outbound)
+            .await
+            .expect("execute merged closed workflow from the base ref");
+        let mut events = Vec::new();
+        while let Ok(message) = incoming.try_recv() {
+            events.push(message);
+        }
+        assert!(events.iter().any(|message| matches!(
+            message,
+            AgentMessage::LogChunk { data, .. }
+                if data == "exact-execution-snapshot-parity:refs/heads/main\n"
+        )));
+        assert!(events.iter().any(|message| matches!(
+            message,
+            AgentMessage::JobFinished {
+                conclusion: Conclusion::Success,
+                ..
+            }
+        )));
+
+        let mut unmatched_run = fixture_run(
+            Uuid::new_v4(),
+            head_sha,
+            base_sha,
+            remote.display().to_string(),
+        );
+        unmatched_run.pull_request.action = "labeled".to_owned();
+        unmatched_run.pull_request.merge_sha = merge_sha;
+        let (outbound, mut incoming) = mpsc::channel(256);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        executor
+            .execute(unmatched_run, cancel, outbound)
+            .await
+            .expect("complete an unmatched activity neutrally");
+        let mut events = Vec::new();
+        while let Ok(message) = incoming.try_recv() {
+            events.push(message);
+        }
+        assert!(events.iter().any(|message| matches!(
+            message,
+            AgentMessage::JobFinished {
+                conclusion: Conclusion::Neutral,
+                summary,
+                ..
+            } if summary.contains("No workflows matched this pull_request activity")
         )));
     }
 
@@ -13695,6 +13846,7 @@ jobs:
                 number: 1,
                 action: "opened".to_owned(),
                 merge_sha: head_sha.clone(),
+                execution_ref: "refs/pull/1/merge".to_owned(),
                 head_sha,
                 base_sha,
                 head_ref: "feature".to_owned(),

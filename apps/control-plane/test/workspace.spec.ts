@@ -250,6 +250,7 @@ describe("Workspace Durable Object", () => {
           return Response.json({
             head: { sha: "0".repeat(40) },
             base: { sha: "a".repeat(40) },
+            merged: false,
             mergeable: true,
             merge_commit_sha: "b".repeat(40),
           });
@@ -284,6 +285,7 @@ describe("Workspace Durable Object", () => {
               head_sha: "0".repeat(40),
               base_sha: "a".repeat(40),
               merge_sha: "b".repeat(40),
+              execution_ref: "refs/pull/1/merge",
             }),
           }),
         }),
@@ -321,6 +323,7 @@ describe("Workspace Durable Object", () => {
           return Response.json({
             head: { sha: "0".repeat(40) },
             base: { sha: "a".repeat(40) },
+            merged: false,
             mergeable: false,
             merge_commit_sha: null,
           });
@@ -453,7 +456,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 10,
+          protocol_version: 11,
           agent_id: "mini-1",
           name: "Test Mini",
           version: "0.1.0",
@@ -464,7 +467,7 @@ describe("Workspace Durable Object", () => {
     );
 
     const [welcome, assignment] = await messages;
-    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 10 });
+    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 11 });
     expect(assignment).toMatchObject({
       type: "run_job",
       job: {
@@ -751,7 +754,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 10,
+          protocol_version: 11,
           agent_id: "mini-1",
           name: "duplicate",
           version: "0.1.0",
@@ -1591,7 +1594,7 @@ async function connectAgentWithTargeting(
     JSON.stringify({
       type: "hello",
       hello: {
-        protocol_version: 10,
+        protocol_version: 11,
         agent_id: agentId,
         name: agentId,
         version: "0.1.0",
@@ -1703,6 +1706,7 @@ function fixtureJob(workspaceId: string): QueuedJob {
       head_sha: "0123456789012345678901234567890123456789",
       base_sha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
       merge_sha: "1111111111111111111111111111111111111111",
+      execution_ref: "refs/pull/1/merge",
       head_ref: "feature",
       base_ref: "main",
     },

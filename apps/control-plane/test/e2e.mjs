@@ -190,10 +190,11 @@ try {
               },
               pull_request: {
                 number: 1,
-                action: "opened",
+                action: "labeled",
                 head_sha: fixture.headSha,
                 base_sha: fixture.baseSha,
                 merge_sha: fixture.mergeSha,
+                execution_ref: "refs/pull/1/merge",
                 head_ref: "acceptance",
                 base_ref: "main",
               },
@@ -344,7 +345,9 @@ async function createRepositoryFixture(root) {
   await writeFile(
     path.join(workflowDirectory, "acceptance.yml"),
     `name: Local end-to-end acceptance
-on: pull_request
+on:
+  pull_request:
+    types: [labeled]
 jobs:
   roundtrip:
     runs-on:
