@@ -2361,6 +2361,26 @@ fn resolve_reusable_secrets(
     Ok(available)
 }
 
+fn authorized_checkout_secret_values(
+    job: &PlannedJob,
+    managed_secrets: &BTreeMap<String, String>,
+    github_token: Option<&str>,
+) -> Result<BTreeSet<String>> {
+    let mut base_secrets = managed_secrets.clone();
+    if let Some(github_token) = github_token {
+        base_secrets.insert("GITHUB_TOKEN".to_owned(), github_token.to_owned());
+    }
+    Ok(resolve_reusable_secrets(job, &base_secrets)?
+        .into_values()
+        .filter(|value| {
+            !value.is_empty()
+                && managed_secrets
+                    .values()
+                    .any(|managed_value| managed_value == value)
+        })
+        .collect())
+}
+
 fn case_insensitive_secret<'a>(
     secrets: &'a BTreeMap<String, String>,
     requested: &str,
@@ -3277,6 +3297,8 @@ async fn execute_job(
                 job.id
             )
         })?;
+    let checkout_secret_values =
+        authorized_checkout_secret_values(job, &managed_secrets, workflow_token.as_deref())?;
     context = expression_context_with_variables(
         run,
         &runtime_variables,
@@ -3416,6 +3438,7 @@ async fn execute_job(
                     &mut job_summary,
                     workflow_commands,
                     repository_access,
+                    &checkout_secret_values,
                 )
                 .await?;
                 if execution.ran {
@@ -3705,6 +3728,7 @@ async fn execute_step(
     job_summary: &mut JobSummaryBuilder,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
     repository_access: &RunRepositoryAccess,
+    checkout_secret_values: &BTreeSet<String>,
 ) -> Result<StepExecution> {
     let mut step_context = context.clone();
     step_context.extend_json_object(
@@ -3771,6 +3795,7 @@ async fn execute_step(
                 outbound,
                 sequence,
                 repository_access,
+                checkout_secret_values,
             )
             .await;
             let outputs = match checkout {
@@ -3855,6 +3880,7 @@ async fn execute_step(
                 job_summary,
                 workflow_commands,
                 repository_access,
+                checkout_secret_values,
             )
             .await;
         }
@@ -3985,6 +4011,7 @@ async fn execute_checkout_step(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
     repository_access: &RunRepositoryAccess,
+    checkout_secret_values: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, String>> {
     let builtin_token = match context.evaluate_json("github.token")? {
         JsonValue::String(token) => token,
@@ -4037,6 +4064,7 @@ async fn execute_checkout_step(
         outbound,
         sequence,
         repository_access,
+        checkout_secret_values,
     )
     .await
 }
@@ -4058,6 +4086,7 @@ async fn execute_checkout_step_with_repository(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
     repository_access: &RunRepositoryAccess,
+    checkout_secret_values: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, String>> {
     let cross_repository_access = if checkout_repository.same_repository {
         None
@@ -4065,6 +4094,7 @@ async fn execute_checkout_step_with_repository(
         Some(select_cross_repository_checkout_access(
             inputs.get("token").map(String::as_str),
             builtin_token,
+            checkout_secret_values,
         )?)
     };
     let requested_ref = inputs
@@ -4143,7 +4173,11 @@ async fn execute_checkout_step_with_repository(
         (commit, Some(snapshot), public_checkout_output_ref(&git_ref))
     };
     let checkout_token = if checkout_repository.same_repository {
-        select_checkout_token(inputs.get("token").map(String::as_str), builtin_token)?
+        select_checkout_token(
+            inputs.get("token").map(String::as_str),
+            builtin_token,
+            checkout_secret_values,
+        )?
     } else {
         managed_checkout_token.as_deref().unwrap_or("")
     };
@@ -4548,6 +4582,30 @@ async fn materialize_cross_repository_checkout_snapshot(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
 ) -> Result<(String, PathBuf, Option<String>)> {
+    if let CrossRepositoryCheckoutAccess::ExplicitManagedToken(token) = &access {
+        let snapshot = materialize_remote_repository(
+            job_id,
+            step_id,
+            &repository.owner,
+            &repository.name,
+            git_ref,
+            &repository.clone_url,
+            RemoteRepositoryMaterializationScope::CheckoutManaged,
+            Some(token),
+            run_dir,
+            cancel,
+            outbound,
+            sequence,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "checkout repository {}/{}@{git_ref} with an explicit managed secret credential",
+                repository.owner, repository.name
+            )
+        })?;
+        return finish_cross_repository_checkout(snapshot, Some(token.clone())).await;
+    }
     let anonymous = materialize_remote_repository(
         job_id,
         step_id,
@@ -4929,19 +4987,27 @@ async fn configure_sparse_checkout(
     Ok(())
 }
 
-fn select_checkout_token<'a>(input: Option<&'a str>, builtin: &'a str) -> Result<&'a str> {
+fn select_checkout_token<'a>(
+    input: Option<&'a str>,
+    builtin: &'a str,
+    managed_secret_values: &BTreeSet<String>,
+) -> Result<&'a str> {
     match input {
         None => Ok(builtin),
         Some("") => Ok(""),
         Some(token) if token == builtin => Ok(token),
-        Some(_) => bail!("actions/checkout custom token credentials are not supported yet"),
+        Some(token) if managed_secret_values.contains(token) => Ok(token),
+        Some(_) => bail!(
+            "actions/checkout token must be the built-in token, empty, or an exact managed secret value"
+        ),
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum CrossRepositoryCheckoutAccess {
     AnonymousOnly,
     ManagedFallback,
+    ExplicitManagedToken(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4964,13 +5030,17 @@ impl RemoteRepositoryMaterializationScope {
 fn select_cross_repository_checkout_access(
     input: Option<&str>,
     builtin: &str,
+    managed_secret_values: &BTreeSet<String>,
 ) -> Result<CrossRepositoryCheckoutAccess> {
     match input {
         Some("") => Ok(CrossRepositoryCheckoutAccess::AnonymousOnly),
         None => Ok(CrossRepositoryCheckoutAccess::ManagedFallback),
         Some(token) if token == builtin => Ok(CrossRepositoryCheckoutAccess::ManagedFallback),
+        Some(token) if managed_secret_values.contains(token) => Ok(
+            CrossRepositoryCheckoutAccess::ExplicitManagedToken(token.to_owned()),
+        ),
         Some(_) => bail!(
-            "actions/checkout custom token credentials for another repository are not supported yet"
+            "actions/checkout token for another repository must be the built-in token, empty, or an exact managed secret value"
         ),
     }
 }
@@ -5152,6 +5222,7 @@ async fn execute_action_step(
     job_summary: &mut JobSummaryBuilder,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
     repository_access: &RunRepositoryAccess,
+    checkout_secret_values: &BTreeSet<String>,
 ) -> Result<StepExecution> {
     let step_timed_out = Arc::new(AtomicBool::new(false));
     let (effective_cancel, timeout_task) =
@@ -5272,6 +5343,7 @@ async fn execute_action_step(
             job_summary,
             workflow_commands,
             repository_access,
+            checkout_secret_values,
         )
         .await?;
         if job_timed_out.load(Ordering::Acquire) {
@@ -5454,6 +5526,7 @@ async fn execute_composite_action(
     job_summary: &mut JobSummaryBuilder,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
     repository_access: &RunRepositoryAccess,
+    checkout_secret_values: &BTreeSet<String>,
 ) -> Result<ActionPhaseExecution> {
     if definition.runs.main.is_some()
         || definition.runs.pre.is_some()
@@ -5501,6 +5574,7 @@ async fn execute_composite_action(
             job_summary,
             workflow_commands,
             repository_access,
+            checkout_secret_values,
         ))
         .await?;
         steps.insert(
@@ -9197,19 +9271,21 @@ jobs:
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
-    async fn public_cross_repository_checkout_materializes_the_pinned_commit_anonymously() {
+    async fn cross_repository_checkout_pins_anonymous_and_managed_secret_access() {
         let fixture = tempfile::tempdir().expect("fixture tempdir");
         let source = fixture.path().join("public-source");
         let remote = fixture.path().join("public.git");
         let run_dir = fixture.path().join("runs").join(Uuid::new_v4().to_string());
         let first_workspace = run_dir.join("first-workspace");
         let second_workspace = run_dir.join("second-workspace");
+        let managed_workspace = run_dir.join("managed-workspace");
         let source_repository = run_dir.join("repository");
         for directory in [
             &source,
             &run_dir,
             &first_workspace,
             &second_workspace,
+            &managed_workspace,
             &source_repository,
         ] {
             std::fs::create_dir_all(directory).expect("fixture directory");
@@ -9285,6 +9361,7 @@ jobs:
             &outbound,
             &Arc::new(AtomicU64::new(0)),
             &repository_access,
+            &BTreeSet::new(),
         )
         .await
         .expect("first public checkout");
@@ -9321,12 +9398,13 @@ jobs:
             &run_dir,
             &mut second_environment,
             &run.checkout_token,
-            repository,
+            repository.clone(),
             None,
             &cancel,
             &outbound,
             &Arc::new(AtomicU64::new(0)),
             &repository_access,
+            &BTreeSet::new(),
         )
         .await
         .expect("same-run repeated public checkout");
@@ -9338,36 +9416,91 @@ jobs:
             "a moving public ref changed within one PR run"
         );
 
+        let managed_token = "managed-cross-repository-token";
+        let managed_secret_values = BTreeSet::from([managed_token.to_owned()]);
+        register_managed_secret_masks(
+            &workflow_commands,
+            &BTreeMap::from([("CHECKOUT_PAT".to_owned(), managed_token.to_owned())]),
+        );
+        let mut managed_inputs = inputs.clone();
+        managed_inputs.insert("token".to_owned(), managed_token.to_owned());
+        let mut managed_environment = BTreeMap::new();
+        let managed_outputs = execute_checkout_step_with_repository(
+            run.id,
+            "2/managed-checkout",
+            &managed_inputs,
+            &run,
+            &source_repository,
+            &managed_workspace,
+            &run_dir,
+            &mut managed_environment,
+            &run.checkout_token,
+            repository,
+            None,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+            &repository_access,
+            &managed_secret_values,
+        )
+        .await
+        .expect("managed secret checkout");
+        assert_eq!(managed_outputs["commit"], first_commit);
+        assert_eq!(
+            std::fs::read_to_string(managed_workspace.join("dependency.txt"))
+                .expect("managed checked out file"),
+            "public-v1\n"
+        );
+        let credential = STANDARD.encode(format!("x-access-token:{managed_token}"));
+        let expected_credential = format!("AUTHORIZATION: basic {credential}");
+        assert_eq!(
+            managed_environment
+                .get("GIT_CONFIG_VALUE_0")
+                .map(String::as_str),
+            Some(expected_credential.as_str())
+        );
+
         drop(outbound);
         let events = drain.await.expect("join checkout event drain");
         assert!(!events.iter().any(|message| match message {
             AgentMessage::LogChunk { data, .. }
             | AgentMessage::JobFinished { summary: data, .. } => {
-                data.contains(&run.checkout_token)
+                data.contains(&run.checkout_token) || data.contains(managed_token)
             }
             _ => false,
         }));
     }
 
     #[test]
-    fn checkout_only_accepts_the_builtin_or_anonymous_token() {
+    fn checkout_accepts_only_builtin_anonymous_or_exact_managed_secret_tokens() {
+        let managed = BTreeSet::from(["managed-secret".to_owned()]);
         assert_eq!(
-            select_checkout_token(None, "builtin").expect("default token"),
+            select_checkout_token(None, "builtin", &managed).expect("default token"),
             "builtin"
         );
         assert_eq!(
-            select_checkout_token(Some("builtin"), "builtin").expect("explicit built-in token"),
+            select_checkout_token(Some("builtin"), "builtin", &managed)
+                .expect("explicit built-in token"),
             "builtin"
         );
         assert_eq!(
-            select_checkout_token(Some(""), "builtin").expect("anonymous checkout"),
+            select_checkout_token(Some(""), "builtin", &managed).expect("anonymous checkout"),
             ""
         );
-        let error = select_checkout_token(Some("custom-secret"), "builtin")
-            .expect_err("custom token should fail");
+        assert_eq!(
+            select_checkout_token(Some("managed-secret"), "builtin", &managed)
+                .expect("managed secret token"),
+            "managed-secret"
+        );
+        let error = select_checkout_token(Some("custom-secret"), "builtin", &managed)
+            .expect_err("arbitrary token should fail");
         let message = format!("{error:#}");
-        assert!(message.contains("custom token credentials"));
+        assert!(message.contains("exact managed secret value"));
         assert!(!message.contains("custom-secret"));
+        assert!(
+            select_checkout_token(Some("managed-secret-suffix"), "builtin", &managed).is_err(),
+            "a transformed secret value was accepted"
+        );
     }
 
     #[test]
@@ -9410,26 +9543,33 @@ jobs:
             );
         }
 
+        let managed = BTreeSet::from(["private-token".to_owned()]);
         assert_eq!(
-            select_cross_repository_checkout_access(None, "builtin")
+            select_cross_repository_checkout_access(None, "builtin", &managed)
                 .expect("implicit managed fallback"),
             CrossRepositoryCheckoutAccess::ManagedFallback
         );
         assert_eq!(
-            select_cross_repository_checkout_access(Some("builtin"), "builtin")
+            select_cross_repository_checkout_access(Some("builtin"), "builtin", &managed)
                 .expect("explicit built-in managed fallback"),
             CrossRepositoryCheckoutAccess::ManagedFallback
         );
         assert_eq!(
-            select_cross_repository_checkout_access(Some(""), "builtin")
+            select_cross_repository_checkout_access(Some(""), "builtin", &managed)
                 .expect("explicit anonymous checkout"),
             CrossRepositoryCheckoutAccess::AnonymousOnly
         );
-        let error = select_cross_repository_checkout_access(Some("private-token"), "builtin")
-            .expect_err("custom public token should fail");
+        assert_eq!(
+            select_cross_repository_checkout_access(Some("private-token"), "builtin", &managed)
+                .expect("explicit managed credential"),
+            CrossRepositoryCheckoutAccess::ExplicitManagedToken("private-token".to_owned())
+        );
+        let error =
+            select_cross_repository_checkout_access(Some("unknown-token"), "builtin", &managed)
+                .expect_err("arbitrary token should fail");
         let message = format!("{error:#}");
         assert!(message.contains("another repository"));
-        assert!(!message.contains("private-token"));
+        assert!(!message.contains("unknown-token"));
     }
 
     #[test]
@@ -9965,6 +10105,7 @@ jobs:
                     &log_outbound,
                     &Arc::new(AtomicU64::new(0)),
                     &access,
+                    &BTreeSet::new(),
                 )
                 .await;
                 (outputs, environment)
@@ -11441,6 +11582,27 @@ jobs:
         );
         assert!(!values.contains_key("outer_token"));
         assert!(!values.contains_key("UNRELATED"));
+
+        let managed_source = caller_source.replace("secrets.GITHUB_TOKEN", "secrets.API_TOKEN");
+        let managed_plan = compile(&managed_source).expect("compile managed secret chain");
+        let managed_inner_job = managed_plan
+            .jobs
+            .iter()
+            .find(|job| job.base_id.ends_with("inner::build"))
+            .expect("managed inner build job");
+        let checkout_values = authorized_checkout_secret_values(
+            managed_inner_job,
+            &BTreeMap::from([
+                ("API_TOKEN".to_owned(), "managed-checkout-token".to_owned()),
+                ("UNRELATED".to_owned(), "must-not-leak".to_owned()),
+            ]),
+            Some("scoped-github-token"),
+        )
+        .expect("resolve checkout secret authorization");
+        assert_eq!(
+            checkout_values,
+            BTreeSet::from(["managed-checkout-token".to_owned()])
+        );
 
         let unavailable =
             compile(&caller_source.replace("secrets.GITHUB_TOKEN", "secrets.UNAVAILABLE_TOKEN"))
