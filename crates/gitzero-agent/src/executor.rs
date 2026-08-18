@@ -4631,7 +4631,9 @@ async fn execute_checkout_step_with_repository(
     );
 
     let mut managed_checkout_token = None;
-    let (expected_sha, immutable_snapshot, output_ref) = if checkout_repository.same_repository {
+    let (expected_sha, immutable_snapshot, output_ref, checkout_branch) = if checkout_repository
+        .same_repository
+    {
         let selected_target = checkout_target(requested_ref, run).context(
             "actions/checkout ref must identify an authenticated pull-request merge, head, or base snapshot",
         )?;
@@ -4640,6 +4642,7 @@ async fn execute_checkout_step_with_repository(
             (selected_target == CheckoutTarget::Execution)
                 .then(|| source_repository_dir.to_owned()),
             checkout_output_ref(inputs.get("ref"), run),
+            checkout_local_branch(requested_ref, selected_target, run)?,
         )
     } else {
         let git_ref = public_checkout_ref(requested_ref)?;
@@ -4686,7 +4689,12 @@ async fn execute_checkout_step_with_repository(
             .await?
         };
         managed_checkout_token = token;
-        (commit, Some(snapshot), public_checkout_output_ref(&git_ref))
+        (
+            commit,
+            Some(snapshot),
+            public_checkout_output_ref(&git_ref),
+            None,
+        )
     };
     let checkout_token = if checkout_repository.same_repository || ssh_credentials.is_some() {
         select_checkout_token(
@@ -4856,24 +4864,6 @@ async fn execute_checkout_step_with_repository(
     )
     .await?;
 
-    let mut checkout = Command::new("git");
-    checkout
-        .args(["checkout", "--quiet", "--detach", "--force", "FETCH_HEAD"])
-        .current_dir(&checkout_directory)
-        .envs(checkout_environment.iter());
-    run_process(
-        job_id,
-        step_id,
-        &mut checkout,
-        timeout,
-        cancel.clone(),
-        outbound.clone(),
-        sequence.clone(),
-    )
-    .await
-    .map_err(anyhow::Error::from)
-    .context("checkout exact pinned repository snapshot")?;
-
     if fetch_depth == 0 || fetch_depth > 1 || fetch_tags {
         let shallow = if fetch_depth == 0 {
             let output = Command::new("git")
@@ -4940,6 +4930,117 @@ async fn execute_checkout_step_with_repository(
         .await
         .map_err(anyhow::Error::from)
         .context("apply actions/checkout fetch options")?;
+    }
+
+    let checkout_context = if let Some(branch) = checkout_branch.as_deref() {
+        let remote_tracking_ref = format!("refs/remotes/origin/{branch}");
+        let mut update_ref = Command::new("git");
+        update_ref
+            .args(["update-ref", &remote_tracking_ref, &expected_sha])
+            .current_dir(&checkout_directory)
+            .envs(checkout_environment.iter());
+        run_process(
+            job_id,
+            step_id,
+            &mut update_ref,
+            timeout,
+            cancel.clone(),
+            outbound.clone(),
+            sequence.clone(),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .context("pin checkout remote-tracking branch")?;
+
+        let mut checkout = Command::new("git");
+        checkout
+            .args([
+                "checkout",
+                "--quiet",
+                "--force",
+                "-B",
+                branch,
+                &remote_tracking_ref,
+            ])
+            .current_dir(&checkout_directory)
+            .envs(checkout_environment.iter());
+        run_process(
+            job_id,
+            step_id,
+            &mut checkout,
+            timeout,
+            cancel.clone(),
+            outbound.clone(),
+            sequence.clone(),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .context("checkout exact pinned repository branch")?;
+
+        let mut upstream = Command::new("git");
+        upstream
+            .args(["branch", "--quiet"])
+            .arg(format!("--set-upstream-to={remote_tracking_ref}"))
+            .args(["--", branch])
+            .current_dir(&checkout_directory)
+            .envs(checkout_environment.iter());
+        run_process(
+            job_id,
+            step_id,
+            &mut upstream,
+            timeout,
+            cancel.clone(),
+            outbound.clone(),
+            sequence.clone(),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .context("configure checkout branch upstream")?;
+        "verify actions/checkout branch"
+    } else {
+        let mut checkout = Command::new("git");
+        checkout
+            .args(["checkout", "--quiet", "--detach", "--force", &expected_sha])
+            .current_dir(&checkout_directory)
+            .envs(checkout_environment.iter());
+        run_process(
+            job_id,
+            step_id,
+            &mut checkout,
+            timeout,
+            cancel.clone(),
+            outbound.clone(),
+            sequence.clone(),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .context("checkout exact pinned repository snapshot")?;
+        "verify actions/checkout detached HEAD"
+    };
+
+    let symbolic_head = Command::new("git")
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .current_dir(&checkout_directory)
+        .output()
+        .await
+        .with_context(|| checkout_context.to_owned())?;
+    let actual_branch = String::from_utf8_lossy(&symbolic_head.stdout)
+        .trim()
+        .to_owned();
+    match checkout_branch.as_deref() {
+        Some(expected_branch)
+            if !symbolic_head.status.success() || actual_branch != expected_branch =>
+        {
+            bail!(
+                "actions/checkout branch verification failed: expected {expected_branch}, got {actual_branch}"
+            );
+        }
+        None if symbolic_head.status.success() => {
+            bail!(
+                "actions/checkout detached-HEAD verification failed: attached to {actual_branch}"
+            );
+        }
+        _ => {}
     }
     if lfs {
         let mut command = Command::new("git");
@@ -5490,6 +5591,40 @@ fn checkout_target(git_ref: &str, run: &RunSpec) -> Option<CheckoutTarget> {
     } else {
         None
     }
+}
+
+fn checkout_local_branch(
+    git_ref: &str,
+    target: CheckoutTarget,
+    run: &RunSpec,
+) -> Result<Option<String>> {
+    let branch = if target == CheckoutTarget::Head
+        && (git_ref == run.pull_request.head_ref
+            || git_ref == format!("refs/heads/{}", run.pull_request.head_ref))
+    {
+        Some(run.pull_request.head_ref.as_str())
+    } else if (target == CheckoutTarget::Base
+        && (git_ref == run.pull_request.base_ref
+            || git_ref == format!("refs/heads/{}", run.pull_request.base_ref)))
+        || (target == CheckoutTarget::Execution
+            && run.pull_request.execution_ref
+                == format!("refs/heads/{}", run.pull_request.base_ref)
+            && (git_ref.is_empty() || git_ref == run.pull_request.execution_ref))
+    {
+        Some(run.pull_request.base_ref.as_str())
+    } else {
+        None
+    };
+    let Some(branch) = branch else {
+        return Ok(None);
+    };
+    if branch.starts_with('-')
+        || branch == "HEAD"
+        || !valid_git_ref(&format!("refs/heads/{branch}"))
+    {
+        bail!("actions/checkout branch ref is invalid");
+    }
+    Ok(Some(branch.to_owned()))
 }
 
 fn checkout_filter(input: Option<&String>) -> Result<Option<String>> {
@@ -11051,6 +11186,11 @@ jobs:
                 Some(CheckoutTarget::Execution),
                 "rejected safe PR-merge alias {git_ref:?}"
             );
+            assert_eq!(
+                checkout_local_branch(git_ref, CheckoutTarget::Execution, &run)
+                    .expect("valid merge checkout"),
+                None
+            );
         }
         for git_ref in [
             &run.pull_request.head_sha,
@@ -11064,6 +11204,23 @@ jobs:
                 "rejected safe PR-head alias {git_ref:?}"
             );
         }
+        assert_eq!(
+            checkout_local_branch("feature", CheckoutTarget::Head, &run)
+                .expect("valid head branch"),
+            Some("feature".to_owned())
+        );
+        assert_eq!(
+            checkout_local_branch("refs/heads/feature", CheckoutTarget::Head, &run)
+                .expect("valid fully qualified head branch"),
+            Some("feature".to_owned())
+        );
+        for git_ref in [&run.pull_request.head_sha, "refs/pull/1/head"] {
+            assert_eq!(
+                checkout_local_branch(git_ref, CheckoutTarget::Head, &run)
+                    .expect("valid detached head checkout"),
+                None
+            );
+        }
         for git_ref in [&run.pull_request.base_sha, "main", "refs/heads/main"] {
             assert_eq!(
                 checkout_target(git_ref, &run),
@@ -11071,6 +11228,15 @@ jobs:
                 "rejected safe PR-base alias {git_ref:?}"
             );
         }
+        assert_eq!(
+            checkout_local_branch("main", CheckoutTarget::Base, &run).expect("valid base branch"),
+            Some("main".to_owned())
+        );
+        assert_eq!(
+            checkout_local_branch(&run.pull_request.base_sha, CheckoutTarget::Base, &run)
+                .expect("valid detached base checkout"),
+            None
+        );
         for git_ref in [
             "refs/pull/2/head",
             "refs/pull/2/merge",
@@ -11113,6 +11279,16 @@ jobs:
             checkout_target("refs/heads/main", &run),
             Some(CheckoutTarget::Execution)
         );
+        assert_eq!(
+            checkout_local_branch("", CheckoutTarget::Execution, &run)
+                .expect("valid default closed branch"),
+            Some("main".to_owned())
+        );
+        assert_eq!(
+            checkout_local_branch("refs/heads/main", CheckoutTarget::Execution, &run)
+                .expect("valid explicit closed branch"),
+            Some("main".to_owned())
+        );
         assert_eq!(checkout_output_ref(None, &run), "refs/heads/main");
         run.pull_request.execution_ref = "refs/heads/main\nforged".to_owned();
         assert!(validate_execution_ref(&run).is_err());
@@ -11126,6 +11302,12 @@ jobs:
         run.pull_request.execution_ref = "refs/heads/main".to_owned();
         run.pull_request.action = "opened".to_owned();
         assert!(validate_execution_ref(&run).is_err());
+
+        run.pull_request.head_ref = "-feature".to_owned();
+        assert!(
+            checkout_local_branch("-feature", CheckoutTarget::Head, &run).is_err(),
+            "accepted an invalid local branch name"
+        );
     }
 
     #[test]
@@ -14995,6 +15177,13 @@ jobs:
           test "${{ github.ref }}" = "$GITZERO_EXPECTED_REF"
           test "${{ steps.merge.outputs.commit }}" = "$GITHUB_SHA"
           test "${{ steps.merge.outputs.ref }}" = "$GITZERO_EXPECTED_REF"
+          if [[ "$GITZERO_EXPECTED_REF" == refs/heads/* ]]; then
+            test "$(git symbolic-ref --quiet --short HEAD)" = "$GITZERO_EXPECTED_REF_NAME"
+            test "$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" = "origin/$GITZERO_EXPECTED_REF_NAME"
+            test "$(git rev-parse "refs/remotes/origin/$GITZERO_EXPECTED_REF_NAME")" = "$GITHUB_SHA"
+          else
+            test -z "$(git symbolic-ref --quiet --short HEAD || true)"
+          fi
           test -f head-only.txt
           test -f base-only.txt
       - id: head
@@ -15005,6 +15194,7 @@ jobs:
           show-progress: false
       - run: |
           test "$(git -C head-snapshot rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          test -z "$(git -C head-snapshot symbolic-ref --quiet --short HEAD || true)"
           test -f head-snapshot/head-only.txt
           test ! -e head-snapshot/base-only.txt
           test -z "${{ steps.head.outputs.ref }}"
@@ -15491,6 +15681,7 @@ jobs:
           test ! -e README.md
           test ! -e .git
           test "$(git -C nested/repository rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C nested/repository symbolic-ref --quiet --short HEAD || true)"
           touch nested/repository/untracked.tmp
           printf dirty >> nested/repository/README.md
           echo nested-exact-checkout
@@ -15506,6 +15697,7 @@ jobs:
           test ! -e nested/repository/untracked.tmp
           test "$(cat nested/repository/README.md)" = base
           test "$(git -C nested/repository rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C nested/repository symbolic-ref --quiet --short HEAD || true)"
           test -z "${GIT_CONFIG_COUNT+x}"
           echo repeat-checkout-clean
       - name: Cone sparse checkout
@@ -15528,6 +15720,7 @@ jobs:
           test -f sparse-cone/.github/workflows/checkout.yml
           test ! -e sparse-cone/docs/skip.txt
           test "$(git -C sparse-cone rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C sparse-cone symbolic-ref --quiet --short HEAD || true)"
           test "$(git -C sparse-cone config --get remote.origin.promisor)" = true
           test "$(git -C sparse-cone config --get remote.origin.partialclonefilter)" = blob:none
           test "$(git -C sparse-cone rev-list --objects --missing=print HEAD | grep -c '^?')" -gt 0
@@ -15552,6 +15745,10 @@ jobs:
           test ! -e sparse-file/.github
           test "$(git -C sparse-file config --bool --get core.sparseCheckoutCone)" = false
           test "$(git -C sparse-file rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C sparse-file symbolic-ref --quiet --short HEAD)" = feature
+          test "$(git -C sparse-file rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" = origin/feature
+          test "$(git -C sparse-file rev-parse refs/remotes/origin/feature)" = "$GITHUB_SHA"
+          git -C sparse-file push --dry-run
           test "${{ steps.sparse_file.outputs.commit }}" = "$GITHUB_SHA"
           test "${{ steps.sparse_file.outputs.ref }}" = feature
           echo sparse-file-exact
@@ -15568,6 +15765,7 @@ jobs:
           test -f sparse-file/docs/skip.txt
           test -f sparse-file/.github/workflows/checkout.yml
           test "$(git -C sparse-file rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C sparse-file symbolic-ref --quiet --short HEAD || true)"
           test "$(git -C sparse-file config --bool --get core.sparseCheckout || true)" != true
           echo sparse-disabled-full-tree
       - name: Checkout authenticated base snapshot
@@ -15580,10 +15778,27 @@ jobs:
       - name: Verify base snapshot
         run: |
           test "$(git -C base-snapshot rev-parse HEAD)" = "${{ github.event.pull_request.base.sha }}"
+          test -z "$(git -C base-snapshot symbolic-ref --quiet --short HEAD || true)"
           test ! -e base-snapshot/.github/workflows/checkout.yml
           test "${{ steps.base.outputs.commit }}" = "${{ github.event.pull_request.base.sha }}"
           test -z "${{ steps.base.outputs.ref }}"
           echo base-snapshot-exact
+      - name: Checkout authenticated base branch
+        id: base_branch
+        uses: actions/checkout@v6
+        with:
+          path: base-branch
+          ref: ${{ github.base_ref }}
+          fetch-depth: 0
+          show-progress: false
+      - name: Verify base branch
+        run: |
+          test "$(git -C base-branch rev-parse HEAD)" = "${{ github.event.pull_request.base.sha }}"
+          test "$(git -C base-branch symbolic-ref --quiet --short HEAD)" = main
+          test "$(git -C base-branch rev-parse --abbrev-ref --symbolic-full-name '@{upstream}')" = origin/main
+          test "$(git -C base-branch rev-parse refs/remotes/origin/main)" = "${{ github.event.pull_request.base.sha }}"
+          test "${{ steps.base_branch.outputs.ref }}" = main
+          echo base-branch-exact
 "#,
         )
         .expect("workflow file");
@@ -15662,6 +15877,7 @@ jobs:
             "sparse-file-exact\n",
             "sparse-disabled-full-tree\n",
             "base-snapshot-exact\n",
+            "base-branch-exact\n",
         ] {
             assert!(
                 events.iter().any(|message| matches!(
