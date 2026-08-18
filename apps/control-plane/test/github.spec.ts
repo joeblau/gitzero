@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createAgentTokens,
   createCheckRun,
+  createPrivateCheckoutToken,
   createSharedRepositoryToken,
   createWorkflowToken,
   disableRepositoryActions,
@@ -367,6 +368,42 @@ describe("GitHub production API contracts", () => {
     expect(requests).toHaveLength(2);
   });
 
+  it("mints a checkout token scoped only to a same-owner installation repository", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({ url: new URL(String(input)), init });
+        return Response.json({ token: "private-checkout-token" });
+      }),
+    );
+
+    await expect(
+      createPrivateCheckoutToken(
+        {
+          GITHUB_API_VERSION: "2026-03-10",
+          GITHUB_APP_ID: "1234",
+          GITHUB_APP_PRIVATE_KEY: privateKey,
+        },
+        7001,
+        "acme",
+        "widget",
+        "ACME",
+        "private-dependency",
+      ),
+    ).resolves.toBe("private-checkout-token");
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.url.pathname).toBe(
+      "/app/installations/7001/access_tokens",
+    );
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+      repositories: ["private-dependency"],
+      permissions: { contents: "read" },
+    });
+  });
+
   it("rejects cross-owner and same-repository token requests without calling GitHub", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
@@ -394,6 +431,26 @@ describe("GitHub production API contracts", () => {
         "acme",
         "widget",
         "Organization",
+        "ACME",
+        "WIDGET",
+      ),
+    ).rejects.toThrow("different repository");
+    await expect(
+      createPrivateCheckoutToken(
+        environment,
+        7001,
+        "acme",
+        "widget",
+        "another-owner",
+        "private-dependency",
+      ),
+    ).rejects.toThrow("under the caller owner");
+    await expect(
+      createPrivateCheckoutToken(
+        environment,
+        7001,
+        "acme",
+        "widget",
         "ACME",
         "WIDGET",
       ),

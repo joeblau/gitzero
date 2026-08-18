@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import {
   createAgentTokens,
   createCheckRun,
+  createPrivateCheckoutToken,
   createSharedRepositoryToken,
   createWorkflowToken,
   fetchActionsVariables,
@@ -1180,15 +1181,25 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
         }
         const job = parseJob(row.job_json);
         try {
-          const token = await createSharedRepositoryToken(
-            this.env,
-            job.installation_id,
-            job.repository.owner,
-            job.repository.name,
-            eventRepositoryOwnerType(this.eventPayload(job.id)),
-            message.owner,
-            message.repository,
-          );
+          const token =
+            message.purpose === "shared_source"
+              ? await createSharedRepositoryToken(
+                  this.env,
+                  job.installation_id,
+                  job.repository.owner,
+                  job.repository.name,
+                  eventRepositoryOwnerType(this.eventPayload(job.id)),
+                  message.owner,
+                  message.repository,
+                )
+              : await createPrivateCheckoutToken(
+                  this.env,
+                  job.installation_id,
+                  job.repository.owner,
+                  job.repository.name,
+                  message.owner,
+                  message.repository,
+                );
           const stillOwned = this.ctx.storage.sql
             .exec<{ id: string }>(
               `SELECT id FROM jobs
@@ -1208,9 +1219,10 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
         } catch (error) {
           console.error(
             JSON.stringify({
-              message: "shared repository token request denied",
+              message: "repository token request denied",
               jobId: job.id,
               agentId,
+              purpose: message.purpose,
               target: `${message.owner}/${message.repository}`,
               error: truncateDiagnostic(error),
             }),
@@ -1220,7 +1232,9 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
               type: "repository_token_denied",
               request_id: message.request_id,
               reason:
-                "Private repository access was denied. Confirm the target Actions sharing policy and GitHub App installation include this repository.",
+                message.purpose === "shared_source"
+                  ? "Private source access was denied. Confirm the target Actions sharing policy and GitHub App installation include this repository."
+                  : "Private checkout access was denied. Confirm the target has the same owner and the GitHub App installation includes this repository.",
             });
           }
         }

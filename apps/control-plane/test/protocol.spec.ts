@@ -9,6 +9,26 @@ const baseRequest = {
 };
 
 describe("agent protocol", () => {
+  it("requires an explicit bounded repository token purpose", () => {
+    const request = {
+      type: "repository_token_request",
+      message_id: baseRequest.message_id,
+      job_id: baseRequest.job_id,
+      request_id: baseRequest.request_id,
+      owner: "acme",
+      repository: "shared-source",
+    };
+    for (const purpose of ["shared_source", "checkout"] as const) {
+      expect(agentMessageSchema.parse({ ...request, purpose })).toMatchObject({
+        purpose,
+      });
+    }
+    expect(agentMessageSchema.safeParse(request).success).toBe(false);
+    expect(
+      agentMessageSchema.safeParse({ ...request, purpose: "workflow" }).success,
+    ).toBe(false);
+  });
+
   it("accepts disjoint exact workflow read and write permissions", () => {
     expect(
       agentMessageSchema.parse({

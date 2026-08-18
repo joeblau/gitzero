@@ -3,7 +3,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 pub const MAX_RUNNER_LABELS: usize = 32;
 pub const MAX_RUNNER_REQUIREMENTS: usize = 512;
 pub const MAX_RUNNER_SELECTOR_BYTES: usize = 256;
@@ -215,6 +215,7 @@ pub enum AgentMessage {
         message_id: Uuid,
         job_id: Uuid,
         request_id: Uuid,
+        purpose: RepositoryTokenPurpose,
         owner: String,
         repository: String,
     },
@@ -253,6 +254,13 @@ pub enum AgentMessage {
         summary: String,
         annotations: Vec<CheckAnnotation>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryTokenPurpose {
+    SharedSource,
+    Checkout,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,11 +382,13 @@ mod tests {
             message_id: Uuid::new_v4(),
             job_id: Uuid::new_v4(),
             request_id,
+            purpose: RepositoryTokenPurpose::SharedSource,
             owner: "acme".into(),
             repository: "shared-actions".into(),
         };
         let json = serde_json::to_string(&token_request).expect("serialize token request");
         assert!(json.contains(r#""type":"repository_token_request""#));
+        assert!(json.contains(r#""purpose":"shared_source""#));
         assert_eq!(
             serde_json::from_str::<AgentMessage>(&json).expect("deserialize token request"),
             token_request

@@ -306,7 +306,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 8,
+          protocol_version: 9,
           agent_id: "mini-1",
           name: "Test Mini",
           version: "0.1.0",
@@ -317,7 +317,7 @@ describe("Workspace Durable Object", () => {
     );
 
     const [welcome, assignment] = await messages;
-    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 8 });
+    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 9 });
     expect(assignment).toMatchObject({
       type: "run_job",
       job: {
@@ -604,7 +604,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 8,
+          protocol_version: 9,
           agent_id: "mini-1",
           name: "duplicate",
           version: "0.1.0",
@@ -949,6 +949,7 @@ describe("Workspace Durable Object", () => {
           message_id: crypto.randomUUID(),
           job_id: job.id,
           request_id: requestId,
+          purpose: "shared_source",
           owner: "ACME",
           repository: "shared-actions",
         }),
@@ -972,6 +973,32 @@ describe("Workspace Durable Object", () => {
         permissions: { contents: "read" },
       });
 
+      const checkoutRequestId = crypto.randomUUID();
+      const checkoutGranted = collectMessageOfType(
+        agent,
+        "repository_token_granted",
+      );
+      agent.send(
+        JSON.stringify({
+          type: "repository_token_request",
+          message_id: crypto.randomUUID(),
+          job_id: job.id,
+          request_id: checkoutRequestId,
+          purpose: "checkout",
+          owner: "acme",
+          repository: "private-dependency",
+        }),
+      );
+      await expect(checkoutGranted).resolves.toEqual({
+        type: "repository_token_granted",
+        request_id: checkoutRequestId,
+        token: "target-contents-token",
+      });
+      expect(JSON.parse(String(requests[3]?.init?.body))).toEqual({
+        repositories: ["private-dependency"],
+        permissions: { contents: "read" },
+      });
+
       const workflowRequestId = crypto.randomUUID();
       const workflowGranted = collectMessageOfType(
         agent,
@@ -992,7 +1019,7 @@ describe("Workspace Durable Object", () => {
         request_id: workflowRequestId,
         token: "workflow-write-token",
       });
-      expect(JSON.parse(String(requests[3]?.init?.body))).toEqual({
+      expect(JSON.parse(String(requests[4]?.init?.body))).toEqual({
         repositories: ["caller"],
         permissions: { checks: "write", contents: "read" },
       });
@@ -1005,6 +1032,7 @@ describe("Workspace Durable Object", () => {
           message_id: crypto.randomUUID(),
           job_id: job.id,
           request_id: deniedRequestId,
+          purpose: "checkout",
           owner: "another-owner",
           repository: "private-action",
         }),
@@ -1014,7 +1042,7 @@ describe("Workspace Durable Object", () => {
         request_id: deniedRequestId,
         reason: expect.stringContaining("access was denied"),
       });
-      expect(requests).toHaveLength(4);
+      expect(requests).toHaveLength(5);
       agent.close(1000, "test complete");
     } finally {
       Reflect.set(env, "GITHUB_APP_ID", originalAppId);
@@ -1416,7 +1444,7 @@ async function connectAgentWithTargeting(
     JSON.stringify({
       type: "hello",
       hello: {
-        protocol_version: 8,
+        protocol_version: 9,
         agent_id: agentId,
         name: agentId,
         version: "0.1.0",

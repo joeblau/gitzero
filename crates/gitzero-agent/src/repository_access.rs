@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use gitzero_protocol::AgentMessage;
+use gitzero_protocol::{AgentMessage, RepositoryTokenPurpose};
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
@@ -35,6 +35,7 @@ impl RepositoryAccessClient {
     pub(crate) async fn request_token(
         &self,
         run_id: Uuid,
+        purpose: RepositoryTokenPurpose,
         owner: &str,
         repository: &str,
         cancel: &watch::Receiver<bool>,
@@ -46,10 +47,14 @@ impl RepositoryAccessClient {
                 message_id: Uuid::new_v4(),
                 job_id: run_id,
                 request_id,
+                purpose,
                 owner: owner.to_owned(),
                 repository: repository.to_owned(),
             },
-            "private shared repository access",
+            match purpose {
+                RepositoryTokenPurpose::SharedSource => "private shared repository access",
+                RepositoryTokenPurpose::Checkout => "private checkout repository access",
+            },
             cancel,
         )
         .await
@@ -173,7 +178,13 @@ mod tests {
             let client = client.clone();
             tokio::spawn(async move {
                 client
-                    .request_token(run_id, "owner", "shared-actions", &cancel)
+                    .request_token(
+                        run_id,
+                        RepositoryTokenPurpose::SharedSource,
+                        "owner",
+                        "shared-actions",
+                        &cancel,
+                    )
                     .await
             })
         };
@@ -181,11 +192,13 @@ mod tests {
             AgentMessage::RepositoryTokenRequest {
                 job_id,
                 request_id,
+                purpose,
                 owner,
                 repository,
                 ..
             } => {
                 assert_eq!(job_id, run_id);
+                assert_eq!(purpose, RepositoryTokenPurpose::SharedSource);
                 assert_eq!(owner, "owner");
                 assert_eq!(repository, "shared-actions");
                 request_id
@@ -211,12 +224,25 @@ mod tests {
             let client = client.clone();
             tokio::spawn(async move {
                 client
-                    .request_token(run_id, "owner", "private", &cancel)
+                    .request_token(
+                        run_id,
+                        RepositoryTokenPurpose::Checkout,
+                        "owner",
+                        "private",
+                        &cancel,
+                    )
                     .await
             })
         };
         let request_id = match events.recv().await.expect("token request") {
-            AgentMessage::RepositoryTokenRequest { request_id, .. } => request_id,
+            AgentMessage::RepositoryTokenRequest {
+                request_id,
+                purpose,
+                ..
+            } => {
+                assert_eq!(purpose, RepositoryTokenPurpose::Checkout);
+                request_id
+            }
             message => panic!("unexpected event: {message:?}"),
         };
         client

@@ -19,7 +19,8 @@ use gitzero_protocol::{
     AgentMessage, CheckAnnotation, CheckAnnotationLevel, Conclusion, ConcurrencyQueue, LogStream,
     MAX_CHECK_ANNOTATION_MESSAGE_BYTES, MAX_CHECK_ANNOTATION_PATH_BYTES,
     MAX_CHECK_ANNOTATION_TITLE_BYTES, MAX_CHECK_ANNOTATIONS, MAX_RUNNER_LABELS,
-    MAX_RUNNER_REQUIREMENTS, MAX_RUNNER_SELECTOR_BYTES, RunSpec, RunnerRequirement,
+    MAX_RUNNER_REQUIREMENTS, MAX_RUNNER_SELECTOR_BYTES, RepositoryTokenPurpose, RunSpec,
+    RunnerRequirement,
 };
 use gitzero_workflow::{
     ExecutionPlan, MAX_UNIQUE_REUSABLE_WORKFLOWS, PlannedConcurrency, PlannedConcurrencyQueue,
@@ -74,7 +75,7 @@ const MAX_SPARSE_CHECKOUT_BYTES: usize = 128 * 1_024;
 // byte to a six-character Unicode escape, so keep the response bounded above
 // that legitimate worst case.
 const MAX_GITHUB_API_RESPONSE_BYTES: usize = 10 * 1_024 * 1_024;
-const MAX_SHARED_REPOSITORIES_PER_RUN: usize = 256;
+const MAX_REPOSITORY_TOKENS_PER_RUN: usize = 256;
 const MAX_WORKFLOW_TOKEN_SCOPES_PER_RUN: usize = 256;
 
 type EnvironmentVariableCache = Arc<Mutex<BTreeMap<String, BTreeMap<String, String>>>>;
@@ -82,7 +83,7 @@ type EnvironmentVariableCache = Arc<Mutex<BTreeMap<String, BTreeMap<String, Stri
 #[derive(Clone)]
 struct RunRepositoryAccess {
     client: RepositoryAccessClient,
-    tokens: Arc<Mutex<BTreeMap<String, String>>>,
+    tokens: Arc<Mutex<BTreeMap<(RepositoryTokenPurpose, String), String>>>,
     workflow_tokens: Arc<Mutex<BTreeMap<PlannedPermissions, String>>>,
     workflow_commands: Arc<StdMutex<WorkflowCommandProcessor>>,
 }
@@ -100,23 +101,29 @@ impl RunRepositoryAccess {
         }
     }
 
-    async fn cached_token(&self, owner: &str, repository: &str) -> Option<String> {
+    async fn cached_token(
+        &self,
+        purpose: RepositoryTokenPurpose,
+        owner: &str,
+        repository: &str,
+    ) -> Option<String> {
         self.tokens
             .lock()
             .await
-            .get(&repository_access_key(owner, repository))
+            .get(&(purpose, repository_access_key(owner, repository)))
             .cloned()
     }
 
     async fn request_token(
         &self,
         run_id: Uuid,
+        purpose: RepositoryTokenPurpose,
         owner: &str,
         repository: &str,
         refresh: bool,
         cancel: &watch::Receiver<bool>,
     ) -> Result<String> {
-        let key = repository_access_key(owner, repository);
+        let key = (purpose, repository_access_key(owner, repository));
         let mut tokens = self.tokens.lock().await;
         if refresh {
             if let Some(mut token) = tokens.remove(&key) {
@@ -125,14 +132,14 @@ impl RunRepositoryAccess {
         } else if let Some(token) = tokens.get(&key) {
             return Ok(token.clone());
         }
-        if tokens.len() >= MAX_SHARED_REPOSITORIES_PER_RUN {
+        if tokens.len() >= MAX_REPOSITORY_TOKENS_PER_RUN {
             bail!(
-                "workflow references more than {MAX_SHARED_REPOSITORIES_PER_RUN} private shared repositories"
+                "workflow requests more than {MAX_REPOSITORY_TOKENS_PER_RUN} private repository tokens"
             );
         }
         let token = self
             .client
-            .request_token(run_id, owner, repository, cancel)
+            .request_token(run_id, purpose, owner, repository, cancel)
             .await?;
         register_repository_token_masks(&self.workflow_commands, &token);
         tokens.insert(key, token.clone());
@@ -3522,6 +3529,7 @@ async fn execute_step(
                 cancel,
                 outbound,
                 sequence,
+                repository_access,
             )
             .await;
             let outputs = match checkout {
@@ -3561,7 +3569,7 @@ async fn execute_step(
                     step_id: step_id.clone(),
                     sequence: sequence.fetch_add(1, Ordering::Relaxed),
                     stream: LogStream::System,
-                    data: "Checked out the exact authenticated pull-request snapshot.\n".to_owned(),
+                    data: "Checked out the exact pinned repository snapshot.\n".to_owned(),
                 },
             )
             .await?;
@@ -3735,6 +3743,7 @@ async fn execute_checkout_step(
     cancel: &watch::Receiver<bool>,
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
+    repository_access: &RunRepositoryAccess,
 ) -> Result<BTreeMap<String, String>> {
     let builtin_token = match context.evaluate_json("github.token")? {
         JsonValue::String(token) => token,
@@ -3786,6 +3795,7 @@ async fn execute_checkout_step(
         cancel,
         outbound,
         sequence,
+        repository_access,
     )
     .await
 }
@@ -3806,11 +3816,15 @@ async fn execute_checkout_step_with_repository(
     cancel: &watch::Receiver<bool>,
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
+    repository_access: &RunRepositoryAccess,
 ) -> Result<BTreeMap<String, String>> {
-    let checkout_token = if checkout_repository.same_repository {
-        select_checkout_token(inputs.get("token").map(String::as_str), builtin_token)?
+    let cross_repository_access = if checkout_repository.same_repository {
+        None
     } else {
-        select_public_checkout_token(inputs.get("token").map(String::as_str), builtin_token)?
+        Some(select_cross_repository_checkout_access(
+            inputs.get("token").map(String::as_str),
+            builtin_token,
+        )?)
     };
     let requested_ref = inputs
         .get("ref")
@@ -3857,6 +3871,7 @@ async fn execute_checkout_step_with_repository(
         bail!("actions/checkout submodules must be false, true, or recursive");
     }
 
+    let mut managed_checkout_token = None;
     let (expected_sha, immutable_snapshot, output_ref) = if checkout_repository.same_repository {
         let selected_target = checkout_target(requested_ref, run).context(
             "actions/checkout ref must identify an authenticated pull-request head or base snapshot",
@@ -3869,18 +3884,27 @@ async fn execute_checkout_step_with_repository(
         )
     } else {
         let git_ref = public_checkout_ref(requested_ref)?;
-        let (commit, snapshot) = materialize_public_checkout_snapshot(
+        let (commit, snapshot, token) = materialize_cross_repository_checkout_snapshot(
             job_id,
             step_id,
             &checkout_repository,
             &git_ref,
+            run,
+            repository_access,
+            cross_repository_access.expect("cross-repository access mode"),
             run_dir,
             cancel,
             outbound,
             sequence,
         )
         .await?;
+        managed_checkout_token = token;
         (commit, Some(snapshot), public_checkout_output_ref(&git_ref))
+    };
+    let checkout_token = if checkout_repository.same_repository {
+        select_checkout_token(inputs.get("token").map(String::as_str), builtin_token)?
+    } else {
+        managed_checkout_token.as_deref().unwrap_or("")
     };
 
     let mut checkout_environment = environment.clone();
@@ -4263,45 +4287,135 @@ fn public_checkout_output_ref(git_ref: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn materialize_public_checkout_snapshot(
+async fn materialize_cross_repository_checkout_snapshot(
     job_id: Uuid,
     step_id: &str,
     repository: &CheckoutRepository,
     git_ref: &str,
+    run: &RunSpec,
+    repository_access: &RunRepositoryAccess,
+    access: CrossRepositoryCheckoutAccess,
     run_dir: &Path,
     cancel: &watch::Receiver<bool>,
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
-) -> Result<(String, PathBuf)> {
-    let snapshot = materialize_remote_repository(
+) -> Result<(String, PathBuf, Option<String>)> {
+    let anonymous = materialize_remote_repository(
         job_id,
         step_id,
         &repository.owner,
         &repository.name,
         git_ref,
         &repository.clone_url,
+        RemoteRepositoryMaterializationScope::CheckoutAnonymous,
         None,
         run_dir,
         cancel,
         outbound,
         sequence,
     )
-    .await
-    .with_context(|| {
-        format!(
-            "checkout public repository {}/{}@{git_ref}",
-            repository.owner, repository.name
-        )
-    })?;
+    .await;
+    let (snapshot, token) = match anonymous {
+        Ok(snapshot) => (snapshot, None),
+        Err(error) if access == CrossRepositoryCheckoutAccess::AnonymousOnly => {
+            return Err(error).with_context(|| {
+                format!(
+                    "checkout repository {}/{}@{git_ref} anonymously",
+                    repository.owner, repository.name
+                )
+            });
+        }
+        Err(error) if !repository.owner.eq_ignore_ascii_case(&run.repository.owner) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "checkout repository {}/{}@{git_ref} anonymously; managed private checkout requires the caller owner {}",
+                    repository.owner, repository.name, run.repository.owner
+                )
+            });
+        }
+        Err(anonymous_error) => {
+            let cached = repository_access
+                .cached_token(
+                    RepositoryTokenPurpose::Checkout,
+                    &repository.owner,
+                    &repository.name,
+                )
+                .await;
+            if let Some(token) = cached.as_deref()
+                && let Ok(snapshot) = materialize_remote_repository(
+                    job_id,
+                    step_id,
+                    &repository.owner,
+                    &repository.name,
+                    git_ref,
+                    &repository.clone_url,
+                    RemoteRepositoryMaterializationScope::CheckoutManaged,
+                    Some(token),
+                    run_dir,
+                    cancel,
+                    outbound,
+                    sequence,
+                )
+                .await
+            {
+                return finish_cross_repository_checkout(snapshot, Some(token.to_owned())).await;
+            }
+            let token = repository_access
+                .request_token(
+                    run.id,
+                    RepositoryTokenPurpose::Checkout,
+                    &repository.owner,
+                    &repository.name,
+                    cached.is_some(),
+                    cancel,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "checkout {}/{}@{git_ref} without anonymous access: {anonymous_error:#}",
+                        repository.owner, repository.name
+                    )
+                })?;
+            let snapshot = materialize_remote_repository(
+                job_id,
+                step_id,
+                &repository.owner,
+                &repository.name,
+                git_ref,
+                &repository.clone_url,
+                RemoteRepositoryMaterializationScope::CheckoutManaged,
+                Some(&token),
+                run_dir,
+                cancel,
+                outbound,
+                sequence,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "checkout private repository {}/{}@{git_ref}",
+                    repository.owner, repository.name
+                )
+            })?;
+            (snapshot, Some(token))
+        }
+    };
+    finish_cross_repository_checkout(snapshot, token).await
+}
+
+async fn finish_cross_repository_checkout(
+    snapshot: PathBuf,
+    token: Option<String>,
+) -> Result<(String, PathBuf, Option<String>)> {
     let commit = git_output(
         Command::new("git")
             .args(["rev-parse", "--verify", "HEAD^{commit}"])
             .current_dir(&snapshot),
-        "resolve public checkout commit",
+        "resolve cross-repository checkout commit",
     )
     .await?;
     validate_remote_commit(&commit)?;
-    Ok((commit, snapshot))
+    Ok((commit, snapshot, token))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4569,10 +4683,37 @@ fn select_checkout_token<'a>(input: Option<&'a str>, builtin: &'a str) -> Result
     }
 }
 
-fn select_public_checkout_token<'a>(input: Option<&'a str>, builtin: &'a str) -> Result<&'a str> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CrossRepositoryCheckoutAccess {
+    AnonymousOnly,
+    ManagedFallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteRepositoryMaterializationScope {
+    SharedSource,
+    CheckoutAnonymous,
+    CheckoutManaged,
+}
+
+impl RemoteRepositoryMaterializationScope {
+    fn directory_name(self) -> &'static str {
+        match self {
+            Self::SharedSource => "shared-source",
+            Self::CheckoutAnonymous => "checkout-anonymous",
+            Self::CheckoutManaged => "checkout-managed",
+        }
+    }
+}
+
+fn select_cross_repository_checkout_access(
+    input: Option<&str>,
+    builtin: &str,
+) -> Result<CrossRepositoryCheckoutAccess> {
     match input {
-        None | Some("") => Ok(""),
-        Some(token) if token == builtin => Ok(""),
+        Some("") => Ok(CrossRepositoryCheckoutAccess::AnonymousOnly),
+        None => Ok(CrossRepositoryCheckoutAccess::ManagedFallback),
+        Some(token) if token == builtin => Ok(CrossRepositoryCheckoutAccess::ManagedFallback),
         Some(_) => bail!(
             "actions/checkout custom token credentials for another repository are not supported yet"
         ),
@@ -5350,7 +5491,9 @@ async fn materialize_remote_repository_with_shared_access(
     let cached_token = if same_repository {
         (!run.checkout_token.is_empty()).then(|| run.checkout_token.clone())
     } else {
-        repository_access.cached_token(owner, repository).await
+        repository_access
+            .cached_token(RepositoryTokenPurpose::SharedSource, owner, repository)
+            .await
     };
     let first = materialize_remote_repository(
         job_id,
@@ -5359,6 +5502,7 @@ async fn materialize_remote_repository_with_shared_access(
         repository,
         git_ref,
         remote,
+        RemoteRepositoryMaterializationScope::SharedSource,
         cached_token.as_deref(),
         run_dir,
         cancel,
@@ -5374,6 +5518,7 @@ async fn materialize_remote_repository_with_shared_access(
     let token = repository_access
         .request_token(
             run.id,
+            RepositoryTokenPurpose::SharedSource,
             owner,
             repository,
             cached_token.is_some(),
@@ -5392,6 +5537,7 @@ async fn materialize_remote_repository_with_shared_access(
         repository,
         git_ref,
         remote,
+        RemoteRepositoryMaterializationScope::SharedSource,
         Some(&token),
         run_dir,
         cancel,
@@ -5409,6 +5555,7 @@ async fn materialize_remote_repository(
     repository: &str,
     git_ref: &str,
     remote: &str,
+    scope: RemoteRepositoryMaterializationScope,
     checkout_token: Option<&str>,
     run_dir: &Path,
     cancel: &watch::Receiver<bool>,
@@ -5421,6 +5568,7 @@ async fn materialize_remote_repository(
         .join(sanitize_id(
             step_id.rsplit_once('/').map_or("job", |(job, _)| job),
         ))
+        .join(scope.directory_name())
         .join(owner)
         .join(repository)
         .join(&encoded_ref);
@@ -5450,6 +5598,26 @@ async fn materialize_remote_repository(
         .join(&encoded_ref);
     let mut commit = read_cached_remote_resolution(&cache, &resolution).await?;
     let resolution_hit = commit.is_some();
+    if resolution_hit && checkout_token.is_none() {
+        let mut probe = Command::new("git");
+        probe
+            .arg("--git-dir")
+            .arg(&cache)
+            .args(["ls-remote", "--quiet", "origin", "HEAD"])
+            .env("GIT_TERMINAL_PROMPT", "0");
+        run_process(
+            job_id,
+            step_id,
+            &mut probe,
+            None,
+            cancel.clone(),
+            outbound.clone(),
+            sequence.clone(),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("verify anonymous access to {owner}/{repository}"))?;
+    }
     if commit.is_none() {
         let mut fetch = Command::new("git");
         fetch
@@ -8750,6 +8918,8 @@ jobs:
         ]);
         let (_cancel_tx, cancel) = watch::channel(false);
         let (outbound, mut incoming) = mpsc::channel(256);
+        let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let repository_access = local_repository_access(&workflow_commands);
         let drain = tokio::spawn(async move {
             let mut events = Vec::new();
             while let Some(message) = incoming.recv().await {
@@ -8774,6 +8944,7 @@ jobs:
             &cancel,
             &outbound,
             &Arc::new(AtomicU64::new(0)),
+            &repository_access,
         )
         .await
         .expect("first public checkout");
@@ -8815,6 +8986,7 @@ jobs:
             &cancel,
             &outbound,
             &Arc::new(AtomicU64::new(0)),
+            &repository_access,
         )
         .await
         .expect("same-run repeated public checkout");
@@ -8859,7 +9031,7 @@ jobs:
     }
 
     #[test]
-    fn cross_repository_checkout_is_public_validated_and_anonymous() {
+    fn cross_repository_checkout_validates_access_modes_and_repository_identity() {
         let run = fixture_run(
             Uuid::nil(),
             "a".repeat(40),
@@ -8899,20 +9071,21 @@ jobs:
         }
 
         assert_eq!(
-            select_public_checkout_token(None, "builtin").expect("implicit public token"),
-            ""
+            select_cross_repository_checkout_access(None, "builtin")
+                .expect("implicit managed fallback"),
+            CrossRepositoryCheckoutAccess::ManagedFallback
         );
         assert_eq!(
-            select_public_checkout_token(Some("builtin"), "builtin")
-                .expect("explicit built-in public token"),
-            ""
+            select_cross_repository_checkout_access(Some("builtin"), "builtin")
+                .expect("explicit built-in managed fallback"),
+            CrossRepositoryCheckoutAccess::ManagedFallback
         );
         assert_eq!(
-            select_public_checkout_token(Some(""), "builtin")
-                .expect("explicit anonymous public token"),
-            ""
+            select_cross_repository_checkout_access(Some(""), "builtin")
+                .expect("explicit anonymous checkout"),
+            CrossRepositoryCheckoutAccess::AnonymousOnly
         );
-        let error = select_public_checkout_token(Some("private-token"), "builtin")
+        let error = select_cross_repository_checkout_access(Some("private-token"), "builtin")
             .expect_err("custom public token should fail");
         let message = format!("{error:#}");
         assert!(message.contains("another repository"));
@@ -9099,6 +9272,312 @@ jobs:
         assert!(!log.contains(token));
         assert!(!log.contains(&credential));
         assert!(commands.value_is_masked_for_step("0/job/step", token));
+    }
+
+    #[tokio::test]
+    async fn repository_token_cache_is_separated_by_purpose() {
+        let commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let (outbound, mut events) = mpsc::channel(4);
+        let client = RepositoryAccessClient::remote(outbound);
+        let access = RunRepositoryAccess::new(client.clone(), commands.clone());
+        let run_id = Uuid::new_v4();
+        let (_cancel_tx, cancel) = watch::channel(false);
+
+        for (purpose, granted_token) in [
+            (RepositoryTokenPurpose::SharedSource, "shared-source-token"),
+            (RepositoryTokenPurpose::Checkout, "private-checkout-token"),
+        ] {
+            let request = {
+                let access = access.clone();
+                let cancel = cancel.clone();
+                tokio::spawn(async move {
+                    access
+                        .request_token(run_id, purpose, "acme", "private-tools", false, &cancel)
+                        .await
+                })
+            };
+            let request_id = match events.recv().await.expect("repository token request") {
+                AgentMessage::RepositoryTokenRequest {
+                    request_id,
+                    purpose: requested_purpose,
+                    ..
+                } => {
+                    assert_eq!(requested_purpose, purpose);
+                    request_id
+                }
+                message => panic!("unexpected event: {message:?}"),
+            };
+            client
+                .handle_granted(request_id, granted_token.to_owned())
+                .await;
+            assert_eq!(
+                request.await.expect("join token request").expect("token"),
+                granted_token
+            );
+        }
+
+        assert_eq!(
+            access
+                .cached_token(
+                    RepositoryTokenPurpose::SharedSource,
+                    "ACME",
+                    "PRIVATE-TOOLS",
+                )
+                .await
+                .as_deref(),
+            Some("shared-source-token")
+        );
+        assert_eq!(
+            access
+                .cached_token(RepositoryTokenPurpose::Checkout, "acme", "private-tools")
+                .await
+                .as_deref(),
+            Some("private-checkout-token")
+        );
+        assert!(events.try_recv().is_err());
+        let mut log = "shared-source-token private-checkout-token".to_owned();
+        commands
+            .lock()
+            .expect("workflow command processor was poisoned")
+            .mask_for_step("0/job/step", &mut log);
+        assert_eq!(log, "*** ***");
+    }
+
+    #[tokio::test]
+    async fn private_checkout_falls_back_with_checkout_purpose_after_anonymous_failure() {
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let source = fixture.path().join("source");
+        let remote = fixture.path().join("private.git");
+        let run_dir = fixture.path().join("runs").join(Uuid::new_v4().to_string());
+        let workspace = run_dir.join("workspace");
+        let source_repository = run_dir.join("repository");
+        for directory in [&source, &run_dir, &workspace, &source_repository] {
+            std::fs::create_dir_all(directory).expect("fixture directory");
+        }
+        git(&source, ["init", "--initial-branch=main"]);
+        git(&source, ["config", "user.email", "gitzero@example.test"]);
+        git(&source, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(source.join("private.txt"), "managed private checkout\n")
+            .expect("private fixture file");
+        git(&source, ["add", "private.txt"]);
+        git(&source, ["commit", "-m", "private fixture"]);
+        let expected_commit = git_output(&source, ["rev-parse", "HEAD"]);
+        git(
+            fixture.path(),
+            ["init", "--bare", remote.to_str().expect("remote path")],
+        );
+        git(
+            &source,
+            [
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        git(&source, ["push", "origin", "main"]);
+
+        let mut run = fixture_run(
+            Uuid::new_v4(),
+            "a".repeat(40),
+            "b".repeat(40),
+            "https://github.com/acme/widget.git".to_owned(),
+        );
+        run.repository.owner = "acme".to_owned();
+        run.repository.name = "widget".to_owned();
+        run.checkout_token = "source-repository-token".to_owned();
+        let repository = CheckoutRepository {
+            owner: "ACME".to_owned(),
+            name: "private-tools".to_owned(),
+            clone_url: remote.display().to_string(),
+            same_repository: false,
+        };
+        let inputs = BTreeMap::from([
+            ("ref".to_owned(), "main".to_owned()),
+            ("show-progress".to_owned(), "false".to_owned()),
+            ("token".to_owned(), run.checkout_token.clone()),
+        ]);
+        let anonymous_scope = run_dir.join("_actions/0/checkout-anonymous");
+        std::fs::create_dir_all(anonymous_scope.parent().expect("scope parent"))
+            .expect("anonymous scope parent");
+        std::fs::write(&anonymous_scope, "force anonymous materialization failure")
+            .expect("block anonymous scope");
+        let commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let (control_outbound, mut control_events) = mpsc::channel(4);
+        let client = RepositoryAccessClient::remote(control_outbound);
+        let access = RunRepositoryAccess::new(client.clone(), commands.clone());
+        let (log_outbound, mut log_events) = mpsc::channel(256);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let checkout = {
+            let run = run.clone();
+            let repository = repository.clone();
+            let inputs = inputs.clone();
+            let run_dir = run_dir.clone();
+            let workspace = workspace.clone();
+            let source_repository = source_repository.clone();
+            let cancel = cancel.clone();
+            let log_outbound = log_outbound.clone();
+            let access = access.clone();
+            tokio::spawn(async move {
+                let mut environment = BTreeMap::new();
+                let outputs = execute_checkout_step_with_repository(
+                    run.id,
+                    "0/private-checkout",
+                    &inputs,
+                    &run,
+                    &source_repository,
+                    &workspace,
+                    &run_dir,
+                    &mut environment,
+                    &run.checkout_token,
+                    repository,
+                    None,
+                    &cancel,
+                    &log_outbound,
+                    &Arc::new(AtomicU64::new(0)),
+                    &access,
+                )
+                .await;
+                (outputs, environment)
+            })
+        };
+
+        let request_id = match control_events
+            .recv()
+            .await
+            .expect("private checkout token request")
+        {
+            AgentMessage::RepositoryTokenRequest {
+                job_id,
+                request_id,
+                purpose,
+                owner,
+                repository,
+                ..
+            } => {
+                assert_eq!(job_id, run.id);
+                assert_eq!(purpose, RepositoryTokenPurpose::Checkout);
+                assert_eq!(owner, "ACME");
+                assert_eq!(repository, "private-tools");
+                request_id
+            }
+            message => panic!("unexpected event: {message:?}"),
+        };
+        client
+            .handle_granted(request_id, "managed-private-token".to_owned())
+            .await;
+        let (outputs, environment) = checkout.await.expect("join private checkout");
+        let outputs = outputs.expect("managed private checkout");
+        assert_eq!(outputs["commit"], expected_commit);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("private.txt"))
+                .expect("checked out private fixture"),
+            "managed private checkout\n"
+        );
+        let credential = STANDARD.encode("x-access-token:managed-private-token");
+        let expected_credential = format!("AUTHORIZATION: basic {credential}");
+        assert_eq!(
+            environment.get("GIT_CONFIG_VALUE_0").map(String::as_str),
+            Some(expected_credential.as_str())
+        );
+        assert!(control_events.try_recv().is_err());
+        while let Ok(message) = log_events.try_recv() {
+            if let AgentMessage::LogChunk { data, .. } = message {
+                assert!(!data.contains("managed-private-token"));
+            }
+        }
+        assert!(
+            commands
+                .lock()
+                .expect("workflow command processor was poisoned")
+                .value_is_masked_for_step("0/private-checkout", "managed-private-token")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn anonymous_checkout_cannot_reuse_an_authorized_source_materialization() {
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let source = fixture.path().join("source");
+        let remote = fixture.path().join("private.git");
+        let unavailable = fixture.path().join("private-unavailable.git");
+        let run_dir = fixture.path().join("runs").join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&source).expect("source directory");
+        std::fs::create_dir_all(&run_dir).expect("run directory");
+        git(&source, ["init", "--initial-branch=main"]);
+        git(&source, ["config", "user.email", "gitzero@example.test"]);
+        git(&source, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(source.join("private.txt"), "private contents\n")
+            .expect("private fixture file");
+        git(&source, ["add", "private.txt"]);
+        git(&source, ["commit", "-m", "private fixture"]);
+        git(
+            fixture.path(),
+            ["init", "--bare", remote.to_str().expect("remote path")],
+        );
+        git(
+            &source,
+            [
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        git(&source, ["push", "origin", "main"]);
+
+        let mut run = fixture_run(
+            Uuid::new_v4(),
+            "a".repeat(40),
+            "b".repeat(40),
+            "https://github.com/acme/widget.git".to_owned(),
+        );
+        run.repository.owner = "acme".to_owned();
+        run.repository.name = "widget".to_owned();
+        let (outbound, _incoming) = mpsc::channel(256);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        materialize_remote_repository(
+            run.id,
+            "0/job/private-action",
+            "acme",
+            "private-tools",
+            "main",
+            remote.to_str().expect("remote path"),
+            RemoteRepositoryMaterializationScope::SharedSource,
+            Some("shared-source-token"),
+            &run_dir,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .expect("authorized source materialization");
+        std::fs::rename(&remote, &unavailable).expect("make private remote unavailable");
+
+        let commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let access = local_repository_access(&commands);
+        let repository = CheckoutRepository {
+            owner: "acme".to_owned(),
+            name: "private-tools".to_owned(),
+            clone_url: remote.display().to_string(),
+            same_repository: false,
+        };
+        let error = materialize_cross_repository_checkout_snapshot(
+            run.id,
+            "0/job/anonymous-checkout",
+            &repository,
+            "main",
+            &run,
+            &access,
+            CrossRepositoryCheckoutAccess::AnonymousOnly,
+            &run_dir,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .expect_err("anonymous checkout must not reuse authorized source files");
+        assert!(format!("{error:#}").contains("anonymously"));
     }
 
     #[tokio::test]
@@ -11213,6 +11692,14 @@ jobs:
 
         let (outbound, _incoming) = mpsc::channel(256);
         let (_cancel_tx, cancel) = watch::channel(false);
+        let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let repository_access = local_repository_access(&workflow_commands);
+        let checkout_run = fixture_run(
+            Uuid::new_v4(),
+            "a".repeat(40),
+            "b".repeat(40),
+            "https://github.com/local/fixture.git".to_owned(),
+        );
         let first_sequence = Arc::new(AtomicU64::new(0));
         let second_sequence = Arc::new(AtomicU64::new(0));
         let first = materialize_remote_repository(
@@ -11222,6 +11709,7 @@ jobs:
             "cached-action",
             "main",
             remote.to_str().expect("remote path"),
+            RemoteRepositoryMaterializationScope::SharedSource,
             None,
             &first_run,
             &cancel,
@@ -11235,6 +11723,7 @@ jobs:
             "cached-action",
             "main",
             remote.to_str().expect("remote path"),
+            RemoteRepositoryMaterializationScope::SharedSource,
             None,
             &first_run,
             &cancel,
@@ -11270,6 +11759,7 @@ jobs:
             "cached-action",
             "main",
             remote.to_str().expect("remote path"),
+            RemoteRepositoryMaterializationScope::SharedSource,
             None,
             &first_run,
             &cancel,
@@ -11291,18 +11781,23 @@ jobs:
             clone_url: remote.display().to_string(),
             same_repository: false,
         };
-        let (pinned_checkout_commit, pinned_checkout) = materialize_public_checkout_snapshot(
-            Uuid::new_v4(),
-            "0/public-checkout",
-            &public_checkout_repository,
-            "main",
-            &first_run,
-            &cancel,
-            &outbound,
-            &Arc::new(AtomicU64::new(0)),
-        )
-        .await
-        .expect("same-run public checkout snapshot");
+        let (pinned_checkout_commit, pinned_checkout, pinned_token) =
+            materialize_cross_repository_checkout_snapshot(
+                checkout_run.id,
+                "0/public-checkout",
+                &public_checkout_repository,
+                "main",
+                &checkout_run,
+                &repository_access,
+                CrossRepositoryCheckoutAccess::ManagedFallback,
+                &first_run,
+                &cancel,
+                &outbound,
+                &Arc::new(AtomicU64::new(0)),
+            )
+            .await
+            .expect("same-run public checkout snapshot");
+        assert!(pinned_token.is_none());
         assert_eq!(
             tokio::fs::read_to_string(pinned_checkout.join("index.js"))
                 .await
@@ -11317,6 +11812,10 @@ jobs:
 
         let second_run = work_root.join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(&second_run).expect("second run directory");
+        let second_checkout_run = RunSpec {
+            id: Uuid::new_v4(),
+            ..checkout_run.clone()
+        };
         let refreshed = materialize_remote_repository(
             Uuid::new_v4(),
             "0/first/action",
@@ -11324,6 +11823,7 @@ jobs:
             "cached-action",
             "main",
             remote.to_str().expect("remote path"),
+            RemoteRepositoryMaterializationScope::SharedSource,
             None,
             &second_run,
             &cancel,
@@ -11339,18 +11839,23 @@ jobs:
             "console.log('v2')\n",
             "a new run must refresh a moving action ref"
         );
-        let (refreshed_checkout_commit, refreshed_checkout) = materialize_public_checkout_snapshot(
-            Uuid::new_v4(),
-            "0/public-checkout",
-            &public_checkout_repository,
-            "main",
-            &second_run,
-            &cancel,
-            &outbound,
-            &Arc::new(AtomicU64::new(0)),
-        )
-        .await
-        .expect("next-run public checkout snapshot");
+        let (refreshed_checkout_commit, refreshed_checkout, refreshed_token) =
+            materialize_cross_repository_checkout_snapshot(
+                second_checkout_run.id,
+                "0/public-checkout",
+                &public_checkout_repository,
+                "main",
+                &second_checkout_run,
+                &repository_access,
+                CrossRepositoryCheckoutAccess::ManagedFallback,
+                &second_run,
+                &cancel,
+                &outbound,
+                &Arc::new(AtomicU64::new(0)),
+            )
+            .await
+            .expect("next-run public checkout snapshot");
+        assert!(refreshed_token.is_none());
         assert_eq!(
             tokio::fs::read_to_string(refreshed_checkout.join("index.js"))
                 .await

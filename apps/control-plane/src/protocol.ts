@@ -1,6 +1,11 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 8;
+export const PROTOCOL_VERSION = 9;
+
+export const repositoryTokenPurposeSchema = z.enum([
+  "shared_source",
+  "checkout",
+]);
 
 export const WORKFLOW_TOKEN_PERMISSIONS = [
   "actions",
@@ -289,6 +294,7 @@ export const agentMessageSchema = z.discriminatedUnion("type", [
     message_id: uuid,
     job_id: uuid,
     request_id: uuid,
+    purpose: repositoryTokenPurposeSchema,
     owner: repositoryComponent,
     repository: repositoryComponent,
   }),

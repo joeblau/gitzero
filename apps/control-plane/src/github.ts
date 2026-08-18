@@ -356,14 +356,12 @@ export async function createSharedRepositoryToken(
   targetOwner: string,
   targetRepository: string,
 ): Promise<string> {
-  if (
-    callerOwner.toLowerCase() !== targetOwner.toLowerCase() ||
-    callerRepository.toLowerCase() === targetRepository.toLowerCase()
-  ) {
-    throw new Error(
-      "shared repository access requires a different repository under the caller owner",
-    );
-  }
+  validateCrossRepositoryTarget(
+    callerOwner,
+    callerRepository,
+    targetOwner,
+    targetRepository,
+  );
   const allowedLevels =
     callerOwnerType === "Organization"
       ? new Set(["organization", "enterprise"])
@@ -403,6 +401,41 @@ export async function createSharedRepositoryToken(
     targetRepository,
     { contents: "read" },
   );
+}
+
+export async function createPrivateCheckoutToken(
+  env: GitHubEnvironment,
+  installationId: number,
+  callerOwner: string,
+  callerRepository: string,
+  targetOwner: string,
+  targetRepository: string,
+): Promise<string> {
+  validateCrossRepositoryTarget(
+    callerOwner,
+    callerRepository,
+    targetOwner,
+    targetRepository,
+  );
+  return createInstallationToken(env, installationId, targetRepository, {
+    contents: "read",
+  });
+}
+
+function validateCrossRepositoryTarget(
+  callerOwner: string,
+  callerRepository: string,
+  targetOwner: string,
+  targetRepository: string,
+): void {
+  if (
+    callerOwner.toLowerCase() !== targetOwner.toLowerCase() ||
+    callerRepository.toLowerCase() === targetRepository.toLowerCase()
+  ) {
+    throw new Error(
+      "repository access requires a different repository under the caller owner",
+    );
+  }
 }
 
 export async function fetchActionsVariables(
