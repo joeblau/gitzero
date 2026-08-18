@@ -1,5 +1,6 @@
 mod action;
 mod artifact;
+mod artifact_subject;
 mod cache;
 mod concurrency;
 mod executor;

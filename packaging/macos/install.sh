@@ -3,7 +3,7 @@ set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 usage() {
-  print -u2 "usage: sudo $0 --binary PATH --control-plane URL --workspace ID (--token-stdin | --token TOKEN) [--user USER] [--agent-id ID] [--labels LABEL,...] [--runner-group GROUP] [--parallelism N] [--cache-max-bytes N] [--cache-max-entry-bytes N] [--artifact-max-bytes N] [--artifact-max-entry-bytes N]"
+  print -u2 "usage: sudo $0 --binary PATH --control-plane URL --workspace ID (--token-stdin | --token TOKEN) [--user USER] [--agent-id ID] [--labels LABEL,...] [--runner-group GROUP] [--parallelism N] [--cache-max-bytes N] [--cache-max-entry-bytes N] [--artifact-max-bytes N] [--artifact-max-entry-bytes N] [--allow-artifacts-file]"
   exit 64
 }
 
@@ -21,6 +21,7 @@ cache_max_bytes="10737418240"
 cache_max_entry_bytes="2147483648"
 artifact_max_bytes="10737418240"
 artifact_max_entry_bytes="2147483648"
+allow_artifacts_file="false"
 
 while (( $# > 0 )); do
   case "$1" in
@@ -38,6 +39,7 @@ while (( $# > 0 )); do
     --cache-max-entry-bytes) cache_max_entry_bytes="${2:-}"; shift 2 ;;
     --artifact-max-bytes) artifact_max_bytes="${2:-}"; shift 2 ;;
     --artifact-max-entry-bytes) artifact_max_entry_bytes="${2:-}"; shift 2 ;;
+    --allow-artifacts-file) allow_artifacts_file="true"; shift ;;
     *) usage ;;
   esac
 done
@@ -104,6 +106,9 @@ plutil -replace EnvironmentVariables.GITZERO_CACHE_MAX_BYTES -string "$cache_max
 plutil -replace EnvironmentVariables.GITZERO_CACHE_MAX_ENTRY_BYTES -string "$cache_max_entry_bytes" "$temporary_plist"
 plutil -replace EnvironmentVariables.GITZERO_ARTIFACT_MAX_BYTES -string "$artifact_max_bytes" "$temporary_plist"
 plutil -replace EnvironmentVariables.GITZERO_ARTIFACT_MAX_ENTRY_BYTES -string "$artifact_max_entry_bytes" "$temporary_plist"
+if [[ "$allow_artifacts_file" == "true" ]]; then
+  plutil -insert EnvironmentVariables.ACTIONS_RUNNER_ALLOW_ARTIFACTS_FILE -string "true" "$temporary_plist"
+fi
 plutil -insert UserName -string "$agent_user" "$temporary_plist"
 plutil -lint "$temporary_plist"
 install -o root -g wheel -m 0600 "$temporary_plist" "$destination"
