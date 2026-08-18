@@ -249,6 +249,7 @@ pub struct PlannedJob {
     pub strategy_job_total: Option<usize>,
     pub continue_on_error: Option<String>,
     pub timeout_minutes: Option<String>,
+    pub permissions: PlannedPermissions,
     pub concurrency: Option<PlannedConcurrency>,
     pub concurrency_scope_ids: Vec<String>,
     pub concurrency_acquire: Vec<PlannedConcurrencyScope>,
@@ -257,6 +258,19 @@ pub struct PlannedJob {
     pub environment: BTreeMap<String, String>,
     pub outputs: BTreeMap<String, String>,
     pub steps: Vec<PlannedStep>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PlannedPermissions {
+    pub read: BTreeSet<String>,
+}
+
+impl Default for PlannedPermissions {
+    fn default() -> Self {
+        Self {
+            read: BTreeSet::from(["contents".to_owned(), "pull-requests".to_owned()]),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -401,6 +415,12 @@ pub fn compile(workflow: &Workflow, path: &Path) -> Result<ExecutionPlan, Workfl
         ));
     }
     validate_defaults(&workflow_name, "workflow", &workflow.defaults)?;
+    let workflow_permissions = planned_permissions(
+        &workflow_name,
+        "workflow",
+        workflow.permissions.as_ref(),
+        &PlannedPermissions::default(),
+    )?;
     let workflow_concurrency = planned_concurrency(
         &workflow_name,
         "workflow",
@@ -483,6 +503,12 @@ pub fn compile(workflow: &Workflow, path: &Path) -> Result<ExecutionPlan, Workfl
                     .timeout_minutes
                     .as_ref()
                     .map(|value| value.as_str().to_owned()),
+                permissions: planned_permissions(
+                    &workflow_name,
+                    &format!("job '{job_id}'"),
+                    job.permissions.as_ref(),
+                    &workflow_permissions,
+                )?,
                 concurrency: planned_concurrency(
                     &workflow_name,
                     &format!("job '{job_id}'"),
@@ -1302,6 +1328,12 @@ fn expand_reusable_call(
         .collect::<BTreeMap<_, _>>();
     let mut called_jobs = Vec::new();
     for mut job in called_plan.jobs {
+        job.permissions.read = job
+            .permissions
+            .read
+            .intersection(&placeholder.permissions.read)
+            .cloned()
+            .collect();
         let old_base_id = job.base_id.clone();
         let new_base_id = aliases[&old_base_id].clone();
         job.id = format!("{new_base_id}{}", &job.id[old_base_id.len()..]);
@@ -1605,6 +1637,124 @@ fn validate_job(workflow: &str, job_id: &str, job: &Job) -> Result<(), WorkflowE
         ));
     }
     Ok(())
+}
+
+const READABLE_TOKEN_PERMISSIONS: [&str; 14] = [
+    "actions",
+    "artifact-metadata",
+    "attestations",
+    "checks",
+    "code-quality",
+    "contents",
+    "deployments",
+    "discussions",
+    "issues",
+    "packages",
+    "pages",
+    "pull-requests",
+    "security-events",
+    "statuses",
+];
+const READ_ONLY_TOKEN_PERMISSIONS: [&str; 1] = ["vulnerability-alerts"];
+const TOKEN_PERMISSION_KEYS: [&str; 16] = [
+    "actions",
+    "artifact-metadata",
+    "attestations",
+    "checks",
+    "code-quality",
+    "contents",
+    "deployments",
+    "discussions",
+    "id-token",
+    "issues",
+    "packages",
+    "pages",
+    "pull-requests",
+    "security-events",
+    "statuses",
+    "vulnerability-alerts",
+];
+
+fn planned_permissions(
+    workflow: &str,
+    location: &str,
+    value: Option<&Value>,
+    inherited: &PlannedPermissions,
+) -> Result<PlannedPermissions, WorkflowError> {
+    let Some(value) = value else {
+        return Ok(inherited.clone());
+    };
+    match value {
+        Value::String(value) if value == "read-all" => Ok(PlannedPermissions {
+            read: READABLE_TOKEN_PERMISSIONS
+                .into_iter()
+                .chain(READ_ONLY_TOKEN_PERMISSIONS)
+                .map(str::to_owned)
+                .collect(),
+        }),
+        Value::String(value) if value == "write-all" => Err(unsupported_workflow(
+            workflow,
+            format!(
+                "{location} permissions request write-all, but GitZero pull-request tokens are read-only"
+            ),
+        )),
+        Value::Mapping(values) => {
+            let mut read = BTreeSet::new();
+            for (name, access) in values {
+                let Some(name) = name.as_str() else {
+                    return Err(unsupported_workflow(
+                        workflow,
+                        format!("{location} permission names must be strings"),
+                    ));
+                };
+                if !TOKEN_PERMISSION_KEYS.contains(&name) {
+                    return Err(unsupported_workflow(
+                        workflow,
+                        format!("{location} permission '{name}' is not recognized"),
+                    ));
+                }
+                let Some(access) = access.as_str() else {
+                    return Err(unsupported_workflow(
+                        workflow,
+                        format!("{location} permission '{name}' must be read, write, or none"),
+                    ));
+                };
+                match access {
+                    "none" => {}
+                    "read" if name != "id-token" => {
+                        read.insert(name.to_owned());
+                    }
+                    "read" => {
+                        return Err(unsupported_workflow(
+                            workflow,
+                            format!(
+                                "{location} permission 'id-token' does not support read access"
+                            ),
+                        ));
+                    }
+                    "write" => {
+                        return Err(unsupported_workflow(
+                            workflow,
+                            format!(
+                                "{location} permission '{name}: write' is not supported because GitZero pull-request tokens are read-only"
+                            ),
+                        ));
+                    }
+                    _ => {
+                        return Err(unsupported_workflow(
+                            workflow,
+                            format!("{location} permission '{name}' must be read, write, or none"),
+                        ));
+                    }
+                }
+            }
+            Ok(PlannedPermissions { read })
+        }
+        _ => Err(unsupported_workflow(
+            workflow,
+            format!("{location} permissions must be read-all, write-all, or a permission mapping"),
+        )),
+    }
 }
 
 fn planned_concurrency(
@@ -3836,5 +3986,100 @@ jobs:
             &job.steps[0].kind,
             StepKind::Run { shell, .. } if shell == "bash"
         ));
+        assert_eq!(job.permissions.read.len(), 15);
+        assert!(job.permissions.read.contains("vulnerability-alerts"));
+    }
+
+    #[test]
+    fn applies_exact_read_permissions_and_rejects_write_elevation() {
+        let workflow = parse(
+            r#"
+name: Permissions
+on: pull_request
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  inherited:
+    runs-on: macos-latest
+    steps:
+      - run: echo inherited
+  reduced:
+    permissions:
+      checks: read
+      contents: none
+    runs-on: macos-latest
+    steps:
+      - run: echo reduced
+  none:
+    permissions: {}
+    runs-on: macos-latest
+    steps:
+      - run: echo none
+"#,
+        )
+        .expect("parse permissions");
+        let plan = compile(&workflow, Path::new("permissions.yml")).expect("compile permissions");
+        assert_eq!(
+            plan.jobs[0].permissions.read,
+            BTreeSet::from(["contents".to_owned(), "pull-requests".to_owned()])
+        );
+        assert_eq!(
+            plan.jobs[1].permissions.read,
+            BTreeSet::from(["checks".to_owned()])
+        );
+        assert!(plan.jobs[2].permissions.read.is_empty());
+
+        let write = parse(
+            "name: Write\non: pull_request\npermissions:\n  issues: write\njobs:\n  build:\n    runs-on: macos-latest\n    steps:\n      - run: echo build\n",
+        )
+        .expect("parse write permissions");
+        let error = compile(&write, Path::new("write.yml")).expect_err("reject write permission");
+        assert!(error.to_string().contains("issues: write"));
+        assert!(error.to_string().contains("read-only"));
+    }
+
+    #[test]
+    fn reusable_workflows_cannot_elevate_caller_permissions() {
+        let caller = parse(
+            r#"
+name: Caller
+on: pull_request
+jobs:
+  call:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/called.yml
+"#,
+        )
+        .expect("parse caller");
+        let called = parse(
+            r#"
+name: Called
+on: workflow_call
+permissions: read-all
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - run: echo build
+"#,
+        )
+        .expect("parse called workflow");
+        let plan = compile_with_local_reusables(
+            &caller,
+            Path::new(".github/workflows/ci.yml"),
+            &BTreeMap::from([(".github/workflows/called.yml".to_owned(), called)]),
+        )
+        .expect("compile reusable workflow");
+        let build = plan
+            .jobs
+            .iter()
+            .find(|job| job.base_id == "call::build")
+            .expect("called build job");
+        assert_eq!(
+            build.permissions.read,
+            BTreeSet::from(["contents".to_owned()])
+        );
     }
 }

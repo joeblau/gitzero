@@ -1,6 +1,32 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 5;
+export const PROTOCOL_VERSION = 6;
+
+export const WORKFLOW_READ_PERMISSIONS = [
+  "actions",
+  "artifact-metadata",
+  "attestations",
+  "checks",
+  "code-quality",
+  "contents",
+  "deployments",
+  "discussions",
+  "issues",
+  "packages",
+  "pages",
+  "pull-requests",
+  "security-events",
+  "statuses",
+  "vulnerability-alerts",
+] as const;
+const workflowReadPermission = z.enum(WORKFLOW_READ_PERMISSIONS);
+const workflowReadPermissions = z
+  .array(workflowReadPermission)
+  .min(1)
+  .max(WORKFLOW_READ_PERMISSIONS.length)
+  .refine((permissions) => new Set(permissions).size === permissions.length, {
+    message: "workflow read permissions must be unique",
+  });
 
 const uuid = z.string().uuid();
 const sha = z.string().regex(/^[0-9a-fA-F]{40}$/);
@@ -148,6 +174,13 @@ export const agentMessageSchema = z.discriminatedUnion("type", [
     repository: repositoryComponent,
   }),
   z.object({
+    type: z.literal("workflow_token_request"),
+    message_id: uuid,
+    job_id: uuid,
+    request_id: uuid,
+    permissions: workflowReadPermissions,
+  }),
+  z.object({
     type: z.literal("step_started"),
     message_id: uuid,
     job_id: uuid,
@@ -196,6 +229,8 @@ export type ServerMessage =
   | { type: "concurrency_cancelled"; request_id: string; reason: string }
   | { type: "repository_token_granted"; request_id: string; token: string }
   | { type: "repository_token_denied"; request_id: string; reason: string }
+  | { type: "workflow_token_granted"; request_id: string; token: string }
+  | { type: "workflow_token_denied"; request_id: string; reason: string }
   | { type: "ack"; message_id: string }
   | { type: "error"; code: string; message: string };
 

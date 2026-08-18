@@ -3,6 +3,7 @@ import {
   createAgentTokens,
   createCheckRun,
   createSharedRepositoryToken,
+  createWorkflowToken,
   disableRepositoryActions,
   fetchActionsVariables,
   fetchActionsVariablesWithToken,
@@ -224,6 +225,54 @@ describe("GitHub Actions variables", () => {
 });
 
 describe("GitHub production API contracts", () => {
+  it("mints workflow tokens with only the requested read permissions", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({ url: new URL(String(input)), init });
+        return Response.json({ token: "exact-read-token" });
+      }),
+    );
+
+    await expect(
+      createWorkflowToken(
+        {
+          GITHUB_API_VERSION: "2026-03-10",
+          GITHUB_APP_ID: "1234",
+          GITHUB_APP_PRIVATE_KEY: privateKey,
+        },
+        7001,
+        "widget",
+        ["artifact-metadata", "pull-requests", "security-events"],
+      ),
+    ).resolves.toBe("exact-read-token");
+    expect(requests).toHaveLength(1);
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+      repositories: ["widget"],
+      permissions: {
+        artifact_metadata: "read",
+        pull_requests: "read",
+        security_events: "read",
+      },
+    });
+
+    await expect(
+      createWorkflowToken(
+        {
+          GITHUB_API_VERSION: "2026-03-10",
+          GITHUB_APP_ID: "1234",
+          GITHUB_APP_PRIVATE_KEY: privateKey,
+        },
+        7001,
+        "widget",
+        ["contents", "contents"],
+      ),
+    ).rejects.toThrow("nonempty unique set");
+    expect(requests).toHaveLength(1);
+  });
+
   it("mints a contents-only token after the target sharing policy authorizes the caller", async () => {
     const privateKey = await testPrivateKeyPem();
     const requests: Array<{ url: URL; init?: RequestInit }> = [];

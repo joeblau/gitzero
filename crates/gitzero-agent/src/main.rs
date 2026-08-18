@@ -338,6 +338,14 @@ async fn handle_server_message(
         ServerMessage::RepositoryTokenDenied { request_id, reason } => {
             repository_access.handle_denied(request_id, reason).await;
         }
+        ServerMessage::WorkflowTokenGranted { request_id, token } => {
+            repository_access
+                .handle_granted(request_id, token.into_inner())
+                .await;
+        }
+        ServerMessage::WorkflowTokenDenied { request_id, reason } => {
+            repository_access.handle_denied(request_id, reason).await;
+        }
         ServerMessage::Ack { .. } => {}
         ServerMessage::Error { code, message } => {
             warn!(%code, %message, "control plane returned an error");

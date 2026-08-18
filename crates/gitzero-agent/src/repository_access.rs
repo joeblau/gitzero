@@ -1,6 +1,9 @@
 use anyhow::{Result, bail};
 use gitzero_protocol::AgentMessage;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
@@ -36,33 +39,68 @@ impl RepositoryAccessClient {
         repository: &str,
         cancel: &watch::Receiver<bool>,
     ) -> Result<String> {
-        let Some(remote) = &self.remote else {
-            bail!("private shared repository access requires the connected control plane");
-        };
         let request_id = Uuid::new_v4();
-        let (decision_tx, mut decision_rx) = oneshot::channel();
-        remote.requests.lock().await.insert(request_id, decision_tx);
-        if remote
-            .outbound
-            .send(AgentMessage::RepositoryTokenRequest {
+        self.request(
+            request_id,
+            AgentMessage::RepositoryTokenRequest {
                 message_id: Uuid::new_v4(),
                 job_id: run_id,
                 request_id,
                 owner: owner.to_owned(),
                 repository: repository.to_owned(),
-            })
-            .await
-            .is_err()
-        {
+            },
+            "private shared repository access",
+            cancel,
+        )
+        .await
+    }
+
+    pub(crate) async fn request_workflow_token(
+        &self,
+        run_id: Uuid,
+        permissions: &BTreeSet<String>,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<String> {
+        if permissions.is_empty() {
+            bail!("workflow token request must contain at least one read permission");
+        }
+        let request_id = Uuid::new_v4();
+        self.request(
+            request_id,
+            AgentMessage::WorkflowTokenRequest {
+                message_id: Uuid::new_v4(),
+                job_id: run_id,
+                request_id,
+                permissions: permissions.iter().cloned().collect(),
+            },
+            "scoped workflow token access",
+            cancel,
+        )
+        .await
+    }
+
+    async fn request(
+        &self,
+        request_id: Uuid,
+        message: AgentMessage,
+        operation: &str,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<String> {
+        let Some(remote) = &self.remote else {
+            bail!("{operation} requires the connected control plane");
+        };
+        let (decision_tx, mut decision_rx) = oneshot::channel();
+        remote.requests.lock().await.insert(request_id, decision_tx);
+        if remote.outbound.send(message).await.is_err() {
             remote.requests.lock().await.remove(&request_id);
-            bail!("control plane event channel closed while requesting repository access");
+            bail!("control plane event channel closed while requesting {operation}");
         }
 
         let mut cancellation = cancel.clone();
         let response = loop {
             if *cancellation.borrow() {
                 remote.requests.lock().await.remove(&request_id);
-                bail!("run cancelled while requesting private repository access");
+                bail!("run cancelled while requesting {operation}");
             }
             tokio::select! {
                 response = &mut decision_rx => break response,
@@ -75,11 +113,11 @@ impl RepositoryAccessClient {
         };
         match response {
             Ok(Ok(token)) if !token.is_empty() => Ok(token),
-            Ok(Ok(_)) => bail!("control plane returned an empty repository token"),
+            Ok(Ok(_)) => bail!("control plane returned an empty token for {operation}"),
             Ok(Err(reason)) => bail!("{reason}"),
             Err(_) => {
                 remote.requests.lock().await.remove(&request_id);
-                bail!("repository access request ended without a control plane decision")
+                bail!("{operation} request ended without a control plane decision")
             }
         }
     }
@@ -187,5 +225,46 @@ mod tests {
             .expect("join request")
             .expect_err("request should fail");
         assert!(error.to_string().contains("sharing policy denied access"));
+    }
+
+    #[tokio::test]
+    async fn remote_workflow_requests_preserve_the_exact_read_scope() {
+        let (outbound, mut events) = mpsc::channel(4);
+        let client = RepositoryAccessClient::remote(outbound);
+        let run_id = Uuid::new_v4();
+        let permissions = BTreeSet::from(["checks".to_owned(), "contents".to_owned()]);
+        let (_, cancel) = watch::channel(false);
+        let request = {
+            let client = client.clone();
+            let permissions = permissions.clone();
+            tokio::spawn(async move {
+                client
+                    .request_workflow_token(run_id, &permissions, &cancel)
+                    .await
+            })
+        };
+        let request_id = match events.recv().await.expect("workflow token request") {
+            AgentMessage::WorkflowTokenRequest {
+                job_id,
+                request_id,
+                permissions: requested,
+                ..
+            } => {
+                assert_eq!(job_id, run_id);
+                assert_eq!(requested, ["checks", "contents"]);
+                request_id
+            }
+            message => panic!("unexpected event: {message:?}"),
+        };
+        client
+            .handle_granted(request_id, "read-scoped-workflow-token".to_owned())
+            .await;
+        assert_eq!(
+            request
+                .await
+                .expect("join request")
+                .expect("workflow token"),
+            "read-scoped-workflow-token"
+        );
     }
 }

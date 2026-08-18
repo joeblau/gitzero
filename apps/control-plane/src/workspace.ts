@@ -3,6 +3,7 @@ import {
   createAgentTokens,
   createCheckRun,
   createSharedRepositoryToken,
+  createWorkflowToken,
   fetchActionsVariables,
   updateCheckRun,
 } from "./github";
@@ -1205,6 +1206,61 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
               request_id: message.request_id,
               reason:
                 "Private repository access was denied. Confirm the target Actions sharing policy and GitHub App installation include this repository.",
+            });
+          }
+        }
+        return;
+      }
+      case "workflow_token_request": {
+        const row = this.assignedJob(message.job_id, agentId);
+        if (row.status === "completed") {
+          sendServer(socket, {
+            type: "workflow_token_denied",
+            request_id: message.request_id,
+            reason: "The parent GitZero run is no longer active.",
+          });
+          return;
+        }
+        const job = parseJob(row.job_json);
+        try {
+          const token = await createWorkflowToken(
+            this.env,
+            job.installation_id,
+            job.repository.name,
+            message.permissions,
+          );
+          const stillOwned = this.ctx.storage.sql
+            .exec<{ id: string }>(
+              `SELECT id FROM jobs
+               WHERE id = ? AND agent_id = ? AND status IN ('assigned', 'running')`,
+              job.id,
+              agentId,
+            )
+            .toArray().length;
+          if (stillOwned === 0 || socket.readyState !== WebSocket.OPEN) {
+            return;
+          }
+          sendServer(socket, {
+            type: "workflow_token_granted",
+            request_id: message.request_id,
+            token,
+          });
+        } catch (error) {
+          console.error(
+            JSON.stringify({
+              message: "workflow token request denied",
+              jobId: job.id,
+              agentId,
+              permissions: message.permissions,
+              error: truncateDiagnostic(error),
+            }),
+          );
+          if (socket.readyState === WebSocket.OPEN) {
+            sendServer(socket, {
+              type: "workflow_token_denied",
+              request_id: message.request_id,
+              reason:
+                "The requested read-only workflow token could not be issued. Confirm the GitHub App has every requested repository permission.",
             });
           }
         }

@@ -20,8 +20,8 @@ use gitzero_protocol::{
 };
 use gitzero_workflow::{
     ExecutionPlan, MAX_UNIQUE_REUSABLE_WORKFLOWS, PlannedConcurrency, PlannedConcurrencyQueue,
-    PlannedJob, PlannedStep, PlannedVirtualJob, ReusableInputType, StepKind, Workflow,
-    compile_with_reusables, expand_dynamic_reusable_call, expand_matrix_definition,
+    PlannedJob, PlannedPermissions, PlannedStep, PlannedVirtualJob, ReusableInputType, StepKind,
+    Workflow, compile_with_reusables, expand_dynamic_reusable_call, expand_matrix_definition,
     matches_pull_request, parse, requires_pull_request_changed_paths,
 };
 use serde::Deserialize;
@@ -69,6 +69,7 @@ const MAX_SPARSE_CHECKOUT_BYTES: usize = 128 * 1_024;
 // that legitimate worst case.
 const MAX_GITHUB_API_RESPONSE_BYTES: usize = 10 * 1_024 * 1_024;
 const MAX_SHARED_REPOSITORIES_PER_RUN: usize = 256;
+const MAX_WORKFLOW_TOKEN_SCOPES_PER_RUN: usize = 256;
 
 type EnvironmentVariableCache = Arc<Mutex<BTreeMap<String, BTreeMap<String, String>>>>;
 
@@ -76,6 +77,7 @@ type EnvironmentVariableCache = Arc<Mutex<BTreeMap<String, BTreeMap<String, Stri
 struct RunRepositoryAccess {
     client: RepositoryAccessClient,
     tokens: Arc<Mutex<BTreeMap<String, String>>>,
+    workflow_tokens: Arc<Mutex<BTreeMap<BTreeSet<String>, String>>>,
     workflow_commands: Arc<StdMutex<WorkflowCommandProcessor>>,
 }
 
@@ -87,6 +89,7 @@ impl RunRepositoryAccess {
         Self {
             client,
             tokens: Arc::new(Mutex::new(BTreeMap::new())),
+            workflow_tokens: Arc::new(Mutex::new(BTreeMap::new())),
             workflow_commands,
         }
     }
@@ -130,12 +133,51 @@ impl RunRepositoryAccess {
         Ok(token)
     }
 
+    async fn workflow_token(
+        &self,
+        run: &RunSpec,
+        permissions: &PlannedPermissions,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<Option<String>> {
+        if permissions.read.is_empty() {
+            return Ok(None);
+        }
+        if permissions == &PlannedPermissions::default() && !run.checkout_token.is_empty() {
+            return Ok(Some(run.checkout_token.clone()));
+        }
+        if run.installation_id == 0 {
+            return Ok(None);
+        }
+        let mut tokens = self.workflow_tokens.lock().await;
+        if let Some(token) = tokens.get(&permissions.read) {
+            return Ok(Some(token.clone()));
+        }
+        if tokens.len() >= MAX_WORKFLOW_TOKEN_SCOPES_PER_RUN {
+            bail!(
+                "workflow uses more than {MAX_WORKFLOW_TOKEN_SCOPES_PER_RUN} distinct token permission sets"
+            );
+        }
+        let token = self
+            .client
+            .request_workflow_token(run.id, &permissions.read, cancel)
+            .await?;
+        register_repository_token_masks(&self.workflow_commands, &token);
+        tokens.insert(permissions.read.clone(), token.clone());
+        Ok(Some(token))
+    }
+
     async fn clear(&self) {
         let mut tokens = self.tokens.lock().await;
         for token in tokens.values_mut() {
             token.clear();
         }
         tokens.clear();
+        drop(tokens);
+        let mut workflow_tokens = self.workflow_tokens.lock().await;
+        for token in workflow_tokens.values_mut() {
+            token.clear();
+        }
+        workflow_tokens.clear();
     }
 }
 
@@ -2951,6 +2993,15 @@ async fn execute_job(
                 job_temp_directory.display()
             )
         })?;
+    let workflow_token = repository_access
+        .workflow_token(run, &job.permissions, cancel)
+        .await
+        .with_context(|| {
+            format!(
+                "issue read-only workflow token for workflow '{workflow_name}' job '{}'",
+                job.id
+            )
+        })?;
     let mut job_environment = environment.clone();
     job_environment.insert("GITHUB_JOB".to_owned(), job.base_id.clone());
     job_environment.insert(
@@ -2974,7 +3025,7 @@ async fn execute_job(
         dependency_status,
         workspace,
         run_dir,
-        Some(&run.checkout_token),
+        workflow_token.as_deref(),
     )?;
     if !condition_allows(job.condition.as_deref(), dependency_status, &context)? {
         report_skipped(
@@ -3046,7 +3097,7 @@ async fn execute_job(
         dependency_status,
         workspace,
         run_dir,
-        Some(&run.checkout_token),
+        workflow_token.as_deref(),
     )?;
     job_environment.extend(render_environment(&job.environment, &context)?);
     restore_default_environment(&mut job_environment, environment);
@@ -3071,7 +3122,7 @@ async fn execute_job(
         dependency_status,
         workspace,
         run_dir,
-        Some(&run.checkout_token),
+        workflow_token.as_deref(),
     )?;
     prepare_workspace(
         job_id,
@@ -3119,7 +3170,7 @@ async fn execute_job(
                 status,
                 workspace,
                 run_dir,
-                Some(&run.checkout_token),
+                workflow_token.as_deref(),
             )?;
             let execution = execute_step(
                 job_id,
@@ -3263,7 +3314,7 @@ async fn execute_job(
             status,
             workspace,
             run_dir,
-            Some(&run.checkout_token),
+            workflow_token.as_deref(),
         )?;
         if let (Some(deployment), Some(environment_name)) = (
             &job.deployment_environment,
@@ -3671,6 +3722,11 @@ async fn execute_checkout_step(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
 ) -> Result<BTreeMap<String, String>> {
+    let builtin_token = match context.evaluate_json("github.token")? {
+        JsonValue::String(token) => token,
+        JsonValue::Null => String::new(),
+        _ => bail!("github.token must resolve to a string or null"),
+    };
     let inputs = render_environment(inputs, context)?
         .into_iter()
         .map(|(name, value)| (name.to_ascii_lowercase(), value))
@@ -3710,6 +3766,7 @@ async fn execute_checkout_step(
         workspace,
         run_dir,
         environment,
+        &builtin_token,
         checkout_repository,
         timeout,
         cancel,
@@ -3729,6 +3786,7 @@ async fn execute_checkout_step_with_repository(
     workspace: &Path,
     run_dir: &Path,
     environment: &mut BTreeMap<String, String>,
+    builtin_token: &str,
     checkout_repository: CheckoutRepository,
     timeout: Option<Duration>,
     cancel: &watch::Receiver<bool>,
@@ -3736,9 +3794,9 @@ async fn execute_checkout_step_with_repository(
     sequence: &Arc<AtomicU64>,
 ) -> Result<BTreeMap<String, String>> {
     let checkout_token = if checkout_repository.same_repository {
-        select_checkout_token(inputs.get("token").map(String::as_str), &run.checkout_token)?
+        select_checkout_token(inputs.get("token").map(String::as_str), builtin_token)?
     } else {
-        select_public_checkout_token(inputs.get("token").map(String::as_str), &run.checkout_token)?
+        select_public_checkout_token(inputs.get("token").map(String::as_str), builtin_token)?
     };
     let requested_ref = inputs
         .get("ref")
@@ -7397,6 +7455,7 @@ async fn relay_masked_events(
             | AgentMessage::ConcurrencyAcquire { .. }
             | AgentMessage::ConcurrencyRelease { .. }
             | AgentMessage::RepositoryTokenRequest { .. }
+            | AgentMessage::WorkflowTokenRequest { .. }
             | AgentMessage::JobStarted { .. } => {}
         }
         outbound
@@ -8337,6 +8396,7 @@ jobs:
             &first_workspace,
             &run_dir,
             &mut first_environment,
+            &run.checkout_token,
             repository.clone(),
             None,
             &cancel,
@@ -8377,6 +8437,7 @@ jobs:
             &second_workspace,
             &run_dir,
             &mut second_environment,
+            &run.checkout_token,
             repository,
             None,
             &cancel,
@@ -8666,6 +8727,70 @@ jobs:
         assert!(!log.contains(token));
         assert!(!log.contains(&credential));
         assert!(commands.value_is_masked_for_step("0/job/step", token));
+    }
+
+    #[tokio::test]
+    async fn caches_and_masks_exact_read_only_workflow_tokens() {
+        let commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let (outbound, mut events) = mpsc::channel(4);
+        let client = RepositoryAccessClient::remote(outbound);
+        let access = RunRepositoryAccess::new(client.clone(), commands.clone());
+        let mut run = fixture_run(
+            Uuid::new_v4(),
+            "0".repeat(40),
+            "1".repeat(40),
+            "https://github.com/octocat/Hello-World.git".to_owned(),
+        );
+        run.installation_id = 42;
+        run.checkout_token = "baseline-checkout-token".to_owned();
+        let permissions = PlannedPermissions {
+            read: BTreeSet::from(["checks".to_owned()]),
+        };
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let request = {
+            let access = access.clone();
+            let run = run.clone();
+            let permissions = permissions.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { access.workflow_token(&run, &permissions, &cancel).await })
+        };
+        let request_id = match events.recv().await.expect("workflow token request") {
+            AgentMessage::WorkflowTokenRequest {
+                job_id,
+                request_id,
+                permissions,
+                ..
+            } => {
+                assert_eq!(job_id, run.id);
+                assert_eq!(permissions, ["checks"]);
+                request_id
+            }
+            message => panic!("unexpected event: {message:?}"),
+        };
+        client
+            .handle_granted(request_id, "checks-read-token".to_owned())
+            .await;
+        assert_eq!(
+            request.await.expect("join token request").expect("token"),
+            Some("checks-read-token".to_owned())
+        );
+        assert_eq!(
+            access
+                .workflow_token(&run, &permissions, &cancel)
+                .await
+                .expect("cached token"),
+            Some("checks-read-token".to_owned())
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "cached token minted more than once"
+        );
+        let mut log = "checks-read-token".to_owned();
+        commands
+            .lock()
+            .expect("workflow command processor was poisoned")
+            .mask_all(&mut log);
+        assert_eq!(log, "***");
     }
 
     #[test]
@@ -9388,6 +9513,7 @@ jobs:
         );
         assert!(pre_job.evaluate("secrets.GITHUB_TOKEN").is_err());
 
+        let job_token = "job-read-scope-token";
         let job = expression_context(
             &run,
             &plan.jobs[0],
@@ -9399,18 +9525,19 @@ jobs:
             ExecutionStatus::Success,
             workspace,
             run_dir,
-            Some(&run.checkout_token),
+            Some(job_token),
         )
         .expect("job context");
         assert_eq!(
             job.evaluate_json("github.token").expect("github token"),
-            JsonValue::String(run.checkout_token.clone())
+            JsonValue::String(job_token.to_owned())
         );
         assert_eq!(
             job.evaluate_json("secrets.GITHUB_TOKEN")
                 .expect("secret token"),
-            JsonValue::String(run.checkout_token)
+            JsonValue::String(job_token.to_owned())
         );
+        assert_ne!(job_token, run.checkout_token);
         assert_eq!(
             job.evaluate_json("github.secret_source")
                 .expect("secret source"),

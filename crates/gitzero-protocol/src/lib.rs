@@ -3,7 +3,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_RUNNER_LABELS: usize = 32;
 pub const MAX_RUNNER_REQUIREMENTS: usize = 512;
 pub const MAX_RUNNER_SELECTOR_BYTES: usize = 256;
@@ -156,6 +156,14 @@ pub enum ServerMessage {
         request_id: Uuid,
         reason: String,
     },
+    WorkflowTokenGranted {
+        request_id: Uuid,
+        token: RepositoryToken,
+    },
+    WorkflowTokenDenied {
+        request_id: Uuid,
+        reason: String,
+    },
     Ack {
         message_id: Uuid,
     },
@@ -205,6 +213,12 @@ pub enum AgentMessage {
         request_id: Uuid,
         owner: String,
         repository: String,
+    },
+    WorkflowTokenRequest {
+        message_id: Uuid,
+        job_id: Uuid,
+        request_id: Uuid,
+        permissions: Vec<String>,
     },
     StepStarted {
         message_id: Uuid,
@@ -354,6 +368,19 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ServerMessage>(&json).expect("deserialize token response"),
             granted
+        );
+
+        let workflow_request = AgentMessage::WorkflowTokenRequest {
+            message_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            request_id,
+            permissions: vec!["checks".into(), "contents".into()],
+        };
+        let json = serde_json::to_string(&workflow_request).expect("serialize workflow token");
+        assert!(json.contains(r#""type":"workflow_token_request""#));
+        assert_eq!(
+            serde_json::from_str::<AgentMessage>(&json).expect("deserialize workflow token"),
+            workflow_request
         );
     }
 

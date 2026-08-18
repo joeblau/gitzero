@@ -1,11 +1,16 @@
 import { SignJWT, importPKCS8 } from "jose";
 import { z } from "zod";
-import type { Conclusion, QueuedJob } from "./protocol";
+import {
+  WORKFLOW_READ_PERMISSIONS,
+  type Conclusion,
+  type QueuedJob,
+} from "./protocol";
 
 const VARIABLE_PAGE_SIZE = 30;
 const MAX_REPOSITORY_VARIABLES = 500;
 const MAX_ORGANIZATION_VARIABLES = 1_000;
 const MAX_COMBINED_VARIABLE_BYTES = 256 * 1_024;
+const workflowReadPermissions = new Set<string>(WORKFLOW_READ_PERMISSIONS);
 
 const actionsVariablePageSchema = z.object({
   total_count: z.number().int().nonnegative(),
@@ -196,6 +201,34 @@ export async function createAgentTokens(
     }),
   ]);
   return { checkoutToken, environmentToken };
+}
+
+export async function createWorkflowToken(
+  env: GitHubEnvironment,
+  installationId: number,
+  repository: string,
+  permissions: readonly string[],
+): Promise<string> {
+  if (
+    permissions.length === 0 ||
+    new Set(permissions).size !== permissions.length ||
+    permissions.some((permission) => !workflowReadPermissions.has(permission))
+  ) {
+    throw new Error(
+      "workflow token permissions must be a nonempty unique set of supported read scopes",
+    );
+  }
+  return createInstallationToken(
+    env,
+    installationId,
+    repository,
+    Object.fromEntries(
+      permissions.map((permission) => [
+        permission.replaceAll("-", "_"),
+        "read" as const,
+      ]),
+    ),
+  );
 }
 
 export async function createSharedRepositoryToken(
