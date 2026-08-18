@@ -154,8 +154,44 @@ pub struct Step {
     pub continue_on_error: Option<Scalar>,
     #[serde(rename = "timeout-minutes", default)]
     pub timeout_minutes: Option<Scalar>,
+    #[serde(default)]
+    pub background: Option<Scalar>,
+    #[serde(default)]
+    pub wait: Option<StepReferences>,
+    #[serde(default)]
+    pub cancel: Option<Scalar>,
+    #[serde(default)]
+    pub parallel: Option<Vec<Step>>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepReferences(pub Vec<String>);
+
+impl<'de> Deserialize<'de> for StepReferences {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        match value {
+            Value::String(value) if !value.is_empty() => Ok(Self(vec![value])),
+            Value::Sequence(values) if !values.is_empty() => values
+                .into_iter()
+                .map(|value| match value {
+                    Value::String(value) if !value.is_empty() => Ok(value),
+                    _ => Err(serde::de::Error::custom(
+                        "wait entries must be non-empty strings",
+                    )),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Self),
+            _ => Err(serde::de::Error::custom(
+                "wait must be a non-empty string or list",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -388,6 +424,7 @@ pub struct PlannedStep {
     pub condition: Option<String>,
     pub continue_on_error: Option<String>,
     pub timeout_minutes: Option<String>,
+    pub background: Option<String>,
     pub kind: StepKind,
 }
 
@@ -403,6 +440,13 @@ pub enum StepKind {
     Uses {
         action: String,
         inputs: BTreeMap<String, String>,
+    },
+    Wait {
+        step_ids: Vec<String>,
+    },
+    WaitAll,
+    Cancel {
+        step_id: String,
     },
 }
 
@@ -1513,110 +1557,377 @@ fn compile_steps(
 ) -> Result<Vec<PlannedStep>, WorkflowError> {
     let mut steps = Vec::with_capacity(source_steps.len());
     let mut action_occurrences = BTreeMap::<String, usize>::new();
-    for (index, step) in source_steps.iter().enumerate() {
-        let step_id = step
-            .id
-            .clone()
-            .unwrap_or_else(|| format!("step-{}", index + 1));
-        let step_name = step.name.clone().unwrap_or_else(|| {
-            step.uses
-                .clone()
-                .or_else(|| step.run.as_ref().map(|_| "Run".to_owned()))
-                .unwrap_or_else(|| step_id.clone())
-        });
-        if let Some(feature) = step.extra.keys().next() {
+    let mut step_ids = BTreeSet::new();
+    let mut background_ids = BTreeMap::new();
+    let mut next_step_number = 1;
+    let mut next_parallel_group = 1;
+    for step in source_steps {
+        compile_step(
+            workflow,
+            job_id,
+            step,
+            false,
+            default_shell,
+            default_working_directory,
+            &mut steps,
+            &mut action_occurrences,
+            &mut step_ids,
+            &mut background_ids,
+            &mut next_step_number,
+            &mut next_parallel_group,
+        )?;
+    }
+    Ok(steps)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_step(
+    workflow: &str,
+    job_id: &str,
+    step: &Step,
+    parallel_background: bool,
+    default_shell: Option<&String>,
+    default_working_directory: Option<&String>,
+    steps: &mut Vec<PlannedStep>,
+    action_occurrences: &mut BTreeMap<String, usize>,
+    step_ids: &mut BTreeSet<String>,
+    background_ids: &mut BTreeMap<String, String>,
+    next_step_number: &mut usize,
+    next_parallel_group: &mut usize,
+) -> Result<String, WorkflowError> {
+    let wait_all = step.extra.get("wait-all");
+    if let Some(feature) = step
+        .extra
+        .keys()
+        .find(|feature| feature.as_str() != "wait-all")
+    {
+        return Err(incompatible(
+            workflow,
+            job_id,
+            format!("step uses unsupported key '{feature}'"),
+        ));
+    }
+    if let Some(value) = wait_all
+        && !value.is_null()
+    {
+        return Err(incompatible(
+            workflow,
+            job_id,
+            "wait-all does not accept a value".to_owned(),
+        ));
+    }
+
+    if let Some(parallel) = &step.parallel {
+        if parallel_background {
             return Err(incompatible(
                 workflow,
                 job_id,
-                format!("step '{step_name}' uses unsupported key '{feature}'"),
+                "parallel groups cannot be nested".to_owned(),
             ));
         }
-        if step.uses.is_some() && (step.shell.is_some() || step.working_directory.is_some()) {
+        if parallel.is_empty() {
             return Err(incompatible(
                 workflow,
                 job_id,
-                format!("step '{step_name}' assigns run-only shell or working-directory fields"),
+                "parallel must contain at least one step".to_owned(),
             ));
         }
-
-        let kind = match (&step.run, &step.uses) {
-            (Some(script), None) if step.with.is_empty() => StepKind::Run {
-                shell: step
-                    .shell
-                    .clone()
-                    .or_else(|| default_shell.cloned())
-                    .unwrap_or_else(|| "bash -e {0}".to_owned()),
-                script: script.clone(),
-            },
-            (Some(_), None) => {
+        if step.id.is_some()
+            || step.name.is_some()
+            || step.run.is_some()
+            || step.uses.is_some()
+            || step.shell.is_some()
+            || step.working_directory.is_some()
+            || !step.env.is_empty()
+            || !step.with.is_empty()
+            || step.condition.is_some()
+            || step.continue_on_error.is_some()
+            || step.timeout_minutes.is_some()
+            || step.background.is_some()
+            || step.wait.is_some()
+            || step.cancel.is_some()
+            || wait_all.is_some()
+        {
+            return Err(incompatible(
+                workflow,
+                job_id,
+                "parallel cannot be combined with other step fields".to_owned(),
+            ));
+        }
+        let group = *next_parallel_group;
+        *next_parallel_group += 1;
+        let mut group_ids = Vec::with_capacity(parallel.len());
+        for child in parallel {
+            if child.background.is_some()
+                || child.wait.is_some()
+                || child.cancel.is_some()
+                || child.parallel.is_some()
+                || child.extra.contains_key("wait-all")
+            {
                 return Err(incompatible(
                     workflow,
                     job_id,
-                    format!("step '{step_name}' supplies with inputs to a run step"),
+                    "parallel entries must be ordinary run or uses steps".to_owned(),
                 ));
             }
-            (None, Some(action)) if is_checkout_action(action) => StepKind::Checkout {
-                inputs: scalar_map(&step.with),
-            },
-            (None, Some(action)) => StepKind::Uses {
-                action: action.clone(),
-                inputs: scalar_map(&step.with),
-            },
-            _ => {
-                return Err(incompatible(
-                    workflow,
-                    job_id,
-                    format!("step '{step_name}' must define exactly one of run or uses"),
-                ));
-            }
-        };
-        let action_base = step.id.clone().unwrap_or_else(|| match &kind {
-            StepKind::Run { .. } => "__run".to_owned(),
-            StepKind::Checkout { .. } => "actionscheckout".to_owned(),
-            StepKind::Uses { action, .. } => action
-                .split('@')
-                .next()
-                .unwrap_or(action)
-                .chars()
-                .filter(char::is_ascii_alphanumeric)
-                .collect::<String>(),
-        });
-        let occurrence = action_occurrences.entry(action_base.clone()).or_default();
-        *occurrence += 1;
-        let github_action = match (&kind, *occurrence) {
-            (_, 1) => action_base,
-            (StepKind::Run { .. }, count) => format!("{action_base}_{count}"),
-            (_, count) => format!("{action_base}{count}"),
-        };
-
+            group_ids.push(compile_step(
+                workflow,
+                job_id,
+                child,
+                true,
+                default_shell,
+                default_working_directory,
+                steps,
+                action_occurrences,
+                step_ids,
+                background_ids,
+                next_step_number,
+                next_parallel_group,
+            )?);
+        }
+        let id = format!("__parallel_{group}_wait");
+        register_step_id(workflow, job_id, &id, step_ids)?;
         steps.push(PlannedStep {
-            id: step_id,
-            github_action,
-            name: step_name,
-            environment: scalar_map(&step.env),
-            working_directory: if matches!(&kind, StepKind::Run { .. }) {
-                step.working_directory
-                    .clone()
-                    .or_else(|| default_working_directory.cloned())
-            } else {
-                None
+            id: id.clone(),
+            github_action: id.clone(),
+            name: "Wait for parallel steps".to_owned(),
+            environment: BTreeMap::new(),
+            working_directory: None,
+            condition: None,
+            continue_on_error: None,
+            timeout_minutes: None,
+            background: None,
+            kind: StepKind::Wait {
+                step_ids: group_ids,
             },
-            condition: step
-                .condition
+        });
+        *next_step_number += 1;
+        return Ok(id);
+    }
+
+    let control_fields = usize::from(step.wait.is_some())
+        + usize::from(wait_all.is_some())
+        + usize::from(step.cancel.is_some());
+    if control_fields > 0 {
+        if control_fields != 1
+            || parallel_background
+            || step.run.is_some()
+            || step.uses.is_some()
+            || step.shell.is_some()
+            || step.working_directory.is_some()
+            || !step.env.is_empty()
+            || !step.with.is_empty()
+            || step.condition.is_some()
+            || step.timeout_minutes.is_some()
+            || step.background.is_some()
+        {
+            return Err(incompatible(
+                workflow,
+                job_id,
+                "wait, wait-all, and cancel must be standalone control steps without if".to_owned(),
+            ));
+        }
+        let kind = if let Some(wait) = &step.wait {
+            let ids = resolve_background_ids(workflow, job_id, "wait", &wait.0, background_ids)?;
+            StepKind::Wait { step_ids: ids }
+        } else if wait_all.is_some() {
+            StepKind::WaitAll
+        } else {
+            let id = step
+                .cancel
                 .as_ref()
-                .map(|condition| condition.as_str().to_owned()),
+                .expect("control field count requires cancel")
+                .as_str();
+            let ids = resolve_background_ids(
+                workflow,
+                job_id,
+                "cancel",
+                &[id.to_owned()],
+                background_ids,
+            )?;
+            StepKind::Cancel {
+                step_id: ids[0].clone(),
+            }
+        };
+        let generated_id = format!("step-{}", *next_step_number);
+        *next_step_number += 1;
+        let id = step.id.clone().unwrap_or(generated_id);
+        register_step_id(workflow, job_id, &id, step_ids)?;
+        let name = step.name.clone().unwrap_or_else(|| match &kind {
+            StepKind::Wait { .. } => "Wait for background steps".to_owned(),
+            StepKind::WaitAll => "Wait for all background steps".to_owned(),
+            StepKind::Cancel { .. } => "Cancel background step".to_owned(),
+            _ => unreachable!("control step kind"),
+        });
+        steps.push(PlannedStep {
+            id: id.clone(),
+            github_action: step.id.clone().unwrap_or_else(|| match &kind {
+                StepKind::Wait { .. } => "__wait".to_owned(),
+                StepKind::WaitAll => "__wait_all".to_owned(),
+                StepKind::Cancel { .. } => "__cancel".to_owned(),
+                _ => unreachable!("control step kind"),
+            }),
+            name,
+            environment: BTreeMap::new(),
+            working_directory: None,
+            condition: None,
             continue_on_error: step
                 .continue_on_error
                 .as_ref()
                 .map(|value| value.as_str().to_owned()),
-            timeout_minutes: step
-                .timeout_minutes
-                .as_ref()
-                .map(|value| value.as_str().to_owned()),
+            timeout_minutes: None,
+            background: None,
             kind,
         });
+        return Ok(id);
     }
-    Ok(steps)
+
+    let generated_id = format!("step-{}", *next_step_number);
+    *next_step_number += 1;
+    let step_id = step.id.clone().unwrap_or(generated_id);
+    register_step_id(workflow, job_id, &step_id, step_ids)?;
+    let step_name = step.name.clone().unwrap_or_else(|| {
+        step.uses
+            .clone()
+            .or_else(|| step.run.as_ref().map(|_| "Run".to_owned()))
+            .unwrap_or_else(|| step_id.clone())
+    });
+    if step.uses.is_some() && (step.shell.is_some() || step.working_directory.is_some()) {
+        return Err(incompatible(
+            workflow,
+            job_id,
+            format!("step '{step_name}' assigns run-only shell or working-directory fields"),
+        ));
+    }
+
+    let kind = match (&step.run, &step.uses) {
+        (Some(script), None) if step.with.is_empty() => StepKind::Run {
+            shell: step
+                .shell
+                .clone()
+                .or_else(|| default_shell.cloned())
+                .unwrap_or_else(|| "bash -e {0}".to_owned()),
+            script: script.clone(),
+        },
+        (Some(_), None) => {
+            return Err(incompatible(
+                workflow,
+                job_id,
+                format!("step '{step_name}' supplies with inputs to a run step"),
+            ));
+        }
+        (None, Some(action)) if is_checkout_action(action) => StepKind::Checkout {
+            inputs: scalar_map(&step.with),
+        },
+        (None, Some(action)) => StepKind::Uses {
+            action: action.clone(),
+            inputs: scalar_map(&step.with),
+        },
+        _ => {
+            return Err(incompatible(
+                workflow,
+                job_id,
+                format!("step '{step_name}' must define exactly one of run or uses"),
+            ));
+        }
+    };
+    let action_base = step.id.clone().unwrap_or_else(|| match &kind {
+        StepKind::Run { .. } => "__run".to_owned(),
+        StepKind::Checkout { .. } => "actionscheckout".to_owned(),
+        StepKind::Uses { action, .. } => action
+            .split('@')
+            .next()
+            .unwrap_or(action)
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>(),
+        _ => unreachable!("ordinary step kind"),
+    });
+    let occurrence = action_occurrences.entry(action_base.clone()).or_default();
+    *occurrence += 1;
+    let github_action = match (&kind, *occurrence) {
+        (_, 1) => action_base,
+        (StepKind::Run { .. }, count) => format!("{action_base}_{count}"),
+        (_, count) => format!("{action_base}{count}"),
+    };
+    let background = if parallel_background {
+        Some("true".to_owned())
+    } else {
+        step.background
+            .as_ref()
+            .map(|value| value.as_str().to_owned())
+    };
+    if step.id.is_some() && background.as_deref() != Some("false") && background.is_some() {
+        background_ids.insert(step_id.to_ascii_lowercase(), step_id.clone());
+    }
+
+    steps.push(PlannedStep {
+        id: step_id.clone(),
+        github_action,
+        name: step_name,
+        environment: scalar_map(&step.env),
+        working_directory: if matches!(&kind, StepKind::Run { .. }) {
+            step.working_directory
+                .clone()
+                .or_else(|| default_working_directory.cloned())
+        } else {
+            None
+        },
+        condition: step
+            .condition
+            .as_ref()
+            .map(|condition| condition.as_str().to_owned()),
+        continue_on_error: step
+            .continue_on_error
+            .as_ref()
+            .map(|value| value.as_str().to_owned()),
+        timeout_minutes: step
+            .timeout_minutes
+            .as_ref()
+            .map(|value| value.as_str().to_owned()),
+        background,
+        kind,
+    });
+    Ok(step_id)
+}
+
+fn register_step_id(
+    workflow: &str,
+    job_id: &str,
+    step_id: &str,
+    step_ids: &mut BTreeSet<String>,
+) -> Result<(), WorkflowError> {
+    if !step_ids.insert(step_id.to_ascii_lowercase()) {
+        return Err(incompatible(
+            workflow,
+            job_id,
+            format!("step id '{step_id}' is duplicated"),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_background_ids(
+    workflow: &str,
+    job_id: &str,
+    control: &str,
+    ids: &[String],
+    background_ids: &BTreeMap<String, String>,
+) -> Result<Vec<String>, WorkflowError> {
+    ids.iter()
+        .map(|id| {
+            background_ids
+                .get(&id.to_ascii_lowercase())
+                .cloned()
+                .ok_or_else(|| {
+                    incompatible(
+                        workflow,
+                        job_id,
+                        format!("{control} references unknown prior background step '{id}'"),
+                    )
+                })
+        })
+        .collect()
 }
 
 fn validate_job(workflow: &str, job_id: &str, job: &Job) -> Result<(), WorkflowError> {
@@ -2750,6 +3061,94 @@ jobs:
             StepKind::Run { shell, script }
                 if shell == "bash -e {0}" && script == "cargo test --workspace"
         ));
+    }
+
+    #[test]
+    fn compiles_background_controls_and_parallel_groups() {
+        let workflow = parse(
+            r#"
+name: Concurrent steps
+on: pull_request
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - id: frontend
+        run: ./build-frontend
+        background: true
+      - id: backend
+        uses: owner/build-action@v1
+        background: ${{ matrix.concurrent }}
+      - run: ./lint
+      - wait: [frontend, backend]
+      - wait-all:
+        continue-on-error: true
+      - cancel: backend
+      - parallel:
+          - name: Unit tests
+            run: ./unit
+          - uses: owner/docs-action@v1
+"#,
+        )
+        .expect("parse concurrent steps");
+        let plan = compile(&workflow, Path::new("concurrent.yml")).expect("compile steps");
+        let steps = &plan.jobs[0].steps;
+        assert_eq!(steps.len(), 9);
+        assert_eq!(steps[0].background.as_deref(), Some("true"));
+        assert_eq!(
+            steps[1].background.as_deref(),
+            Some("${{ matrix.concurrent }}")
+        );
+        assert!(matches!(
+            &steps[3].kind,
+            StepKind::Wait { step_ids } if step_ids == &["frontend", "backend"]
+        ));
+        assert!(matches!(steps[4].kind, StepKind::WaitAll));
+        assert_eq!(steps[4].continue_on_error.as_deref(), Some("true"));
+        assert!(matches!(
+            &steps[5].kind,
+            StepKind::Cancel { step_id } if step_id == "backend"
+        ));
+        assert_eq!(steps[6].background.as_deref(), Some("true"));
+        assert_eq!(steps[7].background.as_deref(), Some("true"));
+        assert!(matches!(
+            &steps[8].kind,
+            StepKind::Wait { step_ids }
+                if step_ids == &[steps[6].id.clone(), steps[7].id.clone()]
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_background_control_shapes_and_targets() {
+        for (source, expected) in [
+            (
+                "      - wait: missing\n",
+                "unknown prior background step 'missing'",
+            ),
+            (
+                "      - wait-all: true\n",
+                "wait-all does not accept a value",
+            ),
+            (
+                "      - wait-all:\n        if: always()\n",
+                "standalone control steps without if",
+            ),
+            (
+                "      - parallel:\n          - run: echo nested\n            background: true\n",
+                "parallel entries must be ordinary",
+            ),
+        ] {
+            let workflow = parse(&format!(
+                "name: Invalid background\non: pull_request\njobs:\n  test:\n    runs-on: macos-latest\n    steps:\n{source}"
+            ))
+            .expect("parse invalid background workflow");
+            let error = compile(&workflow, Path::new("invalid.yml"))
+                .expect_err("invalid background workflow must fail");
+            assert!(
+                error.to_string().contains(expected),
+                "expected '{expected}' in '{error}'"
+            );
+        }
     }
 
     #[test]

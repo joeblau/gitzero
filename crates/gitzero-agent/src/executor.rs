@@ -86,6 +86,7 @@ const MAX_REPOSITORY_TOKENS_PER_RUN: usize = 256;
 const MAX_WORKFLOW_TOKEN_SCOPES_PER_RUN: usize = 256;
 const MAX_MANAGED_SECRETS_PER_JOB: usize = 300;
 const MAX_MANAGED_SECRET_BYTES: usize = 48 * 1_024;
+const MAX_BACKGROUND_STEPS: usize = 10;
 
 type EnvironmentVariableCache = Arc<Mutex<BTreeMap<String, BTreeMap<String, String>>>>;
 
@@ -2051,6 +2052,13 @@ impl JobSummaryBuilder {
         }
     }
 
+    fn append(&mut self, other: Self) {
+        for step in other.steps {
+            self.push(step.name, step.markdown);
+        }
+        self.omitted_steps |= other.omitted_steps;
+    }
+
     fn finish(self, completed_order: u64) -> Option<JobSummary> {
         if self.steps.is_empty() && !self.omitted_steps {
             return None;
@@ -2134,6 +2142,31 @@ struct StepExecution {
     outcome: JobConclusion,
     outputs: BTreeMap<String, String>,
     ran: bool,
+}
+
+struct BackgroundStepCompletion {
+    execution: StepExecution,
+    initial_environment: BTreeMap<String, String>,
+    final_environment: BTreeMap<String, String>,
+    posts: Vec<ActionPost>,
+    summary: JobSummaryBuilder,
+}
+
+struct BackgroundStepRuntime {
+    cancel: watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<Result<BackgroundStepCompletion>>>,
+    conclusion: Option<JobConclusion>,
+    explicitly_cancelled: bool,
+    flushed: bool,
+}
+
+impl Drop for BackgroundStepRuntime {
+    fn drop(&mut self) {
+        self.cancel.send_replace(true);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 struct ActionPost {
@@ -3613,6 +3646,16 @@ impl Drop for AbortTaskOnDrop {
     }
 }
 
+struct AbortTasksOnDrop(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortTasksOnDrop {
+    fn drop(&mut self) {
+        for task in self.0.drain(..) {
+            task.abort();
+        }
+    }
+}
+
 struct SensitiveDirectoryGuard(PathBuf);
 
 impl Drop for SensitiveDirectoryGuard {
@@ -3628,6 +3671,235 @@ impl Drop for SensitiveDirectoryGuard {
                 );
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_background_step(
+    job_id: Uuid,
+    workflow_name: String,
+    workflow_job_id: String,
+    job_summary_name: String,
+    step: PlannedStep,
+    run: RunSpec,
+    repository_dir: PathBuf,
+    run_dir: PathBuf,
+    initial_environment: BTreeMap<String, String>,
+    context: EvaluationContext,
+    status: ExecutionStatus,
+    cancel: watch::Receiver<bool>,
+    outbound: mpsc::Sender<AgentMessage>,
+    sequence: Arc<AtomicU64>,
+    job_timed_out: Arc<AtomicBool>,
+    workflow_commands: Arc<StdMutex<WorkflowCommandProcessor>>,
+    repository_access: RunRepositoryAccess,
+    checkout_secret_values: BTreeSet<String>,
+    slots: Arc<Semaphore>,
+) -> BackgroundStepRuntime {
+    let (step_cancel, local_cancel) = watch::channel(false);
+    let task = tokio::spawn(async move {
+        let (combined_cancel, relays) = combine_cancellations(&cancel, vec![local_cancel]);
+        let _relay_guard = AbortTasksOnDrop(relays);
+        let mut slot_cancel = combined_cancel.clone();
+        let permit = match acquire_execution_slot(slots, &mut slot_cancel).await {
+            Ok(permit) => permit,
+            Err(_) if *combined_cancel.borrow() => {
+                return Ok(BackgroundStepCompletion {
+                    execution: StepExecution {
+                        conclusion: JobConclusion::Cancelled,
+                        outcome: JobConclusion::Cancelled,
+                        outputs: BTreeMap::new(),
+                        ran: false,
+                    },
+                    initial_environment: initial_environment.clone(),
+                    final_environment: initial_environment,
+                    posts: Vec::new(),
+                    summary: JobSummaryBuilder::new(job_summary_name),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let mut final_environment = initial_environment.clone();
+        let mut posts = Vec::new();
+        let mut summary = JobSummaryBuilder::new(job_summary_name);
+        let execution = execute_step(
+            job_id,
+            &workflow_name,
+            &workflow_job_id,
+            &step,
+            &run,
+            &repository_dir,
+            &run_dir,
+            &mut final_environment,
+            &context,
+            status,
+            &mut posts,
+            &combined_cancel,
+            &outbound,
+            &sequence,
+            job_timed_out.as_ref(),
+            &mut summary,
+            &workflow_commands,
+            &repository_access,
+            &checkout_secret_values,
+        )
+        .await;
+        drop(permit);
+        Ok(BackgroundStepCompletion {
+            execution: execution?,
+            initial_environment,
+            final_environment,
+            posts,
+            summary,
+        })
+    });
+    BackgroundStepRuntime {
+        cancel: step_cancel,
+        task: Some(task),
+        conclusion: None,
+        explicitly_cancelled: false,
+        flushed: false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn flush_background_steps(
+    ids: &[String],
+    background: &mut BTreeMap<String, BackgroundStepRuntime>,
+    environment: &mut BTreeMap<String, String>,
+    steps: &mut serde_json::Map<String, JsonValue>,
+    posts: &mut Vec<ActionPost>,
+    job_summary: &mut JobSummaryBuilder,
+    completed_steps: &mut usize,
+) -> Result<Vec<JobConclusion>> {
+    let mut conclusions = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(runtime) = background.get_mut(id) else {
+            conclusions.push(JobConclusion::Success);
+            continue;
+        };
+        let task = runtime.task.take();
+        let completion = match task {
+            Some(task) => Some(
+                task.await
+                    .with_context(|| format!("background step '{id}' task ended unexpectedly"))??,
+            ),
+            None => None,
+        };
+        if let Some(completion) = completion {
+            let runtime = background
+                .get_mut(id)
+                .expect("background step remained registered while joining");
+            runtime.conclusion = Some(completion.execution.conclusion);
+            if !runtime.flushed {
+                merge_background_environment(
+                    environment,
+                    &completion.initial_environment,
+                    &completion.final_environment,
+                );
+                posts.extend(completion.posts);
+                job_summary.append(completion.summary);
+                if completion.execution.ran {
+                    *completed_steps += 1;
+                }
+                steps.insert(
+                    id.clone(),
+                    json!({
+                        "outputs": completion.execution.outputs,
+                        "outcome": completion.execution.outcome.as_github_result(),
+                        "conclusion": completion.execution.conclusion.as_github_result(),
+                    }),
+                );
+                runtime.flushed = true;
+            }
+        }
+        conclusions.push(
+            background
+                .get(id)
+                .and_then(|runtime| runtime.conclusion)
+                .unwrap_or(JobConclusion::Success),
+        );
+    }
+    Ok(conclusions)
+}
+
+fn merge_background_environment(
+    environment: &mut BTreeMap<String, String>,
+    initial: &BTreeMap<String, String>,
+    final_environment: &BTreeMap<String, String>,
+) {
+    for (name, value) in final_environment {
+        if name != "PATH" && initial.get(name) != Some(value) {
+            environment.insert(name.clone(), value.clone());
+        }
+    }
+    let initial_path = initial
+        .get("PATH")
+        .cloned()
+        .or_else(|| std::env::var("PATH").ok())
+        .unwrap_or_default();
+    let final_path = final_environment
+        .get("PATH")
+        .map(String::as_str)
+        .unwrap_or_default();
+    if initial_path == final_path {
+        return;
+    }
+    let initial_entries = split_path(&initial_path);
+    let final_entries = split_path(final_path);
+    if let Some(additions) = deferred_path_additions(&initial_entries, &final_entries) {
+        let current = environment
+            .get("PATH")
+            .cloned()
+            .or_else(|| std::env::var("PATH").ok())
+            .map(|path| split_path(&path))
+            .unwrap_or_default();
+        let additions = additions.to_vec();
+        let mut merged = additions.clone();
+        merged.extend(
+            current
+                .into_iter()
+                .filter(|entry| !additions.iter().any(|addition| addition == entry)),
+        );
+        environment.insert("PATH".to_owned(), merged.join(":"));
+    } else {
+        environment.insert("PATH".to_owned(), final_path.to_owned());
+    }
+}
+
+fn split_path(path: &str) -> Vec<String> {
+    if path.is_empty() {
+        Vec::new()
+    } else {
+        path.split(':').map(str::to_owned).collect()
+    }
+}
+
+fn deferred_path_additions<'a>(
+    initial: &[String],
+    final_entries: &'a [String],
+) -> Option<&'a [String]> {
+    (1..=final_entries.len()).find_map(|prefix_length| {
+        let additions = &final_entries[..prefix_length];
+        let retained = initial
+            .iter()
+            .filter(|entry| !additions.iter().any(|addition| addition == *entry))
+            .collect::<Vec<_>>();
+        (retained.len() == final_entries.len().saturating_sub(prefix_length)
+            && retained
+                .iter()
+                .zip(&final_entries[prefix_length..])
+                .all(|(left, right)| left.as_str() == right))
+        .then_some(additions)
+    })
+}
+
+fn background_wait_conclusion(conclusions: &[JobConclusion]) -> JobConclusion {
+    let conclusion = aggregate_conclusions(conclusions);
+    if conclusion == JobConclusion::Skipped {
+        JobConclusion::Success
+    } else {
+        conclusion
     }
 }
 
@@ -3860,21 +4132,18 @@ async fn execute_job(
 
         let step_execution = async {
             let cancel = &effective_cancel;
-            let job_timed_out = job_timed_out.as_ref();
+            let job_timed_out = job_timed_out.clone();
             let mut steps = serde_json::Map::new();
             let mut posts = Vec::new();
             let mut status = ExecutionStatus::Success;
             let mut completed_steps = 0;
+            let background_slots = Arc::new(Semaphore::new(MAX_BACKGROUND_STEPS));
+            let mut background = BTreeMap::<String, BackgroundStepRuntime>::new();
+            let mut background_order = Vec::<String>::new();
             for step in &job.steps {
                 if *cancel.borrow() {
-                    if job_timed_out.load(Ordering::Acquire) {
-                        return Ok(JobExecution {
-                            conclusion: JobConclusion::TimedOut,
-                            completed_steps,
-                            outputs: BTreeMap::new(),
-                        });
-                    }
-                    bail!("run cancelled");
+                    status = ExecutionStatus::Cancelled;
+                    break;
                 }
                 workflow_token = repository_access
                     .workflow_token(run, &job.permissions, cancel)
@@ -3900,6 +4169,139 @@ async fn execute_job(
                     workflow_token.as_deref(),
                     &managed_secrets,
                 )?;
+                let is_background = match step.background.as_deref() {
+                    Some(background) => context
+                        .evaluate_condition(background)
+                        .with_context(|| format!("evaluate background '{background}'"))?,
+                    None => false,
+                };
+                if matches!(
+                    &step.kind,
+                    StepKind::Checkout { .. } | StepKind::Run { .. } | StepKind::Uses { .. }
+                ) && is_background
+                {
+                    let runtime = start_background_step(
+                        job_id,
+                        workflow_name.to_owned(),
+                        event_job_id.to_owned(),
+                        format!("{workflow_name} / {rendered_job_name}"),
+                        step.clone(),
+                        run.clone(),
+                        workspace.to_path_buf(),
+                        run_dir.to_path_buf(),
+                        job_environment.clone(),
+                        context.clone(),
+                        status,
+                        cancel.clone(),
+                        outbound.clone(),
+                        sequence.clone(),
+                        job_timed_out.clone(),
+                        workflow_commands.clone(),
+                        repository_access.clone(),
+                        checkout_secret_values.clone(),
+                        background_slots.clone(),
+                    );
+                    background_order.push(step.id.clone());
+                    background.insert(step.id.clone(), runtime);
+                    continue;
+                }
+
+                if matches!(
+                    &step.kind,
+                    StepKind::Wait { .. } | StepKind::WaitAll | StepKind::Cancel { .. }
+                ) {
+                    let step_id = format!("{event_job_id}/{}", step.id);
+                    let step_name = context.render(&step.name)?;
+                    send(
+                        outbound,
+                        AgentMessage::StepStarted {
+                            message_id: Uuid::new_v4(),
+                            job_id,
+                            step_id: step_id.clone(),
+                            name: format!("{workflow_name} / {step_name}"),
+                        },
+                    )
+                    .await?;
+                    let target_ids = match &step.kind {
+                        StepKind::Wait { step_ids } => step_ids.clone(),
+                        StepKind::WaitAll => background_order
+                            .iter()
+                            .filter(|id| {
+                                background.get(*id).is_some_and(|runtime| !runtime.flushed)
+                            })
+                            .cloned()
+                            .collect(),
+                        StepKind::Cancel { step_id } => vec![step_id.clone()],
+                        _ => unreachable!("background control step"),
+                    };
+                    if matches!(&step.kind, StepKind::Cancel { .. }) {
+                        for id in &target_ids {
+                            if let Some(runtime) = background.get_mut(id) {
+                                runtime.explicitly_cancelled = true;
+                                runtime.cancel.send_replace(true);
+                            }
+                        }
+                    }
+                    let conclusions = flush_background_steps(
+                        &target_ids,
+                        &mut background,
+                        &mut job_environment,
+                        &mut steps,
+                        &mut posts,
+                        &mut job_summary,
+                        &mut completed_steps,
+                    )
+                    .await?;
+                    let outcome = if matches!(&step.kind, StepKind::Cancel { .. }) {
+                        JobConclusion::Success
+                    } else {
+                        background_wait_conclusion(&conclusions)
+                    };
+                    let continue_on_error = match step.continue_on_error.as_deref() {
+                        Some(condition) => context
+                            .evaluate_condition(condition)
+                            .with_context(|| format!("evaluate continue-on-error '{condition}'"))?,
+                        None => false,
+                    };
+                    let conclusion = if continue_on_error && outcome == JobConclusion::Failure {
+                        JobConclusion::Success
+                    } else {
+                        outcome
+                    };
+                    completed_steps += 1;
+                    steps.insert(
+                        step.id.clone(),
+                        json!({
+                            "outputs": BTreeMap::<String, String>::new(),
+                            "outcome": outcome.as_github_result(),
+                            "conclusion": conclusion.as_github_result(),
+                        }),
+                    );
+                    send(
+                        outbound,
+                        AgentMessage::StepFinished {
+                            message_id: Uuid::new_v4(),
+                            job_id,
+                            step_id,
+                            conclusion: protocol_conclusion(conclusion),
+                            exit_code: Some(if conclusion == JobConclusion::Success {
+                                0
+                            } else {
+                                1
+                            }),
+                        },
+                    )
+                    .await?;
+                    match conclusion {
+                        JobConclusion::Failure | JobConclusion::TimedOut => {
+                            status = ExecutionStatus::Failure
+                        }
+                        JobConclusion::Cancelled => status = ExecutionStatus::Cancelled,
+                        JobConclusion::Success | JobConclusion::Skipped => {}
+                    }
+                    continue;
+                }
+
                 let execution = execute_step(
                     job_id,
                     workflow_name,
@@ -3915,7 +4317,7 @@ async fn execute_job(
                     cancel,
                     outbound,
                     sequence,
-                    job_timed_out,
+                    job_timed_out.as_ref(),
                     &mut job_summary,
                     workflow_commands,
                     repository_access,
@@ -3943,6 +4345,38 @@ async fn execute_job(
                 if status == ExecutionStatus::Cancelled || job_timed_out.load(Ordering::Acquire) {
                     break;
                 }
+            }
+
+            let remaining = background_order
+                .iter()
+                .filter(|id| background.get(*id).is_some_and(|runtime| !runtime.flushed))
+                .cloned()
+                .collect::<Vec<_>>();
+            flush_background_steps(
+                &remaining,
+                &mut background,
+                &mut job_environment,
+                &mut steps,
+                &mut posts,
+                &mut job_summary,
+                &mut completed_steps,
+            )
+            .await?;
+            let background_conclusions = background_order
+                .iter()
+                .filter_map(|id| background.get(id))
+                .filter_map(|runtime| {
+                    let conclusion = runtime.conclusion?;
+                    (!(runtime.explicitly_cancelled && conclusion == JobConclusion::Cancelled))
+                        .then_some(conclusion)
+                })
+                .collect::<Vec<_>>();
+            match background_wait_conclusion(&background_conclusions) {
+                JobConclusion::Failure | JobConclusion::TimedOut => {
+                    status = ExecutionStatus::Failure
+                }
+                JobConclusion::Cancelled => status = ExecutionStatus::Cancelled,
+                JobConclusion::Success | JobConclusion::Skipped => {}
             }
 
             if job_timed_out.load(Ordering::Acquire) {
@@ -3988,7 +4422,7 @@ async fn execute_job(
                     cancel,
                     outbound,
                     sequence,
-                    job_timed_out,
+                    job_timed_out.as_ref(),
                     &mut job_summary,
                     &summary_name,
                     workflow_commands,
@@ -4366,6 +4800,9 @@ async fn execute_step(
             .await;
         }
         StepKind::Run { shell, script } => (shell, script),
+        StepKind::Wait { .. } | StepKind::WaitAll | StepKind::Cancel { .. } => {
+            bail!("background control steps must be executed by the job coordinator")
+        }
     };
     let shell = step_context.render(shell)?;
     let script = step_context.render(script)?;
@@ -6924,6 +7361,9 @@ fn plan_composite_step(step: &ActionStep, index: usize) -> Result<PlannedStep> {
             .chars()
             .filter(char::is_ascii_alphanumeric)
             .collect(),
+        StepKind::Wait { .. } | StepKind::WaitAll | StepKind::Cancel { .. } => {
+            unreachable!("composite actions cannot contain background control steps")
+        }
     });
     Ok(PlannedStep {
         id,
@@ -6944,6 +7384,7 @@ fn plan_composite_step(step: &ActionStep, index: usize) -> Result<PlannedStep> {
             .as_ref()
             .map(|condition| condition.as_str().to_owned()),
         timeout_minutes: None,
+        background: None,
         kind,
     })
 }
@@ -13031,6 +13472,371 @@ jobs:
             deployment_policy_reference("refs/tags/v1").expect("tag reference"),
             ("tag", "v1")
         );
+    }
+
+    #[test]
+    fn background_environment_flushes_paths_in_wait_order() {
+        let initial = BTreeMap::from([
+            ("PATH".to_owned(), "/base/bin:/usr/bin".to_owned()),
+            ("SHARED".to_owned(), "initial".to_owned()),
+        ]);
+        let first = BTreeMap::from([
+            (
+                "PATH".to_owned(),
+                "/first/bin:/base/bin:/usr/bin".to_owned(),
+            ),
+            ("SHARED".to_owned(), "first".to_owned()),
+        ]);
+        let second = BTreeMap::from([
+            (
+                "PATH".to_owned(),
+                "/second/bin:/base/bin:/usr/bin".to_owned(),
+            ),
+            ("SHARED".to_owned(), "second".to_owned()),
+        ]);
+        let mut environment = initial.clone();
+        merge_background_environment(&mut environment, &initial, &first);
+        merge_background_environment(&mut environment, &initial, &second);
+        assert_eq!(
+            environment["PATH"],
+            "/second/bin:/first/bin:/base/bin:/usr/bin"
+        );
+        assert_eq!(environment["SHARED"], "second");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn executes_background_waits_and_parallel_steps_with_deferred_state() {
+        let fixture = tempfile::tempdir().expect("background fixture tempdir");
+        let repository = fixture.path().join("repository");
+        std::fs::create_dir_all(&repository).expect("repository directory");
+        git(&repository, ["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            ["config", "user.email", "gitzero@example.test"],
+        );
+        git(&repository, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(repository.join("README.md"), "background fixture\n").expect("fixture file");
+        git(&repository, ["add", "."]);
+        git(&repository, ["commit", "-m", "background fixture"]);
+        let head_sha = git_output(&repository, ["rev-parse", "HEAD"]);
+        let workflow = parse(
+            r#"
+name: Background parity
+on: pull_request
+jobs:
+  verify:
+    runs-on: macos-latest
+    steps:
+      - id: first
+        background: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/first-bin"
+          touch "$RUNNER_TEMP/first-started"
+          while [ ! -f "$RUNNER_TEMP/release-first" ]; do sleep 0.02; done
+          echo FIRST_ENV=one >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/first-bin" >> "$GITHUB_PATH"
+          echo value=one >> "$GITHUB_OUTPUT"
+      - id: second
+        background: true
+        run: |
+          mkdir -p "$RUNNER_TEMP/second-bin"
+          touch "$RUNNER_TEMP/second-started"
+          while [ ! -f "$RUNNER_TEMP/release-second" ]; do sleep 0.02; done
+          echo SECOND_ENV=two >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/second-bin" >> "$GITHUB_PATH"
+          echo value=two >> "$GITHUB_OUTPUT"
+      - name: Foreground overlaps both
+        run: |
+          while [ ! -f "$RUNNER_TEMP/first-started" ] || [ ! -f "$RUNNER_TEMP/second-started" ]; do sleep 0.02; done
+          test -z "$FIRST_ENV"
+          test -z "$SECOND_ENV"
+          touch "$RUNNER_TEMP/release-first"
+      - id: wait-first
+        wait: first
+      - name: First state only
+        run: |
+          test "$FIRST_ENV" = one
+          test '${{ steps.first.outputs.value }}' = one
+          test -z "$SECOND_ENV"
+          case "$PATH" in "$RUNNER_TEMP/first-bin:"*) ;; *) exit 1 ;; esac
+          touch "$RUNNER_TEMP/release-second"
+      - wait-all:
+      - name: All state
+        run: |
+          test "$SECOND_ENV" = two
+          test '${{ steps.second.outputs.value }}' = two
+          echo "background-path:$PATH"
+          case "$PATH" in "$RUNNER_TEMP/second-bin:$RUNNER_TEMP/first-bin:"*) ;; *) exit 1 ;; esac
+      - id: expression-disabled-background
+        background: ${{ false }}
+        run: echo expression-background-foreground
+      - wait: expression-disabled-background
+      - name: Prepare local background action
+        run: |
+          mkdir -p .github/actions/background
+          cat > .github/actions/background/action.yml <<'ACTION'
+          name: Background JavaScript
+          runs:
+            using: node24
+            main: main.js
+            post: post.js
+          ACTION
+          cat > .github/actions/background/main.js <<'MAIN'
+          const fs = require('fs');
+          const path = require('path');
+          const ready = path.join(process.env.RUNNER_TEMP, 'action-ready');
+          const release = path.join(process.env.RUNNER_TEMP, 'release-action');
+          fs.writeFileSync(ready, 'ready');
+          function wait() {
+            if (fs.existsSync(release)) {
+              fs.appendFileSync(process.env.GITHUB_ENV, 'ACTION_ENV=action\n');
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, 'value=action\n');
+              console.log('background-action-main');
+              return;
+            }
+            setTimeout(wait, 20);
+          }
+          wait();
+          MAIN
+          cat > .github/actions/background/post.js <<'POST'
+          console.log('background-action-post');
+          POST
+      - id: background-action
+        uses: ./.github/actions/background
+        background: true
+      - name: Release background action
+        run: |
+          for attempt in $(seq 1 250); do
+            if [ -f "$RUNNER_TEMP/action-ready" ]; then break; fi
+            sleep 0.02
+          done
+          test -z "$ACTION_ENV"
+          touch "$RUNNER_TEMP/release-action"
+          test -f "$RUNNER_TEMP/action-ready"
+      - parallel:
+          - name: Parallel one
+            run: |
+              touch "$RUNNER_TEMP/parallel-one"
+              while [ ! -f "$RUNNER_TEMP/parallel-two" ]; do sleep 0.02; done
+              echo parallel-one
+          - name: Parallel two
+            run: |
+              touch "$RUNNER_TEMP/parallel-two"
+              while [ ! -f "$RUNNER_TEMP/parallel-one" ]; do sleep 0.02; done
+              echo parallel-two
+      - run: echo background-parity-complete
+"#,
+        )
+        .expect("parse background workflow");
+        let plan =
+            gitzero_workflow::compile(&workflow, Path::new(".github/workflows/background.yml"))
+                .expect("compile background workflow");
+        let run_dir = fixture.path().join("run");
+        let tool_cache = fixture.path().join("toolcache");
+        tokio::fs::create_dir_all(&run_dir).await.expect("run dir");
+        tokio::fs::create_dir_all(&tool_cache)
+            .await
+            .expect("tool cache");
+        let run = fixture_run(
+            Uuid::new_v4(),
+            head_sha.clone(),
+            head_sha,
+            repository.display().to_string(),
+        );
+        let environment =
+            github_environment(&run, &repository, &run_dir, &tool_cache, "GitZero Test")
+                .await
+                .expect("GitHub environment");
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let (outbound, mut incoming) = mpsc::channel(512);
+        let sequence = Arc::new(AtomicU64::new(0));
+        let execution_slots = Arc::new(Semaphore::new(1));
+        let runner_targeting = default_runner_targeting();
+        let job_summaries = Arc::new(Mutex::new(Vec::new()));
+        let environment_variable_cache = Arc::new(Mutex::new(BTreeMap::new()));
+        let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let concurrency = ConcurrencyClient::local();
+        let repository_access = local_repository_access(&workflow_commands);
+        let execution = execute_plan(
+            run.id,
+            &plan,
+            0,
+            &run,
+            &repository,
+            &run_dir,
+            &environment,
+            &cancel,
+            &outbound,
+            &sequence,
+            &execution_slots,
+            &runner_targeting,
+            &job_summaries,
+            &environment_variable_cache,
+            &workflow_commands,
+            &concurrency,
+            &repository_access,
+        );
+        tokio::pin!(execution);
+        let mut events = Vec::new();
+        loop {
+            tokio::select! {
+                result = &mut execution => {
+                    let result = result.expect("execute background workflow");
+                    assert!(
+                        result.failed_jobs.is_empty(),
+                        "failed jobs: {:?}; events: {:?}",
+                        result.failed_jobs,
+                        events
+                    );
+                    assert!(result.cancelled_jobs.is_empty());
+                    break;
+                }
+                message = incoming.recv() => {
+                    events.push(message.expect("background event"));
+                }
+            }
+        }
+        while let Ok(message) = incoming.try_recv() {
+            events.push(message);
+        }
+        for expected in [
+            "background-action-main\n",
+            "background-action-post\n",
+            "expression-background-foreground\n",
+            "parallel-one\n",
+            "parallel-two\n",
+            "background-parity-complete\n",
+        ] {
+            assert!(events.iter().any(|message| matches!(
+                message,
+                AgentMessage::LogChunk { data, .. } if data == expected
+            )));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cancels_background_processes_neutrally_and_surfaces_prior_failures() {
+        let fixture = tempfile::tempdir().expect("background cancellation tempdir");
+        let repository = fixture.path().join("repository");
+        std::fs::create_dir_all(&repository).expect("repository directory");
+        git(&repository, ["init", "--initial-branch=main"]);
+        git(
+            &repository,
+            ["config", "user.email", "gitzero@example.test"],
+        );
+        git(&repository, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(repository.join("README.md"), "cancel fixture\n").expect("fixture file");
+        git(&repository, ["add", "."]);
+        git(&repository, ["commit", "-m", "cancel fixture"]);
+        let head_sha = git_output(&repository, ["rev-parse", "HEAD"]);
+        let workflow = parse(
+            r#"
+name: Background cancellation
+on: pull_request
+jobs:
+  verify:
+    runs-on: macos-latest
+    steps:
+      - id: monitor
+        background: true
+        run: |
+          trap 'touch "$RUNNER_TEMP/terminated"; exit 0' TERM
+          touch "$RUNNER_TEMP/monitor-ready"
+          while true; do sleep 1; done
+      - run: |
+          while [ ! -f "$RUNNER_TEMP/monitor-ready" ]; do sleep 0.02; done
+      - cancel: monitor
+      - run: test -f "$RUNNER_TEMP/terminated"
+      - id: tolerated
+        background: true
+        continue-on-error: true
+        run: exit 7
+      - wait: tolerated
+      - id: failed-before-cancel
+        background: true
+        run: |
+          touch "$RUNNER_TEMP/failed-ready"
+          exit 9
+      - run: |
+          while [ ! -f "$RUNNER_TEMP/failed-ready" ]; do sleep 0.02; done
+          sleep 0.1
+      - cancel: failed-before-cancel
+      - if: always()
+        run: echo cancellation-drained
+"#,
+        )
+        .expect("parse cancellation workflow");
+        let plan = gitzero_workflow::compile(&workflow, Path::new(".github/workflows/cancel.yml"))
+            .expect("compile cancellation workflow");
+        let run_dir = fixture.path().join("run");
+        let tool_cache = fixture.path().join("toolcache");
+        tokio::fs::create_dir_all(&run_dir).await.expect("run dir");
+        tokio::fs::create_dir_all(&tool_cache)
+            .await
+            .expect("tool cache");
+        let run = fixture_run(
+            Uuid::new_v4(),
+            head_sha.clone(),
+            head_sha,
+            repository.display().to_string(),
+        );
+        let environment =
+            github_environment(&run, &repository, &run_dir, &tool_cache, "GitZero Test")
+                .await
+                .expect("GitHub environment");
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let (outbound, mut incoming) = mpsc::channel(512);
+        let sequence = Arc::new(AtomicU64::new(0));
+        let execution_slots = Arc::new(Semaphore::new(1));
+        let runner_targeting = default_runner_targeting();
+        let job_summaries = Arc::new(Mutex::new(Vec::new()));
+        let environment_variable_cache = Arc::new(Mutex::new(BTreeMap::new()));
+        let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let concurrency = ConcurrencyClient::local();
+        let repository_access = local_repository_access(&workflow_commands);
+        let execution = execute_plan(
+            run.id,
+            &plan,
+            0,
+            &run,
+            &repository,
+            &run_dir,
+            &environment,
+            &cancel,
+            &outbound,
+            &sequence,
+            &execution_slots,
+            &runner_targeting,
+            &job_summaries,
+            &environment_variable_cache,
+            &workflow_commands,
+            &concurrency,
+            &repository_access,
+        );
+        tokio::pin!(execution);
+        let mut events = Vec::new();
+        loop {
+            tokio::select! {
+                result = &mut execution => {
+                    let result = result.expect("execute cancellation workflow");
+                    assert_eq!(result.failed_jobs, ["Background cancellation / verify"]);
+                    assert!(result.cancelled_jobs.is_empty());
+                    break;
+                }
+                message = incoming.recv() => {
+                    events.push(message.expect("cancellation event"));
+                }
+            }
+        }
+        while let Ok(message) = incoming.try_recv() {
+            events.push(message);
+        }
+        assert!(events.iter().any(|message| matches!(
+            message,
+            AgentMessage::LogChunk { data, .. } if data == "cancellation-drained\n"
+        )));
     }
 
     #[cfg(target_os = "macos")]
