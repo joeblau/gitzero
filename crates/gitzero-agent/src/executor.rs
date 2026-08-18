@@ -4699,7 +4699,12 @@ async fn execute_checkout_step_with_repository(
     };
 
     let mut checkout_environment = environment.clone();
-    configure_checkout_credentials(&mut checkout_environment, checkout_token);
+    let rewrite_ssh_submodule_urls = submodules != "false" && ssh_credentials.is_none();
+    configure_checkout_credentials(
+        &mut checkout_environment,
+        checkout_token,
+        rewrite_ssh_submodule_urls,
+    )?;
     configure_checkout_ssh(
         &mut checkout_environment,
         ssh_credentials
@@ -4718,7 +4723,8 @@ async fn execute_checkout_step_with_repository(
         } else {
             ""
         },
-    );
+        persist_credentials && rewrite_ssh_submodule_urls,
+    )?;
     configure_checkout_ssh(
         environment,
         persist_credentials
@@ -4955,19 +4961,50 @@ async fn execute_checkout_step_with_repository(
         .context("pull Git LFS objects")?;
     }
     if submodules != "false" {
-        let mut command = Command::new("git");
-        command.args(["submodule", "update", "--init"]);
+        let mut sync = Command::new("git");
+        sync.args(["submodule", "sync"]);
         if submodules == "recursive" {
-            command.arg("--recursive");
+            sync.arg("--recursive");
         }
-        command
+        sync.current_dir(&checkout_directory)
+            .envs(checkout_environment.iter())
+            .env("GIT_TERMINAL_PROMPT", "0");
+        run_process(
+            job_id,
+            step_id,
+            &mut sync,
+            timeout,
+            cancel.clone(),
+            outbound.clone(),
+            sequence.clone(),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .context("synchronize checkout submodules")?;
+
+        let mut update = Command::new("git");
+        update.args([
+            "-c",
+            "protocol.version=2",
+            "submodule",
+            "update",
+            "--init",
+            "--force",
+        ]);
+        if fetch_depth > 0 {
+            update.arg(format!("--depth={fetch_depth}"));
+        }
+        if submodules == "recursive" {
+            update.arg("--recursive");
+        }
+        update
             .current_dir(&checkout_directory)
             .envs(checkout_environment.iter())
             .env("GIT_TERMINAL_PROMPT", "0");
         run_process(
             job_id,
             step_id,
-            &mut command,
+            &mut update,
             timeout,
             cancel.clone(),
             outbound.clone(),
@@ -4976,6 +5013,28 @@ async fn execute_checkout_step_with_repository(
         .await
         .map_err(anyhow::Error::from)
         .context("initialize checkout submodules")?;
+
+        let mut configure = Command::new("git");
+        configure.args(["submodule", "foreach"]);
+        if submodules == "recursive" {
+            configure.arg("--recursive");
+        }
+        configure
+            .args(["git", "config", "--local", "gc.auto", "0"])
+            .current_dir(&checkout_directory)
+            .envs(checkout_environment.iter());
+        run_process(
+            job_id,
+            step_id,
+            &mut configure,
+            timeout,
+            cancel.clone(),
+            outbound.clone(),
+            sequence.clone(),
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .context("disable automatic garbage collection in checkout submodules")?;
     }
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -5700,26 +5759,71 @@ fn select_cross_repository_checkout_access(
     }
 }
 
-fn configure_checkout_credentials(environment: &mut BTreeMap<String, String>, token: &str) {
-    const EXTRAHEADER: &str = "http.https://github.com/.extraheader";
-    if environment
-        .get("GIT_CONFIG_KEY_0")
-        .is_some_and(|key| key == EXTRAHEADER)
-    {
-        environment.remove("GIT_CONFIG_COUNT");
-        environment.remove("GIT_CONFIG_KEY_0");
-        environment.remove("GIT_CONFIG_VALUE_0");
+const CHECKOUT_HTTP_EXTRAHEADER: &str = "http.https://github.com/.extraheader";
+const CHECKOUT_SSH_INSTEAD_OF: &str = "url.https://github.com/.insteadOf";
+const MAX_INLINE_GIT_CONFIG_PARAMETERS: usize = 256;
+
+fn configure_checkout_credentials(
+    environment: &mut BTreeMap<String, String>,
+    token: &str,
+    rewrite_ssh_submodule_urls: bool,
+) -> Result<()> {
+    let count = match environment.get("GIT_CONFIG_COUNT") {
+        Some(value) => value
+            .parse::<usize>()
+            .context("GIT_CONFIG_COUNT must be a nonnegative integer")?,
+        None => 0,
+    };
+    if count > MAX_INLINE_GIT_CONFIG_PARAMETERS + 2 {
+        bail!("GIT_CONFIG_COUNT exceeds the checkout compatibility limit");
     }
-    if token.is_empty() {
-        return;
+    let mut entries = Vec::with_capacity(count.saturating_add(2));
+    for index in 0..count {
+        let key = environment
+            .get(&format!("GIT_CONFIG_KEY_{index}"))
+            .context("GIT_CONFIG_COUNT references a missing key")?;
+        let value = environment
+            .get(&format!("GIT_CONFIG_VALUE_{index}"))
+            .context("GIT_CONFIG_COUNT references a missing value")?;
+        if !key.eq_ignore_ascii_case(CHECKOUT_HTTP_EXTRAHEADER)
+            && !key.eq_ignore_ascii_case(CHECKOUT_SSH_INSTEAD_OF)
+        {
+            entries.push((key.clone(), value.clone()));
+        }
     }
-    let credential = STANDARD.encode(format!("x-access-token:{token}"));
-    environment.insert("GIT_CONFIG_COUNT".to_owned(), "1".to_owned());
-    environment.insert("GIT_CONFIG_KEY_0".to_owned(), EXTRAHEADER.to_owned());
-    environment.insert(
-        "GIT_CONFIG_VALUE_0".to_owned(),
-        format!("AUTHORIZATION: basic {credential}"),
-    );
+    let managed_entry_count =
+        usize::from(!token.is_empty()) + usize::from(rewrite_ssh_submodule_urls);
+    if entries.len() + managed_entry_count > MAX_INLINE_GIT_CONFIG_PARAMETERS + 2 {
+        bail!("inline Git configuration leaves no room for checkout credentials");
+    }
+
+    environment.remove("GIT_CONFIG_COUNT");
+    for index in 0..count.max(2) {
+        environment.remove(&format!("GIT_CONFIG_KEY_{index}"));
+        environment.remove(&format!("GIT_CONFIG_VALUE_{index}"));
+    }
+
+    if !token.is_empty() {
+        let credential = STANDARD.encode(format!("x-access-token:{token}"));
+        entries.push((
+            CHECKOUT_HTTP_EXTRAHEADER.to_owned(),
+            format!("AUTHORIZATION: basic {credential}"),
+        ));
+    }
+    if rewrite_ssh_submodule_urls {
+        entries.push((
+            CHECKOUT_SSH_INSTEAD_OF.to_owned(),
+            "git@github.com:".to_owned(),
+        ));
+    }
+    for (index, (key, value)) in entries.iter().enumerate() {
+        environment.insert(format!("GIT_CONFIG_KEY_{index}"), key.clone());
+        environment.insert(format!("GIT_CONFIG_VALUE_{index}"), value.clone());
+    }
+    if !entries.is_empty() {
+        environment.insert("GIT_CONFIG_COUNT".to_owned(), entries.len().to_string());
+    }
+    Ok(())
 }
 
 fn configure_checkout_ssh(environment: &mut BTreeMap<String, String>, command: Option<&str>) {
@@ -10066,7 +10170,8 @@ jobs:
             events
         });
         let mut first_environment = BTreeMap::new();
-        configure_checkout_credentials(&mut first_environment, &run.checkout_token);
+        configure_checkout_credentials(&mut first_environment, &run.checkout_token, false)
+            .expect("configure first checkout credentials");
         let first_outputs = execute_checkout_step_with_repository(
             run.id,
             "0/public-checkout",
@@ -10656,8 +10761,10 @@ jobs:
     fn checkout_credentials_can_be_used_without_persisting_them() {
         let mut job_environment = BTreeMap::new();
         let mut checkout_environment = job_environment.clone();
-        configure_checkout_credentials(&mut checkout_environment, "built-in-token");
-        configure_checkout_credentials(&mut job_environment, "");
+        configure_checkout_credentials(&mut checkout_environment, "built-in-token", false)
+            .expect("configure checkout credentials");
+        configure_checkout_credentials(&mut job_environment, "", false)
+            .expect("leave checkout credentials ephemeral");
 
         assert_eq!(checkout_environment["GIT_CONFIG_COUNT"], "1");
         assert_eq!(
@@ -10667,10 +10774,266 @@ jobs:
         assert!(checkout_environment["GIT_CONFIG_VALUE_0"].starts_with("AUTHORIZATION: basic "));
         assert!(!job_environment.contains_key("GIT_CONFIG_COUNT"));
 
-        configure_checkout_credentials(&mut job_environment, "built-in-token");
+        configure_checkout_credentials(&mut job_environment, "built-in-token", false)
+            .expect("persist checkout credentials");
         assert!(job_environment.contains_key("GIT_CONFIG_VALUE_0"));
-        configure_checkout_credentials(&mut job_environment, "");
+        configure_checkout_credentials(&mut job_environment, "", false)
+            .expect("remove checkout credentials");
         assert!(!job_environment.contains_key("GIT_CONFIG_VALUE_0"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn checkout_composes_https_submodule_rewrites_with_existing_git_configuration() {
+        let mut environment = BTreeMap::from([
+            ("GIT_CONFIG_COUNT".to_owned(), "1".to_owned()),
+            ("GIT_CONFIG_KEY_0".to_owned(), "core.quotePath".to_owned()),
+            ("GIT_CONFIG_VALUE_0".to_owned(), "false".to_owned()),
+        ]);
+        configure_checkout_credentials(&mut environment, "managed-token", true)
+            .expect("compose checkout configuration");
+
+        assert_eq!(environment["GIT_CONFIG_COUNT"], "3");
+        assert_eq!(environment["GIT_CONFIG_KEY_0"], "core.quotePath");
+        assert_eq!(environment["GIT_CONFIG_VALUE_0"], "false");
+        assert_eq!(environment["GIT_CONFIG_KEY_1"], CHECKOUT_HTTP_EXTRAHEADER);
+        assert!(environment["GIT_CONFIG_VALUE_1"].starts_with("AUTHORIZATION: basic "));
+        assert_eq!(environment["GIT_CONFIG_KEY_2"], CHECKOUT_SSH_INSTEAD_OF);
+        assert_eq!(environment["GIT_CONFIG_VALUE_2"], "git@github.com:");
+
+        let output = std::process::Command::new("git")
+            .args([
+                "ls-remote",
+                "--get-url",
+                "git@github.com:acme/dependency.git",
+            ])
+            .envs(environment.iter())
+            .output()
+            .expect("resolve rewritten SSH submodule URL");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .expect("rewritten URL UTF-8")
+                .trim(),
+            "https://github.com/acme/dependency.git"
+        );
+
+        configure_checkout_credentials(&mut environment, "", false)
+            .expect("remove managed checkout configuration");
+        assert_eq!(environment["GIT_CONFIG_COUNT"], "1");
+        assert_eq!(environment["GIT_CONFIG_KEY_0"], "core.quotePath");
+        assert!(!environment.values().any(|value| value == "managed-token"));
+        assert!(
+            !environment
+                .values()
+                .any(|value| value == CHECKOUT_HTTP_EXTRAHEADER)
+        );
+        assert!(
+            !environment
+                .values()
+                .any(|value| value == CHECKOUT_SSH_INSTEAD_OF)
+        );
+        let output = std::process::Command::new("git")
+            .args([
+                "ls-remote",
+                "--get-url",
+                "git@github.com:acme/dependency.git",
+            ])
+            .envs(environment.iter())
+            .output()
+            .expect("resolve SSH submodule URL without HTTPS rewrite");
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout)
+                .expect("SSH URL UTF-8")
+                .trim(),
+            "git@github.com:acme/dependency.git"
+        );
+
+        let mut bounded = BTreeMap::from([(
+            "GIT_CONFIG_COUNT".to_owned(),
+            MAX_INLINE_GIT_CONFIG_PARAMETERS.to_string(),
+        )]);
+        for index in 0..MAX_INLINE_GIT_CONFIG_PARAMETERS {
+            bounded.insert(
+                format!("GIT_CONFIG_KEY_{index}"),
+                format!("test.key{index}"),
+            );
+            bounded.insert(format!("GIT_CONFIG_VALUE_{index}"), index.to_string());
+        }
+        configure_checkout_credentials(&mut bounded, "bounded-token", true)
+            .expect("compose bounded checkout configuration");
+        assert_eq!(
+            bounded["GIT_CONFIG_COUNT"],
+            (MAX_INLINE_GIT_CONFIG_PARAMETERS + 2).to_string()
+        );
+        assert!(
+            bounded
+                .values()
+                .any(|value| value == CHECKOUT_HTTP_EXTRAHEADER)
+        );
+        assert!(
+            bounded
+                .values()
+                .any(|value| value == CHECKOUT_SSH_INSTEAD_OF)
+        );
+        configure_checkout_credentials(&mut bounded, "", false)
+            .expect("remove bounded checkout configuration");
+        assert_eq!(
+            bounded["GIT_CONFIG_COUNT"],
+            MAX_INLINE_GIT_CONFIG_PARAMETERS.to_string()
+        );
+        assert!(
+            !bounded
+                .values()
+                .any(|value| value.starts_with("AUTHORIZATION: basic "))
+        );
+        assert!(
+            !bounded
+                .values()
+                .any(|value| value == CHECKOUT_HTTP_EXTRAHEADER)
+        );
+        assert!(
+            !bounded
+                .values()
+                .any(|value| value == CHECKOUT_SSH_INSTEAD_OF)
+        );
+
+        let mut invalid = BTreeMap::from([(
+            "GIT_CONFIG_COUNT".to_owned(),
+            (MAX_INLINE_GIT_CONFIG_PARAMETERS + 3).to_string(),
+        )]);
+        let original = invalid.clone();
+        assert!(configure_checkout_credentials(&mut invalid, "secret", true).is_err());
+        assert_eq!(
+            invalid, original,
+            "invalid inline configuration was mutated"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn checkout_submodules_are_synced_forced_shallow_and_recursive() {
+        let fixture = tempfile::tempdir().expect("submodule checkout tempdir");
+        let child = fixture.path().join("child");
+        let source = fixture.path().join("source");
+        let run_dir = fixture.path().join("runs").join(Uuid::new_v4().to_string());
+        let workspace = run_dir.join("workspace");
+        let trace = fixture.path().join("git-trace.json");
+        for directory in [&child, &source, &run_dir, &workspace] {
+            std::fs::create_dir_all(directory).expect("fixture directory");
+        }
+
+        git(&child, ["init", "--initial-branch=main"]);
+        git(&child, ["config", "user.email", "gitzero@example.test"]);
+        git(&child, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(child.join("child.txt"), "pinned child\n").expect("child fixture file");
+        git(&child, ["add", "child.txt"]);
+        git(&child, ["commit", "-m", "child fixture"]);
+        let child_commit = git_output(&child, ["rev-parse", "HEAD"]);
+
+        git(&source, ["init", "--initial-branch=main"]);
+        git(&source, ["config", "user.email", "gitzero@example.test"]);
+        git(&source, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(source.join("README.md"), "root fixture\n").expect("root fixture file");
+        git(&source, ["add", "README.md"]);
+        git(&source, ["commit", "-m", "root fixture"]);
+        let child_url = format!("file://{}", child.display());
+        let status = std::process::Command::new("git")
+            .args([
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &child_url,
+                "deps/child",
+            ])
+            .current_dir(&source)
+            .status()
+            .expect("add fixture submodule");
+        assert!(status.success());
+        git(&source, ["commit", "-am", "add fixture submodule"]);
+        let root_commit = git_output(&source, ["rev-parse", "HEAD"]);
+
+        let mut run = fixture_run(
+            Uuid::new_v4(),
+            root_commit.clone(),
+            root_commit.clone(),
+            "https://github.com/local/fixture.git".to_owned(),
+        );
+        run.pull_request.merge_sha = root_commit.clone();
+        let inputs = BTreeMap::from([
+            ("fetch-depth".to_owned(), "1".to_owned()),
+            ("persist-credentials".to_owned(), "false".to_owned()),
+            ("show-progress".to_owned(), "false".to_owned()),
+            ("submodules".to_owned(), "recursive".to_owned()),
+        ]);
+        let mut environment = BTreeMap::from([
+            ("GIT_ALLOW_PROTOCOL".to_owned(), "file".to_owned()),
+            ("GIT_TRACE2_EVENT".to_owned(), trace.display().to_string()),
+        ]);
+        let repository = checkout_repository(None, &run).expect("same repository");
+        let (outbound, mut incoming) = mpsc::channel(256);
+        let drain = tokio::spawn(async move { while incoming.recv().await.is_some() {} });
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let repository_access = local_repository_access(&workflow_commands);
+
+        let outputs = execute_checkout_step_with_repository(
+            run.id,
+            "0/submodules",
+            &inputs,
+            &run,
+            &source,
+            &workspace,
+            &run_dir,
+            &mut environment,
+            "",
+            repository,
+            None,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+            &repository_access,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("checkout with recursive submodules");
+        drop(outbound);
+        drain.await.expect("drain checkout events");
+
+        assert_eq!(outputs["commit"], root_commit);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("deps/child/child.txt"))
+                .expect("checked out submodule file"),
+            "pinned child\n"
+        );
+        assert_eq!(
+            git_output(&workspace.join("deps/child"), ["rev-parse", "HEAD"]),
+            child_commit
+        );
+        assert_eq!(
+            git_output(
+                &workspace.join("deps/child"),
+                ["config", "--get", "gc.auto"]
+            ),
+            "0"
+        );
+        assert_eq!(
+            git_output(
+                &workspace.join("deps/child"),
+                ["rev-parse", "--is-shallow-repository"]
+            ),
+            "true"
+        );
+        assert!(!environment.contains_key("GIT_CONFIG_COUNT"));
+
+        let trace = std::fs::read_to_string(trace).expect("Git trace");
+        assert!(trace.contains("submodule"));
+        assert!(trace.contains("sync"));
+        assert!(trace.contains("--force"));
+        assert!(trace.contains("--depth=1"));
+        assert!(trace.contains("--recursive"));
     }
 
     #[test]
