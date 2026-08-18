@@ -77,7 +77,7 @@ type EnvironmentVariableCache = Arc<Mutex<BTreeMap<String, BTreeMap<String, Stri
 struct RunRepositoryAccess {
     client: RepositoryAccessClient,
     tokens: Arc<Mutex<BTreeMap<String, String>>>,
-    workflow_tokens: Arc<Mutex<BTreeMap<BTreeSet<String>, String>>>,
+    workflow_tokens: Arc<Mutex<BTreeMap<PlannedPermissions, String>>>,
     workflow_commands: Arc<StdMutex<WorkflowCommandProcessor>>,
 }
 
@@ -139,7 +139,7 @@ impl RunRepositoryAccess {
         permissions: &PlannedPermissions,
         cancel: &watch::Receiver<bool>,
     ) -> Result<Option<String>> {
-        if permissions.read.is_empty() {
+        if permissions.read.is_empty() && permissions.write.is_empty() {
             return Ok(None);
         }
         if permissions == &PlannedPermissions::default() && !run.checkout_token.is_empty() {
@@ -149,7 +149,7 @@ impl RunRepositoryAccess {
             return Ok(None);
         }
         let mut tokens = self.workflow_tokens.lock().await;
-        if let Some(token) = tokens.get(&permissions.read) {
+        if let Some(token) = tokens.get(permissions) {
             return Ok(Some(token.clone()));
         }
         if tokens.len() >= MAX_WORKFLOW_TOKEN_SCOPES_PER_RUN {
@@ -159,10 +159,10 @@ impl RunRepositoryAccess {
         }
         let token = self
             .client
-            .request_workflow_token(run.id, &permissions.read, cancel)
+            .request_workflow_token(run.id, &permissions.read, &permissions.write, cancel)
             .await?;
         register_repository_token_masks(&self.workflow_commands, &token);
-        tokens.insert(permissions.read.clone(), token.clone());
+        tokens.insert(permissions.clone(), token.clone());
         Ok(Some(token))
     }
 
@@ -2998,7 +2998,7 @@ async fn execute_job(
         .await
         .with_context(|| {
             format!(
-                "issue read-only workflow token for workflow '{workflow_name}' job '{}'",
+                "issue scoped workflow token for workflow '{workflow_name}' job '{}'",
                 job.id
             )
         })?;
@@ -8730,7 +8730,7 @@ jobs:
     }
 
     #[tokio::test]
-    async fn caches_and_masks_exact_read_only_workflow_tokens() {
+    async fn caches_and_masks_exact_scoped_workflow_tokens() {
         let commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
         let (outbound, mut events) = mpsc::channel(4);
         let client = RepositoryAccessClient::remote(outbound);
@@ -8744,7 +8744,8 @@ jobs:
         run.installation_id = 42;
         run.checkout_token = "baseline-checkout-token".to_owned();
         let permissions = PlannedPermissions {
-            read: BTreeSet::from(["checks".to_owned()]),
+            read: BTreeSet::new(),
+            write: BTreeSet::from(["checks".to_owned()]),
         };
         let (_cancel_tx, cancel) = watch::channel(false);
         let request = {
@@ -8758,11 +8759,13 @@ jobs:
             AgentMessage::WorkflowTokenRequest {
                 job_id,
                 request_id,
-                permissions,
+                read_permissions,
+                write_permissions,
                 ..
             } => {
                 assert_eq!(job_id, run.id);
-                assert_eq!(permissions, ["checks"]);
+                assert!(read_permissions.is_empty());
+                assert_eq!(write_permissions, ["checks"]);
                 request_id
             }
             message => panic!("unexpected event: {message:?}"),

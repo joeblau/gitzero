@@ -1222,12 +1222,29 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
           return;
         }
         const job = parseJob(row.job_json);
+        let effectivePermissions: { read: string[]; write: string[] } = {
+          read: [...message.read_permissions],
+          write: [],
+        };
         try {
+          effectivePermissions =
+            message.write_permissions.length === 0
+              ? {
+                  read: [...message.read_permissions],
+                  write: [],
+                }
+              : effectiveWorkflowTokenPermissions(
+                  job,
+                  this.eventPayload(job.id),
+                  message.read_permissions,
+                  message.write_permissions,
+                );
           const token = await createWorkflowToken(
             this.env,
             job.installation_id,
             job.repository.name,
-            message.permissions,
+            effectivePermissions.read,
+            effectivePermissions.write,
           );
           const stillOwned = this.ctx.storage.sql
             .exec<{ id: string }>(
@@ -1251,7 +1268,11 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
               message: "workflow token request denied",
               jobId: job.id,
               agentId,
-              permissions: message.permissions,
+              readPermissions: effectivePermissions.read,
+              writePermissions: effectivePermissions.write,
+              writePermissionsDowngraded:
+                message.write_permissions.length > 0 &&
+                effectivePermissions.write.length === 0,
               error: truncateDiagnostic(error),
             }),
           );
@@ -1260,7 +1281,7 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
               type: "workflow_token_denied",
               request_id: message.request_id,
               reason:
-                "The requested read-only workflow token could not be issued. Confirm the GitHub App has every requested repository permission.",
+                "The requested workflow token could not be issued. Confirm the GitHub App has every requested repository permission.",
             });
           }
         }
@@ -1774,6 +1795,59 @@ function eventRepositoryOwnerType(event: unknown): string {
   if (!owner || typeof owner !== "object") return "";
   const type = Reflect.get(owner, "type");
   return typeof type === "string" ? type : "";
+}
+
+function effectiveWorkflowTokenPermissions(
+  job: QueuedJob,
+  event: unknown,
+  readPermissions: readonly string[],
+  writePermissions: readonly string[],
+): { read: string[]; write: string[] } {
+  if (
+    writePermissions.length === 0 ||
+    workflowWritePermissionsAllowed(job, event)
+  ) {
+    return { read: [...readPermissions], write: [...writePermissions] };
+  }
+  return {
+    read: [...new Set([...readPermissions, ...writePermissions])].sort(),
+    write: [],
+  };
+}
+
+function workflowWritePermissionsAllowed(
+  job: QueuedJob,
+  event: unknown,
+): boolean {
+  const repository =
+    `${job.repository.owner}/${job.repository.name}`.toLowerCase();
+  const eventRepository = eventString(event, ["repository", "full_name"]);
+  const headRepository = eventString(event, [
+    "pull_request",
+    "head",
+    "repo",
+    "full_name",
+  ]);
+  const pullRequestAuthor = eventString(event, [
+    "pull_request",
+    "user",
+    "login",
+  ]);
+  return (
+    eventRepository.toLowerCase() === repository &&
+    headRepository.toLowerCase() === repository &&
+    pullRequestAuthor.length > 0 &&
+    pullRequestAuthor.toLowerCase() !== "dependabot[bot]"
+  );
+}
+
+function eventString(event: unknown, path: readonly string[]): string {
+  let value = event;
+  for (const component of path) {
+    if (!value || typeof value !== "object") return "";
+    value = Reflect.get(value, component);
+  }
+  return typeof value === "string" ? value : "";
 }
 
 function parseJob(value: string): QueuedJob {

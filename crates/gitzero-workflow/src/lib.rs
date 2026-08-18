@@ -263,13 +263,35 @@ pub struct PlannedJob {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PlannedPermissions {
     pub read: BTreeSet<String>,
+    pub write: BTreeSet<String>,
 }
 
 impl Default for PlannedPermissions {
     fn default() -> Self {
         Self {
             read: BTreeSet::from(["contents".to_owned(), "pull-requests".to_owned()]),
+            write: BTreeSet::new(),
         }
+    }
+}
+
+impl PlannedPermissions {
+    fn intersect(&self, maximum: &Self) -> Self {
+        let available = self
+            .read
+            .union(&self.write)
+            .filter(|permission| {
+                maximum.read.contains(*permission) || maximum.write.contains(*permission)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let write = self
+            .write
+            .intersection(&maximum.write)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let read = available.difference(&write).cloned().collect();
+        Self { read, write }
     }
 }
 
@@ -1328,12 +1350,7 @@ fn expand_reusable_call(
         .collect::<BTreeMap<_, _>>();
     let mut called_jobs = Vec::new();
     for mut job in called_plan.jobs {
-        job.permissions.read = job
-            .permissions
-            .read
-            .intersection(&placeholder.permissions.read)
-            .cloned()
-            .collect();
+        job.permissions = job.permissions.intersect(&placeholder.permissions);
         let old_base_id = job.base_id.clone();
         let new_base_id = aliases[&old_base_id].clone();
         job.id = format!("{new_base_id}{}", &job.id[old_base_id.len()..]);
@@ -1639,7 +1656,7 @@ fn validate_job(workflow: &str, job_id: &str, job: &Job) -> Result<(), WorkflowE
     Ok(())
 }
 
-const READABLE_TOKEN_PERMISSIONS: [&str; 14] = [
+const READ_WRITE_TOKEN_PERMISSIONS: [&str; 14] = [
     "actions",
     "artifact-metadata",
     "attestations",
@@ -1686,20 +1703,22 @@ fn planned_permissions(
     };
     match value {
         Value::String(value) if value == "read-all" => Ok(PlannedPermissions {
-            read: READABLE_TOKEN_PERMISSIONS
+            read: READ_WRITE_TOKEN_PERMISSIONS
                 .into_iter()
                 .chain(READ_ONLY_TOKEN_PERMISSIONS)
                 .map(str::to_owned)
                 .collect(),
+            write: BTreeSet::new(),
         }),
         Value::String(value) if value == "write-all" => Err(unsupported_workflow(
             workflow,
             format!(
-                "{location} permissions request write-all, but GitZero pull-request tokens are read-only"
+                "{location} permissions request write-all, which includes unsupported id-token: write access"
             ),
         )),
         Value::Mapping(values) => {
             let mut read = BTreeSet::new();
+            let mut write = BTreeSet::new();
             for (name, access) in values {
                 let Some(name) = name.as_str() else {
                     return Err(unsupported_workflow(
@@ -1733,12 +1752,23 @@ fn planned_permissions(
                         ));
                     }
                     "write" => {
-                        return Err(unsupported_workflow(
-                            workflow,
-                            format!(
-                                "{location} permission '{name}: write' is not supported because GitZero pull-request tokens are read-only"
-                            ),
-                        ));
+                        if name == "id-token" {
+                            return Err(unsupported_workflow(
+                                workflow,
+                                format!(
+                                    "{location} permission 'id-token: write' is not supported because GitZero does not issue GitHub OIDC tokens"
+                                ),
+                            ));
+                        }
+                        if READ_ONLY_TOKEN_PERMISSIONS.contains(&name) {
+                            return Err(unsupported_workflow(
+                                workflow,
+                                format!(
+                                    "{location} permission '{name}' supports only read or none access"
+                                ),
+                            ));
+                        }
+                        write.insert(name.to_owned());
                     }
                     _ => {
                         return Err(unsupported_workflow(
@@ -1748,7 +1778,7 @@ fn planned_permissions(
                     }
                 }
             }
-            Ok(PlannedPermissions { read })
+            Ok(PlannedPermissions { read, write })
         }
         _ => Err(unsupported_workflow(
             workflow,
@@ -3987,11 +4017,12 @@ jobs:
             StepKind::Run { shell, .. } if shell == "bash"
         ));
         assert_eq!(job.permissions.read.len(), 15);
+        assert!(job.permissions.write.is_empty());
         assert!(job.permissions.read.contains("vulnerability-alerts"));
     }
 
     #[test]
-    fn applies_exact_read_permissions_and_rejects_write_elevation() {
+    fn applies_exact_read_and_write_permissions_and_rejects_oidc() {
         let workflow = parse(
             r#"
 name: Permissions
@@ -4006,7 +4037,7 @@ jobs:
       - run: echo inherited
   reduced:
     permissions:
-      checks: read
+      checks: write
       contents: none
     runs-on: macos-latest
     steps:
@@ -4024,19 +4055,39 @@ jobs:
             plan.jobs[0].permissions.read,
             BTreeSet::from(["contents".to_owned(), "pull-requests".to_owned()])
         );
+        assert!(plan.jobs[0].permissions.write.is_empty());
+        assert!(plan.jobs[1].permissions.read.is_empty());
         assert_eq!(
-            plan.jobs[1].permissions.read,
+            plan.jobs[1].permissions.write,
             BTreeSet::from(["checks".to_owned()])
         );
         assert!(plan.jobs[2].permissions.read.is_empty());
+        assert!(plan.jobs[2].permissions.write.is_empty());
 
-        let write = parse(
-            "name: Write\non: pull_request\npermissions:\n  issues: write\njobs:\n  build:\n    runs-on: macos-latest\n    steps:\n      - run: echo build\n",
+        let oidc = parse(
+            "name: OIDC\non: pull_request\npermissions:\n  id-token: write\njobs:\n  build:\n    runs-on: macos-latest\n    steps:\n      - run: echo build\n",
         )
-        .expect("parse write permissions");
-        let error = compile(&write, Path::new("write.yml")).expect_err("reject write permission");
-        assert!(error.to_string().contains("issues: write"));
-        assert!(error.to_string().contains("read-only"));
+        .expect("parse OIDC permissions");
+        let error = compile(&oidc, Path::new("oidc.yml")).expect_err("reject OIDC permission");
+        assert!(error.to_string().contains("id-token: write"));
+        assert!(error.to_string().contains("OIDC"));
+
+        let write_all = parse(
+            "name: Write all\non: pull_request\npermissions: write-all\njobs:\n  build:\n    runs-on: macos-latest\n    steps:\n      - run: echo build\n",
+        )
+        .expect("parse write-all permissions");
+        let error = compile(&write_all, Path::new("write-all.yml")).expect_err("reject write-all");
+        assert!(error.to_string().contains("write-all"));
+        assert!(error.to_string().contains("id-token: write"));
+
+        let vulnerability_write = parse(
+            "name: Dependabot\non: pull_request\npermissions:\n  vulnerability-alerts: write\njobs:\n  build:\n    runs-on: macos-latest\n    steps:\n      - run: echo build\n",
+        )
+        .expect("parse Dependabot permission");
+        let error = compile(&vulnerability_write, Path::new("vulnerability-write.yml"))
+            .expect_err("reject read-only permission write");
+        assert!(error.to_string().contains("vulnerability-alerts"));
+        assert!(error.to_string().contains("only read or none"));
     }
 
     #[test]
@@ -4049,6 +4100,7 @@ jobs:
   call:
     permissions:
       contents: read
+      issues: write
     uses: ./.github/workflows/called.yml
 "#,
         )
@@ -4057,7 +4109,10 @@ jobs:
             r#"
 name: Called
 on: workflow_call
-permissions: read-all
+permissions:
+  checks: read
+  contents: write
+  issues: write
 jobs:
   build:
     runs-on: macos-latest
@@ -4080,6 +4135,10 @@ jobs:
         assert_eq!(
             build.permissions.read,
             BTreeSet::from(["contents".to_owned()])
+        );
+        assert_eq!(
+            build.permissions.write,
+            BTreeSet::from(["issues".to_owned()])
         );
     }
 }

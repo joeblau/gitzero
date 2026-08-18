@@ -3,7 +3,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const MAX_RUNNER_LABELS: usize = 32;
 pub const MAX_RUNNER_REQUIREMENTS: usize = 512;
 pub const MAX_RUNNER_SELECTOR_BYTES: usize = 256;
@@ -218,7 +218,8 @@ pub enum AgentMessage {
         message_id: Uuid,
         job_id: Uuid,
         request_id: Uuid,
-        permissions: Vec<String>,
+        read_permissions: Vec<String>,
+        write_permissions: Vec<String>,
     },
     StepStarted {
         message_id: Uuid,
@@ -374,7 +375,8 @@ mod tests {
             message_id: Uuid::new_v4(),
             job_id: Uuid::new_v4(),
             request_id,
-            permissions: vec!["checks".into(), "contents".into()],
+            read_permissions: vec!["contents".into()],
+            write_permissions: vec!["checks".into()],
         };
         let json = serde_json::to_string(&workflow_request).expect("serialize workflow token");
         assert!(json.contains(r#""type":"workflow_token_request""#));

@@ -58,11 +58,12 @@ impl RepositoryAccessClient {
     pub(crate) async fn request_workflow_token(
         &self,
         run_id: Uuid,
-        permissions: &BTreeSet<String>,
+        read_permissions: &BTreeSet<String>,
+        write_permissions: &BTreeSet<String>,
         cancel: &watch::Receiver<bool>,
     ) -> Result<String> {
-        if permissions.is_empty() {
-            bail!("workflow token request must contain at least one read permission");
+        if read_permissions.is_empty() && write_permissions.is_empty() {
+            bail!("workflow token request must contain at least one permission");
         }
         let request_id = Uuid::new_v4();
         self.request(
@@ -71,7 +72,8 @@ impl RepositoryAccessClient {
                 message_id: Uuid::new_v4(),
                 job_id: run_id,
                 request_id,
-                permissions: permissions.iter().cloned().collect(),
+                read_permissions: read_permissions.iter().cloned().collect(),
+                write_permissions: write_permissions.iter().cloned().collect(),
             },
             "scoped workflow token access",
             cancel,
@@ -228,18 +230,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_workflow_requests_preserve_the_exact_read_scope() {
+    async fn remote_workflow_requests_preserve_exact_read_and_write_scopes() {
         let (outbound, mut events) = mpsc::channel(4);
         let client = RepositoryAccessClient::remote(outbound);
         let run_id = Uuid::new_v4();
-        let permissions = BTreeSet::from(["checks".to_owned(), "contents".to_owned()]);
+        let read_permissions = BTreeSet::from(["contents".to_owned()]);
+        let write_permissions = BTreeSet::from(["checks".to_owned()]);
         let (_, cancel) = watch::channel(false);
         let request = {
             let client = client.clone();
-            let permissions = permissions.clone();
+            let read_permissions = read_permissions.clone();
+            let write_permissions = write_permissions.clone();
             tokio::spawn(async move {
                 client
-                    .request_workflow_token(run_id, &permissions, &cancel)
+                    .request_workflow_token(run_id, &read_permissions, &write_permissions, &cancel)
                     .await
             })
         };
@@ -247,11 +251,13 @@ mod tests {
             AgentMessage::WorkflowTokenRequest {
                 job_id,
                 request_id,
-                permissions: requested,
+                read_permissions: requested_read,
+                write_permissions: requested_write,
                 ..
             } => {
                 assert_eq!(job_id, run_id);
-                assert_eq!(requested, ["checks", "contents"]);
+                assert_eq!(requested_read, ["contents"]);
+                assert_eq!(requested_write, ["checks"]);
                 request_id
             }
             message => panic!("unexpected event: {message:?}"),

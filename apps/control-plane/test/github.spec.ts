@@ -225,14 +225,14 @@ describe("GitHub Actions variables", () => {
 });
 
 describe("GitHub production API contracts", () => {
-  it("mints workflow tokens with only the requested read permissions", async () => {
+  it("mints workflow tokens with only the requested read and write permissions", async () => {
     const privateKey = await testPrivateKeyPem();
     const requests: Array<{ url: URL; init?: RequestInit }> = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         requests.push({ url: new URL(String(input)), init });
-        return Response.json({ token: "exact-read-token" });
+        return Response.json({ token: "exact-scoped-token" });
       }),
     );
 
@@ -245,15 +245,16 @@ describe("GitHub production API contracts", () => {
         },
         7001,
         "widget",
-        ["artifact-metadata", "pull-requests", "security-events"],
+        ["artifact-metadata", "security-events"],
+        ["pull-requests"],
       ),
-    ).resolves.toBe("exact-read-token");
+    ).resolves.toBe("exact-scoped-token");
     expect(requests).toHaveLength(1);
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
       repositories: ["widget"],
       permissions: {
         artifact_metadata: "read",
-        pull_requests: "read",
+        pull_requests: "write",
         security_events: "read",
       },
     });
@@ -267,9 +268,10 @@ describe("GitHub production API contracts", () => {
         },
         7001,
         "widget",
-        ["contents", "contents"],
+        ["contents"],
+        ["contents"],
       ),
-    ).rejects.toThrow("nonempty unique set");
+    ).rejects.toThrow("nonempty disjoint set");
     expect(requests).toHaveLength(1);
   });
 

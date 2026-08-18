@@ -1,8 +1,8 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 6;
+export const PROTOCOL_VERSION = 7;
 
-export const WORKFLOW_READ_PERMISSIONS = [
+export const WORKFLOW_TOKEN_PERMISSIONS = [
   "actions",
   "artifact-metadata",
   "attestations",
@@ -19,14 +19,56 @@ export const WORKFLOW_READ_PERMISSIONS = [
   "statuses",
   "vulnerability-alerts",
 ] as const;
-const workflowReadPermission = z.enum(WORKFLOW_READ_PERMISSIONS);
+export const WORKFLOW_WRITE_PERMISSIONS = [
+  "actions",
+  "artifact-metadata",
+  "attestations",
+  "checks",
+  "code-quality",
+  "contents",
+  "deployments",
+  "discussions",
+  "issues",
+  "packages",
+  "pages",
+  "pull-requests",
+  "security-events",
+  "statuses",
+] as const;
+const workflowTokenPermission = z.enum(WORKFLOW_TOKEN_PERMISSIONS);
+const workflowWritePermission = z.enum(WORKFLOW_WRITE_PERMISSIONS);
 const workflowReadPermissions = z
-  .array(workflowReadPermission)
-  .min(1)
-  .max(WORKFLOW_READ_PERMISSIONS.length)
+  .array(workflowTokenPermission)
+  .max(WORKFLOW_TOKEN_PERMISSIONS.length)
   .refine((permissions) => new Set(permissions).size === permissions.length, {
     message: "workflow read permissions must be unique",
   });
+const workflowWritePermissions = z
+  .array(workflowWritePermission)
+  .max(WORKFLOW_WRITE_PERMISSIONS.length)
+  .refine((permissions) => new Set(permissions).size === permissions.length, {
+    message: "workflow write permissions must be unique",
+  });
+const workflowTokenRequestSchema = z
+  .object({
+    type: z.literal("workflow_token_request"),
+    message_id: z.string().uuid(),
+    job_id: z.string().uuid(),
+    request_id: z.string().uuid(),
+    read_permissions: workflowReadPermissions,
+    write_permissions: workflowWritePermissions,
+  })
+  .refine(
+    ({ read_permissions, write_permissions }) => {
+      const combined = [...read_permissions, ...write_permissions];
+      return (
+        combined.length > 0 &&
+        combined.length <= WORKFLOW_TOKEN_PERMISSIONS.length &&
+        new Set(combined).size === combined.length
+      );
+    },
+    { message: "workflow token permissions must be nonempty and disjoint" },
+  );
 
 const uuid = z.string().uuid();
 const sha = z.string().regex(/^[0-9a-fA-F]{40}$/);
@@ -173,13 +215,7 @@ export const agentMessageSchema = z.discriminatedUnion("type", [
     owner: repositoryComponent,
     repository: repositoryComponent,
   }),
-  z.object({
-    type: z.literal("workflow_token_request"),
-    message_id: uuid,
-    job_id: uuid,
-    request_id: uuid,
-    permissions: workflowReadPermissions,
-  }),
+  workflowTokenRequestSchema,
   z.object({
     type: z.literal("step_started"),
     message_id: uuid,

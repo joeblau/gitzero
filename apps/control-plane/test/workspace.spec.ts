@@ -306,7 +306,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 6,
+          protocol_version: 7,
           agent_id: "mini-1",
           name: "Test Mini",
           version: "0.1.0",
@@ -317,7 +317,7 @@ describe("Workspace Durable Object", () => {
     );
 
     const [welcome, assignment] = await messages;
-    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 6 });
+    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 7 });
     expect(assignment).toMatchObject({
       type: "run_job",
       job: {
@@ -604,7 +604,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 6,
+          protocol_version: 7,
           agent_id: "mini-1",
           name: "duplicate",
           version: "0.1.0",
@@ -876,14 +876,16 @@ describe("Workspace Durable Object", () => {
         const url = new URL(String(input));
         requests.push({ url, init });
         if (url.pathname.endsWith("/access_tokens")) {
-          const permissions = JSON.parse(String(init?.body))
-            .permissions as Record<string, string>;
+          const body = JSON.parse(String(init?.body)) as {
+            repositories: string[];
+            permissions: Record<string, string>;
+          };
           return Response.json({
             token:
-              permissions.administration === "read"
+              body.permissions.administration === "read"
                 ? "policy-token"
-                : permissions.checks === "read"
-                  ? "workflow-read-token"
+                : body.repositories[0] === "caller"
+                  ? "workflow-write-token"
                   : "target-contents-token",
           });
         }
@@ -901,7 +903,16 @@ describe("Workspace Durable Object", () => {
       job.repository.owner = "acme";
       job.repository.name = "caller";
       job.repository.clone_url = "https://github.com/acme/caller.git";
-      job.event = { repository: { owner: { type: "Organization" } } };
+      job.event = {
+        repository: {
+          full_name: "acme/caller",
+          owner: { type: "Organization" },
+        },
+        pull_request: {
+          head: { repo: { full_name: "acme/caller" } },
+          user: { login: "trusted-author" },
+        },
+      };
       await workspace.enqueue(job, "shared-repository-token");
       await assignment;
 
@@ -947,17 +958,18 @@ describe("Workspace Durable Object", () => {
           message_id: crypto.randomUUID(),
           job_id: job.id,
           request_id: workflowRequestId,
-          permissions: ["checks", "contents"],
+          read_permissions: ["contents"],
+          write_permissions: ["checks"],
         }),
       );
       await expect(workflowGranted).resolves.toEqual({
         type: "workflow_token_granted",
         request_id: workflowRequestId,
-        token: "workflow-read-token",
+        token: "workflow-write-token",
       });
       expect(JSON.parse(String(requests[3]?.init?.body))).toEqual({
         repositories: ["caller"],
-        permissions: { checks: "read", contents: "read" },
+        permissions: { checks: "write", contents: "read" },
       });
 
       const deniedRequestId = crypto.randomUUID();
@@ -978,6 +990,92 @@ describe("Workspace Durable Object", () => {
         reason: expect.stringContaining("access was denied"),
       });
       expect(requests).toHaveLength(4);
+      agent.close(1000, "test complete");
+    } finally {
+      Reflect.set(env, "GITHUB_APP_ID", originalAppId);
+      Reflect.set(env, "GITHUB_APP_PRIVATE_KEY", originalPrivateKey);
+    }
+  });
+
+  it("downgrades untrusted or incomplete workflow writes before minting tokens", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const originalAppId = env.GITHUB_APP_ID;
+    const originalPrivateKey = env.GITHUB_APP_PRIVATE_KEY;
+    Reflect.set(env, "GITHUB_APP_ID", "1234");
+    Reflect.set(env, "GITHUB_APP_PRIVATE_KEY", privateKey);
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        requests.push({ url: new URL(String(input)), init });
+        return Response.json({ token: "downgraded-read-token" });
+      }),
+    );
+
+    try {
+      const workspaceId = crypto.randomUUID();
+      const workspace = env.WORKSPACES.getByName(workspaceId);
+      const agent = await connectAgent(workspace, workspaceId, "mini-1", 3);
+      const jobs = [
+        {
+          job: fixtureJob(workspaceId),
+          headRepository: "contributor/caller",
+          author: "contributor",
+        },
+        {
+          job: fixtureJob(workspaceId),
+          headRepository: "acme/caller",
+          author: "dependabot[bot]",
+        },
+        {
+          job: fixtureJob(workspaceId),
+          headRepository: "acme/caller",
+          author: "",
+        },
+      ];
+      for (const { job, headRepository, author } of jobs) {
+        job.installation_id = 7011;
+        job.repository.owner = "acme";
+        job.repository.name = "caller";
+        job.repository.clone_url = "https://github.com/acme/caller.git";
+        job.event = {
+          repository: { full_name: "acme/caller" },
+          pull_request: {
+            head: { repo: { full_name: headRepository } },
+            user: { login: author },
+          },
+        };
+        const assignment = collectMessageOfType(agent, "run_job");
+        await workspace.enqueue(job, `write-downgrade:${author}`);
+        await assignment;
+      }
+
+      for (const { job } of jobs) {
+        const requestId = crypto.randomUUID();
+        const granted = collectMessageOfType(agent, "workflow_token_granted");
+        agent.send(
+          JSON.stringify({
+            type: "workflow_token_request",
+            message_id: crypto.randomUUID(),
+            job_id: job.id,
+            request_id: requestId,
+            read_permissions: ["contents"],
+            write_permissions: ["checks"],
+          }),
+        );
+        await expect(granted).resolves.toEqual({
+          type: "workflow_token_granted",
+          request_id: requestId,
+          token: "downgraded-read-token",
+        });
+      }
+      expect(requests).toHaveLength(3);
+      for (const request of requests) {
+        expect(JSON.parse(String(request.init?.body))).toEqual({
+          repositories: ["caller"],
+          permissions: { checks: "read", contents: "read" },
+        });
+      }
       agent.close(1000, "test complete");
     } finally {
       Reflect.set(env, "GITHUB_APP_ID", originalAppId);
@@ -1293,7 +1391,7 @@ async function connectAgentWithTargeting(
     JSON.stringify({
       type: "hello",
       hello: {
-        protocol_version: 6,
+        protocol_version: 7,
         agent_id: agentId,
         name: agentId,
         version: "0.1.0",

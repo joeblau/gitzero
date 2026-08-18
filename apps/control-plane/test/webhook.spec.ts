@@ -19,8 +19,13 @@ describe("GitHub webhook ingestion", () => {
         draft: false,
         title: "Preserve webhook metadata",
         labels: [{ name: "ci" }],
-        head: { sha: "1".repeat(40), ref: "feature/metadata" },
+        head: {
+          sha: "1".repeat(40),
+          ref: "feature/metadata",
+          repo: { full_name: "acme/widget" },
+        },
         base: { sha: "2".repeat(40), ref: "main" },
+        user: { login: "octocat" },
       },
       sender: { id: 1234, login: "octocat" },
     };
