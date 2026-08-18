@@ -4,6 +4,7 @@ use crate::action::{
 use crate::artifact::{ArtifactLimits, ArtifactService};
 use crate::cache::{CacheLimits, CacheService};
 use crate::concurrency::{ConcurrencyAcquisition, ConcurrencyClient};
+use crate::problem_matcher::ProblemMatcherRegistry;
 use crate::repository_access::RepositoryAccessClient;
 use anyhow::{Context, Result, bail};
 use base64::{
@@ -60,6 +61,7 @@ const MAX_LEGACY_COMMAND_VALUES_PER_STEP: usize = 1_024;
 const MAX_LEGACY_COMMAND_BYTES_PER_STEP: usize = 1_024 * 1_024;
 const MAX_ERROR_ANNOTATIONS_PER_STEP: usize = 10;
 const MAX_WARNING_ANNOTATIONS_PER_STEP: usize = 10;
+const MAX_NOTICE_ANNOTATIONS_PER_STEP: usize = 10;
 const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(360 * 60);
 const ENVIRONMENT_VARIABLE_PAGE_SIZE: usize = 30;
 const MAX_ENVIRONMENT_VARIABLES: usize = 100;
@@ -326,9 +328,12 @@ impl Executor {
         };
         let mut secrets = secret_values(&run);
         secrets.push(runtime_token);
-        let workflow_commands = Arc::new(StdMutex::new(
-            WorkflowCommandProcessor::with_global_masks(secrets.clone(), repository_dir.clone()),
-        ));
+        let workflow_commands =
+            Arc::new(StdMutex::new(WorkflowCommandProcessor::with_global_masks(
+                secrets.clone(),
+                repository_dir.clone(),
+                run_dir.clone(),
+            )));
         let repository_access =
             RunRepositoryAccess::new(repository_access, workflow_commands.clone());
         let (masked_outbound, masked_events) = mpsc::channel(512);
@@ -2987,6 +2992,10 @@ async fn execute_job(
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
     repository_access: &RunRepositoryAccess,
 ) -> Result<JobExecution> {
+    workflow_commands
+        .lock()
+        .expect("workflow command processor was poisoned")
+        .register_workspace(event_job_id, workspace.to_path_buf());
     let job_temp_directory = run_dir
         .join("_temp")
         .join(format!("job-{}", Uuid::new_v4()));
@@ -6721,10 +6730,12 @@ async fn forward_output<R>(
                 if !prepare_workflow_log(workflow_commands.as_ref(), &step_id, stream, &mut data) {
                     return;
                 }
-                if !data.is_empty()
-                    && outbound
+                if !data.is_empty() {
+                    let message_id = Uuid::new_v4();
+                    mark_preprocessed_workflow_log(workflow_commands.as_ref(), message_id);
+                    if outbound
                         .send(AgentMessage::LogChunk {
-                            message_id: Uuid::new_v4(),
+                            message_id,
                             job_id,
                             step_id: step_id.clone(),
                             sequence: sequence.fetch_add(1, Ordering::Relaxed),
@@ -6733,8 +6744,9 @@ async fn forward_output<R>(
                         })
                         .await
                         .is_err()
-                {
-                    return;
+                    {
+                        return;
+                    }
                 }
             }
             if let Some(commands) = &workflow_commands {
@@ -6774,9 +6786,11 @@ async fn forward_output<R>(
             if data.is_empty() {
                 continue;
             }
+            let message_id = Uuid::new_v4();
+            mark_preprocessed_workflow_log(workflow_commands.as_ref(), message_id);
             if outbound
                 .send(AgentMessage::LogChunk {
-                    message_id: Uuid::new_v4(),
+                    message_id,
                     job_id,
                     step_id: step_id.clone(),
                     sequence: sequence.fetch_add(1, Ordering::Relaxed),
@@ -6811,6 +6825,18 @@ fn prepare_workflow_log(
     }
     commands.mask_for_step(step_id, data);
     true
+}
+
+fn mark_preprocessed_workflow_log(
+    commands: Option<&Arc<StdMutex<WorkflowCommandProcessor>>>,
+    message_id: Uuid,
+) {
+    if let Some(commands) = commands {
+        commands
+            .lock()
+            .expect("workflow command processor was poisoned")
+            .mark_preprocessed_log(message_id);
+    }
 }
 
 async fn github_environment(
@@ -7415,12 +7441,17 @@ async fn relay_masked_events(
                     .mask_for_step(step_id, name);
             }
             AgentMessage::LogChunk {
+                message_id,
                 step_id,
                 stream,
                 data,
                 ..
             } => {
-                if matches!(stream, LogStream::Stdout | LogStream::Stderr) {
+                let preprocessed = commands
+                    .lock()
+                    .expect("workflow command processor was poisoned")
+                    .take_preprocessed_log(*message_id);
+                if !preprocessed && matches!(stream, LogStream::Stdout | LogStream::Stderr) {
                     commands
                         .lock()
                         .expect("workflow command processor was poisoned")
@@ -7492,9 +7523,10 @@ struct WorkflowCommandProcessor {
     global_masks: Vec<String>,
     scopes: BTreeMap<String, WorkflowCommandScope>,
     legacy_values: BTreeMap<String, LegacyCommandValues>,
-    workspace: Option<PathBuf>,
+    problem_matchers: ProblemMatcherRegistry,
     annotations: Vec<CheckAnnotation>,
     annotation_counts: BTreeMap<(String, CheckAnnotationLevel), usize>,
+    preprocessed_logs: BTreeSet<Uuid>,
     partial_commands: BTreeMap<(String, u8), String>,
     fatal_error: Option<String>,
 }
@@ -7521,14 +7553,30 @@ struct LegacyCommandValues {
 }
 
 impl WorkflowCommandProcessor {
-    fn with_global_masks(mut masks: Vec<String>, workspace: PathBuf) -> Self {
+    fn with_global_masks(
+        mut masks: Vec<String>,
+        workspace: PathBuf,
+        matcher_root: PathBuf,
+    ) -> Self {
         masks.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
         masks.dedup();
         Self {
             global_masks: masks,
-            workspace: Some(workspace),
+            problem_matchers: ProblemMatcherRegistry::new(workspace, matcher_root),
             ..Self::default()
         }
+    }
+
+    fn mark_preprocessed_log(&mut self, message_id: Uuid) {
+        self.preprocessed_logs.insert(message_id);
+    }
+
+    fn take_preprocessed_log(&mut self, message_id: Uuid) -> bool {
+        self.preprocessed_logs.remove(&message_id)
+    }
+
+    fn register_workspace(&mut self, scope: &str, workspace: PathBuf) {
+        self.problem_matchers.register_workspace(scope, workspace);
     }
 
     fn ensure_healthy(&self) -> Result<()> {
@@ -7630,7 +7678,25 @@ impl WorkflowCommandProcessor {
             }
             return Ok(WorkflowLineDisposition::Suppress);
         }
-        if let Some(annotation) = parse_workflow_annotation(line, self.workspace.as_deref())? {
+        if let Some(path) = strip_prefix_ignore_ascii_case(line, "::add-matcher::") {
+            let path = decode_workflow_command_data(path);
+            self.problem_matchers.add_from_file(&scope_id, &path)?;
+            return Ok(WorkflowLineDisposition::Suppress);
+        }
+        if let Some(removal) = parse_remove_matcher_command(line)? {
+            match removal {
+                ProblemMatcherRemoval::Owner(owner) => {
+                    self.problem_matchers.remove_owner(&scope_id, &owner)?;
+                }
+                ProblemMatcherRemoval::File(path) => {
+                    self.problem_matchers.remove_from_file(&scope_id, &path)?;
+                }
+            }
+            return Ok(WorkflowLineDisposition::Suppress);
+        }
+        if let Some(annotation) =
+            parse_workflow_annotation(line, self.problem_matchers.workspace(&scope_id))?
+        {
             let visible = annotation_log_line(&annotation);
             self.record_annotation(step_id, annotation);
             return Ok(WorkflowLineDisposition::Replace(visible));
@@ -7643,6 +7709,9 @@ impl WorkflowCommandProcessor {
             self.record_legacy_value(step_id, name, value, true)?;
             return Ok(WorkflowLineDisposition::Suppress);
         }
+        if let Some(annotation) = self.problem_matchers.scan(&scope_id, line) {
+            self.record_annotation(step_id, annotation);
+        }
         Ok(WorkflowLineDisposition::Original)
     }
 
@@ -7650,7 +7719,7 @@ impl WorkflowCommandProcessor {
         let per_step_limit = match annotation.annotation_level {
             CheckAnnotationLevel::Failure => Some(MAX_ERROR_ANNOTATIONS_PER_STEP),
             CheckAnnotationLevel::Warning => Some(MAX_WARNING_ANNOTATIONS_PER_STEP),
-            CheckAnnotationLevel::Notice => None,
+            CheckAnnotationLevel::Notice => Some(MAX_NOTICE_ANNOTATIONS_PER_STEP),
         };
         if let Some(limit) = per_step_limit {
             let key = (step_id.to_owned(), annotation.annotation_level);
@@ -7734,6 +7803,7 @@ impl WorkflowCommandProcessor {
                     || strip_prefix_ignore_ascii_case(line, "::set-output ").is_some()
                     || strip_prefix_ignore_ascii_case(line, "::save-state ").is_some()
                     || is_annotation_workflow_command(line)
+                    || is_problem_matcher_workflow_command(line)
             }
         }
     }
@@ -7755,6 +7825,8 @@ impl WorkflowCommandProcessor {
         if let Some(scope) = self.scopes.get_mut(&workflow_command_scope(step_id)) {
             scope.stop_token = None;
         }
+        self.problem_matchers
+            .reset_scope(&workflow_command_scope(step_id));
         self.legacy_values.remove(step_id);
         Ok(())
     }
@@ -7853,6 +7925,48 @@ fn decode_workflow_command_property(value: &str) -> String {
         .replace("%2C", ",")
         .replace("%2c", ",")
         .replace("%25", "%")
+}
+
+enum ProblemMatcherRemoval {
+    Owner(String),
+    File(String),
+}
+
+fn is_problem_matcher_workflow_command(line: &str) -> bool {
+    strip_prefix_ignore_ascii_case(line, "::add-matcher::").is_some()
+        || strip_prefix_ignore_ascii_case(line, "::remove-matcher::").is_some()
+        || strip_prefix_ignore_ascii_case(line, "::remove-matcher ").is_some()
+}
+
+fn parse_remove_matcher_command(line: &str) -> Result<Option<ProblemMatcherRemoval>> {
+    let Some(body) = strip_prefix_ignore_ascii_case(line, "::remove-matcher") else {
+        return Ok(None);
+    };
+    let (property_text, data) = if let Some(data) = body.strip_prefix("::") {
+        ("", data)
+    } else if let Some(properties) = body.strip_prefix(' ') {
+        properties
+            .split_once("::")
+            .context("remove-matcher command is missing its data delimiter")?
+    } else {
+        return Ok(None);
+    };
+    let owner = property_text
+        .split(',')
+        .filter_map(|property| property.split_once('='))
+        .find_map(|(key, value)| {
+            key.trim()
+                .eq_ignore_ascii_case("owner")
+                .then(|| decode_workflow_command_property(value))
+        })
+        .filter(|owner| !owner.is_empty());
+    let data = decode_workflow_command_data(data);
+    match (owner, data.is_empty()) {
+        (Some(owner), true) => Ok(Some(ProblemMatcherRemoval::Owner(owner))),
+        (None, false) => Ok(Some(ProblemMatcherRemoval::File(data))),
+        (Some(_), false) => bail!("remove-matcher command cannot specify both owner and file"),
+        (None, true) => bail!("remove-matcher command must specify an owner or file"),
+    }
 }
 
 fn is_annotation_workflow_command(line: &str) -> bool {
@@ -9560,6 +9674,7 @@ jobs:
         let commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::with_global_masks(
             Vec::new(),
             directory.path().to_path_buf(),
+            directory.path().to_path_buf(),
         )));
         let relay = tokio::spawn(relay_masked_events(
             incoming,
@@ -9688,6 +9803,170 @@ jobs:
         assert_eq!(
             expanded.title.as_ref().expect("bounded title").len(),
             MAX_CHECK_ANNOTATION_TITLE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_problem_matchers_publish_once_and_remain_job_scoped() {
+        let directory = tempfile::tempdir().expect("temporary run root");
+        let discovery = directory.path().join("repository");
+        let workspace = directory.path().join("jobs/0-job-a");
+        std::fs::create_dir_all(&discovery).expect("discovery checkout");
+        std::fs::create_dir_all(workspace.join("src")).expect("workspace");
+        std::fs::write(workspace.join("src/main.rs"), "fn main() {}\n").expect("source");
+        std::fs::write(
+            workspace.join("matcher.json"),
+            r#"{
+              "problemMatcher": [{
+                "owner": "rust-test",
+                "pattern": [{
+                  "regexp": "^([^:]+):(\\d+):(\\d+): (warning|error) ([^:]+): (.*)$",
+                  "file": 1, "line": 2, "column": 3, "severity": 4,
+                  "code": 5, "message": 6
+                }]
+              }]
+            }"#,
+        )
+        .expect("matcher config");
+        let job_id = Uuid::new_v4();
+        let step_id = "0/job-a/lint";
+        let commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::with_global_masks(
+            Vec::new(),
+            discovery,
+            directory.path().to_path_buf(),
+        )));
+        commands
+            .lock()
+            .expect("workflow command processor")
+            .register_workspace("0/job-a", workspace.clone());
+
+        let mut registration = "::add-matcher::matcher.json\n".to_owned();
+        assert!(prepare_workflow_log(
+            Some(&commands),
+            step_id,
+            LogStream::Stdout,
+            &mut registration,
+        ));
+        assert!(registration.is_empty());
+
+        let mut diagnostic =
+            "\u{1b}[31msrc/main.rs:3:7: warning GZ100: leak sensitive\u{1b}[0m\n".to_owned();
+        assert!(prepare_workflow_log(
+            Some(&commands),
+            step_id,
+            LogStream::Stdout,
+            &mut diagnostic,
+        ));
+        let diagnostic_id = Uuid::new_v4();
+        mark_preprocessed_workflow_log(Some(&commands), diagnostic_id);
+
+        let mut direct_annotation = format!(
+            "::notice file={},line=5::direct annotation\n",
+            workspace.join("src/main.rs").display()
+        );
+        assert!(prepare_workflow_log(
+            Some(&commands),
+            step_id,
+            LogStream::Stdout,
+            &mut direct_annotation,
+        ));
+        let direct_annotation_id = Uuid::new_v4();
+        mark_preprocessed_workflow_log(Some(&commands), direct_annotation_id);
+
+        let mut removal = "::remove-matcher owner=RUST-TEST::\n".to_owned();
+        assert!(prepare_workflow_log(
+            Some(&commands),
+            step_id,
+            LogStream::Stdout,
+            &mut removal,
+        ));
+        assert!(removal.is_empty());
+        let mut after_removal = "src/main.rs:4:1: error GZ200: removed\n".to_owned();
+        assert!(prepare_workflow_log(
+            Some(&commands),
+            step_id,
+            LogStream::Stdout,
+            &mut after_removal,
+        ));
+        let after_removal_id = Uuid::new_v4();
+        mark_preprocessed_workflow_log(Some(&commands), after_removal_id);
+
+        let (input, incoming) = mpsc::channel(8);
+        let (outbound, mut output) = mpsc::channel(8);
+        let relay = tokio::spawn(relay_masked_events(
+            incoming,
+            outbound,
+            vec!["sensitive".to_owned()],
+            commands,
+        ));
+        for (message_id, data) in [
+            (diagnostic_id, diagnostic),
+            (direct_annotation_id, direct_annotation),
+            (after_removal_id, after_removal),
+        ] {
+            input
+                .send(AgentMessage::LogChunk {
+                    message_id,
+                    job_id,
+                    step_id: step_id.to_owned(),
+                    sequence: 0,
+                    stream: LogStream::Stdout,
+                    data,
+                })
+                .await
+                .expect("diagnostic log");
+        }
+        input
+            .send(AgentMessage::LogChunk {
+                message_id: Uuid::new_v4(),
+                job_id,
+                step_id: "0/job-b/lint".to_owned(),
+                sequence: 1,
+                stream: LogStream::Stdout,
+                data: "src/main.rs:8:2: error GZ300: other job\n".to_owned(),
+            })
+            .await
+            .expect("other job diagnostic");
+        input
+            .send(AgentMessage::JobFinished {
+                message_id: Uuid::new_v4(),
+                job_id,
+                conclusion: Conclusion::Failure,
+                summary: "problem matcher run".to_owned(),
+                annotations: Vec::new(),
+            })
+            .await
+            .expect("terminal result");
+        drop(input);
+        relay
+            .await
+            .expect("join relay")
+            .expect("relay matcher events");
+
+        let mut annotations = None;
+        let mut logs = Vec::new();
+        while let Some(message) = output.recv().await {
+            match message {
+                AgentMessage::LogChunk { data, .. } => logs.push(data),
+                AgentMessage::JobFinished {
+                    annotations: found, ..
+                } => annotations = Some(found),
+                _ => {}
+            }
+        }
+        assert!(logs.iter().any(|line| line.contains("leak ***")));
+        let annotations = annotations.expect("annotated terminal result");
+        assert_eq!(annotations.len(), 2, "preprocessed log was matched twice");
+        assert_eq!(annotations[0].path, "src/main.rs");
+        assert_eq!(annotations[0].start_line, 3);
+        assert_eq!(annotations[0].start_column, Some(7));
+        assert_eq!(annotations[0].title.as_deref(), Some("GZ100"));
+        assert_eq!(annotations[0].message, "leak ***");
+        assert_eq!(annotations[1].path, "src/main.rs");
+        assert_eq!(annotations[1].start_line, 5);
+        assert_eq!(
+            annotations[1].annotation_level,
+            CheckAnnotationLevel::Notice
         );
     }
 

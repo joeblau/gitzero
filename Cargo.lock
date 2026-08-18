@@ -515,6 +515,7 @@ dependencies = [
  "gitzero-protocol",
  "gitzero-workflow",
  "libc",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

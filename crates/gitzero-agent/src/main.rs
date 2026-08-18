@@ -3,6 +3,7 @@ mod artifact;
 mod cache;
 mod concurrency;
 mod executor;
+mod problem_matcher;
 mod repository_access;
 
 use anyhow::{Context, Result, bail};

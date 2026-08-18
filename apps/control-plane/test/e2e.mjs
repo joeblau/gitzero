@@ -238,7 +238,7 @@ try {
       assert.equal(completedJob.attempt_count, 1);
       assert.match(
         completedJob.summary,
-        /GitZero completed 1 step\(s\) successfully\./,
+        /GitZero completed 2 step\(s\) successfully\./,
       );
       assert.match(completedJob.summary, /GitZero local E2E summary marker/);
     }
@@ -265,7 +265,7 @@ try {
         (event) =>
           event.type === "job_finished" && event.data?.job_id === queued.job_id,
       );
-      assert.equal(completion?.data?.annotation_count, 1);
+      assert.equal(completion?.data?.annotation_count, 2);
     }
 
     for (const agentId of agentIds) {
@@ -317,6 +317,30 @@ async function createRepositoryFixture(root) {
   const workflowDirectory = path.join(source, ".github/workflows");
   await mkdir(workflowDirectory, { recursive: true });
   await writeFile(
+    path.join(source, ".github/gitzero-e2e-matcher.json"),
+    JSON.stringify(
+      {
+        problemMatcher: [
+          {
+            owner: "gitzero-e2e",
+            pattern: [
+              {
+                regexp: "^(README\\.md):(\\d+): (warning|error) ([^:]+): (.*)$",
+                file: 1,
+                line: 2,
+                severity: 3,
+                code: 4,
+                message: 5,
+              },
+            ],
+          },
+        ],
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+  await writeFile(
     path.join(workflowDirectory, "acceptance.yml"),
     `name: Local end-to-end acceptance
 on: pull_request
@@ -326,17 +350,20 @@ jobs:
       group: acceptance-minis
       labels: [self-hosted, macOS, acceptance]
     steps:
+      - uses: actions/checkout@v6
       - name: Prove Worker-to-agent execution
         run: |
           test "$GITZERO_E2E_SENTINEL" = "worker-agent-roundtrip"
           test "$GITHUB_SHA" = "$GITZERO_E2E_HEAD_SHA"
           sleep 2
           printf 'gitzero-e2e-log\\n'
+          printf '::add-matcher::.github/gitzero-e2e-matcher.json\\n'
+          printf 'README.md:1: warning GZ-E2E: GitZero local E2E matcher marker\\n'
           printf '::warning file=README.md,line=1,title=GitZero E2E::GitZero local E2E annotation marker\\n'
           printf 'GitZero local E2E summary marker\\n' >> "$GITHUB_STEP_SUMMARY"
 `,
   );
-  await git(source, "add", ".github/workflows/acceptance.yml");
+  await git(source, "add", ".github");
   await git(source, "commit", "-m", "add acceptance workflow");
   const headSha = (await gitOutput(source, "rev-parse", "HEAD")).trim();
   await git(source, "push", "origin", "HEAD:refs/pull/1/head");
