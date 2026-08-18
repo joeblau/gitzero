@@ -28,6 +28,8 @@
     <string>10737418240</string>
     <key>GITZERO_CACHE_MAX_ENTRY_BYTES</key>
     <string>2147483648</string>
+    <key>GITZERO_CACHE_MODE</key>
+    <string>write</string>
     <key>GITZERO_ARTIFACT_MAX_BYTES</key>
     <string>10737418240</string>
     <key>GITZERO_ARTIFACT_MAX_ENTRY_BYTES</key>

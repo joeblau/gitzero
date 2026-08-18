@@ -8,6 +8,7 @@ mod problem_matcher;
 mod repository_access;
 
 use anyhow::{Context, Result, bail};
+use cache::CacheMode;
 use clap::Parser;
 use concurrency::ConcurrencyClient;
 use executor::{Executor, ExecutorConfig, default_runner_labels};
@@ -85,6 +86,9 @@ struct Args {
     )]
     cache_max_entry_bytes: u64,
 
+    #[arg(long, env = "GITZERO_CACHE_MODE", default_value_t)]
+    cache_mode: CacheMode,
+
     #[arg(
         long,
         env = "GITZERO_ARTIFACT_MAX_BYTES",
@@ -151,6 +155,7 @@ async fn main() -> Result<()> {
             artifact_max_bytes: args.artifact_max_bytes,
             artifact_max_entry_bytes: args.artifact_max_entry_bytes,
         })
+        .with_cache_mode(args.cache_mode)
         .with_runner_targeting(args.labels.clone(), args.runner_group.clone()),
     );
     let semaphore = Arc::new(Semaphore::new(usize::from(args.max_parallelism)));
@@ -539,6 +544,7 @@ mod tests {
             keep_failed_workspaces: false,
             cache_max_bytes: 10 * 1024 * 1024,
             cache_max_entry_bytes: 1024 * 1024,
+            cache_mode: CacheMode::Write,
             artifact_max_bytes: 10 * 1024 * 1024,
             artifact_max_entry_bytes: 1024 * 1024,
         };

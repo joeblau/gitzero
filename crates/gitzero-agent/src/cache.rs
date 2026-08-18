@@ -13,9 +13,11 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
+    fmt,
     io::SeekFrom,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{Arc, Mutex as StdMutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -44,6 +46,54 @@ pub struct CacheLimits {
     pub maximum_entry_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CacheMode {
+    None,
+    Read,
+    #[default]
+    Write,
+    WriteOnly,
+}
+
+impl CacheMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::WriteOnly => "write-only",
+        }
+    }
+
+    const fn allows_read(self) -> bool {
+        matches!(self, Self::Read | Self::Write)
+    }
+
+    const fn allows_write(self) -> bool {
+        matches!(self, Self::Write | Self::WriteOnly)
+    }
+}
+
+impl fmt::Display for CacheMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CacheMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "none" => Ok(Self::None),
+            "read" => Ok(Self::Read),
+            "write" => Ok(Self::Write),
+            "write-only" => Ok(Self::WriteOnly),
+            _ => Err("cache mode must be one of: none, read, write, write-only".to_owned()),
+        }
+    }
+}
+
 pub struct CacheService {
     base_url: String,
     runtime_token: String,
@@ -58,6 +108,7 @@ impl CacheService {
         repository: &str,
         scope: &str,
         runtime_token: &str,
+        mode: CacheMode,
         limits: CacheLimits,
     ) -> Result<Self> {
         if limits.maximum_entry_bytes == 0 || limits.maximum_bytes < limits.maximum_entry_bytes {
@@ -89,6 +140,7 @@ impl CacheService {
             upload_root: upload_root.to_owned(),
             base_url: base_url.clone(),
             runtime_token: runtime_token.to_owned(),
+            mode,
             limits,
             next_reservation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             reservations: Arc::new(Mutex::new(BTreeMap::new())),
@@ -178,6 +230,7 @@ struct CacheState {
     upload_root: PathBuf,
     base_url: String,
     runtime_token: String,
+    mode: CacheMode,
     limits: CacheLimits,
     next_reservation: Arc<std::sync::atomic::AtomicU64>,
     reservations: Arc<Mutex<BTreeMap<u64, Arc<Mutex<Reservation>>>>>,
@@ -269,6 +322,7 @@ async fn lookup_cache(
     Query(query): Query<LookupQuery>,
 ) -> CacheResponse<Response> {
     authorize(&state, &headers)?;
+    require_cache_read(&state)?;
     validate_version(&query.version)?;
     let keys = query.keys.split(',').map(str::to_owned).collect::<Vec<_>>();
     if keys.is_empty() || keys.len() > MAX_LOOKUP_KEYS {
@@ -321,6 +375,7 @@ async fn list_caches(
     Query(query): Query<ListQuery>,
 ) -> CacheResponse<Response> {
     authorize(&state, &headers)?;
+    require_cache_read(&state)?;
     let lock = cache_root_lock(&state.root);
     let _guard = lock.lock().await;
     let mut entries = load_scope_entries(&state.scope_root)
@@ -359,6 +414,7 @@ async fn reserve_cache(
     Json(request): Json<ReserveRequest>,
 ) -> CacheResponse<Response> {
     authorize(&state, &headers)?;
+    require_cache_write(&state)?;
     validate_key(&request.key)?;
     let version = request.version.unwrap_or_default();
     validate_version(&version)?;
@@ -414,6 +470,7 @@ async fn upload_chunk(
     body: Body,
 ) -> CacheResponse<Response> {
     authorize(&state, &headers)?;
+    require_cache_write(&state)?;
     let (start, end) = parse_content_range(&headers)?;
     if end >= state.limits.maximum_entry_bytes {
         return Err(CacheHttpError::new(
@@ -481,6 +538,7 @@ async fn commit_cache(
     Json(request): Json<CommitRequest>,
 ) -> CacheResponse<Response> {
     authorize(&state, &headers)?;
+    require_cache_write(&state)?;
     if request.size == 0 || request.size > state.limits.maximum_entry_bytes {
         return Err(CacheHttpError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -600,6 +658,7 @@ async fn download_cache(
             "cache download is not authorized",
         ));
     }
+    require_cache_read(&state)?;
     let archive = state.scope_root.join(digest).join("archive");
     let file = fs::File::open(&archive).await.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -637,6 +696,34 @@ fn authorize(state: &CacheState, headers: &HeaderMap) -> CacheResponse<()> {
         Err(CacheHttpError::new(
             StatusCode::UNAUTHORIZED,
             "cache request is not authorized",
+        ))
+    }
+}
+
+fn require_cache_read(state: &CacheState) -> CacheResponse<()> {
+    if state.mode.allows_read() {
+        Ok(())
+    } else {
+        Err(CacheHttpError::new(
+            StatusCode::FORBIDDEN,
+            format!(
+                "cache read denied: effective cache mode '{}' does not permit reads",
+                state.mode
+            ),
+        ))
+    }
+}
+
+fn require_cache_write(state: &CacheState) -> CacheResponse<()> {
+    if state.mode.allows_write() {
+        Ok(())
+    } else {
+        Err(CacheHttpError::new(
+            StatusCode::FORBIDDEN,
+            format!(
+                "cache write denied: effective cache mode '{}' does not permit writes",
+                state.mode
+            ),
         ))
     }
 }
@@ -884,12 +971,22 @@ mod tests {
 
     impl TestService {
         async fn start(fixture: &TempDir, scope: &str, maximum_bytes: u64) -> Self {
+            Self::start_with_mode(fixture, scope, maximum_bytes, CacheMode::Write).await
+        }
+
+        async fn start_with_mode(
+            fixture: &TempDir,
+            scope: &str,
+            maximum_bytes: u64,
+            mode: CacheMode,
+        ) -> Self {
             let service = CacheService::start(
                 fixture.path(),
                 &fixture.path().join(format!("uploads-{}", Uuid::new_v4())),
                 "fixture/repository",
                 scope,
                 "fixture.runtime.token",
+                mode,
                 CacheLimits {
                     maximum_bytes,
                     maximum_entry_bytes: maximum_bytes.min(1_024),
@@ -977,6 +1074,143 @@ mod tests {
                 .await
                 .expect("lookup cache")
         }
+    }
+
+    #[test]
+    fn cache_modes_parse_and_expose_the_github_lattice() {
+        for (value, mode, readable, writable) in [
+            ("none", CacheMode::None, false, false),
+            ("read", CacheMode::Read, true, false),
+            ("write", CacheMode::Write, true, true),
+            ("write-only", CacheMode::WriteOnly, false, true),
+        ] {
+            assert_eq!(value.parse::<CacheMode>().unwrap(), mode);
+            assert_eq!(mode.to_string(), value);
+            assert_eq!(mode.allows_read(), readable);
+            assert_eq!(mode.allows_write(), writable);
+        }
+        assert!("READ".parse::<CacheMode>().is_err());
+        assert!("read-write".parse::<CacheMode>().is_err());
+    }
+
+    #[tokio::test]
+    async fn cache_service_enforces_effective_read_and_write_modes() {
+        let fixture = TempDir::new().expect("fixture");
+        let scope = "refs/pull/8/head";
+        let seed = TestService::start(&fixture, scope, 4_096).await;
+        assert_eq!(
+            seed.save("seed", "v1", b"seed bytes").await,
+            StatusCode::NO_CONTENT
+        );
+        seed.service
+            .shutdown()
+            .await
+            .expect("shutdown seed service");
+        let digest = scan_cache_entries(&fixture.path().join("_workflow-cache"))
+            .expect("scan seeded cache")
+            .into_iter()
+            .next()
+            .and_then(|entry| {
+                entry
+                    .directory
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .expect("seeded cache digest");
+
+        let read = TestService::start_with_mode(&fixture, scope, 4_096, CacheMode::Read).await;
+        assert_eq!(read.lookup("seed", "v1").await.status(), StatusCode::OK);
+        let download = read
+            .client
+            .get(read.url(&format!(
+                "_gitzero/cache/{digest}?token={}",
+                read.service.runtime_token()
+            )))
+            .send()
+            .await
+            .expect("read-mode download");
+        assert_eq!(download.status(), StatusCode::OK);
+        assert_eq!(download.bytes().await.unwrap(), "seed bytes");
+        let denied_write = read
+            .request(reqwest::Method::POST, "_apis/artifactcache/caches")
+            .json(&json!({ "key": "denied", "version": "v1", "cacheSize": 4 }))
+            .send()
+            .await
+            .expect("read-mode reservation denial");
+        assert_eq!(denied_write.status(), StatusCode::FORBIDDEN);
+        assert!(
+            denied_write.json::<serde_json::Value>().await.unwrap()["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("cache write denied:")
+        );
+        read.service
+            .shutdown()
+            .await
+            .expect("shutdown read service");
+
+        let write_only =
+            TestService::start_with_mode(&fixture, scope, 4_096, CacheMode::WriteOnly).await;
+        assert_eq!(
+            write_only.lookup("seed", "v1").await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let denied_download = write_only
+            .client
+            .get(write_only.url(&format!(
+                "_gitzero/cache/{digest}?token={}",
+                write_only.service.runtime_token()
+            )))
+            .send()
+            .await
+            .expect("write-only download denial");
+        assert_eq!(denied_download.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            write_only.save("write-only", "v1", b"new bytes").await,
+            StatusCode::NO_CONTENT
+        );
+        write_only
+            .service
+            .shutdown()
+            .await
+            .expect("shutdown write-only service");
+
+        let none = TestService::start_with_mode(&fixture, scope, 4_096, CacheMode::None).await;
+        assert_eq!(
+            none.lookup("seed", "v1").await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            none.request(reqwest::Method::GET, "_apis/artifactcache/caches")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            none.request(reqwest::Method::PATCH, "_apis/artifactcache/caches/1")
+                .header("Content-Range", "bytes 0-0/*")
+                .body(vec![0])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            none.request(reqwest::Method::POST, "_apis/artifactcache/caches/1")
+                .json(&json!({ "size": 1 }))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        none.service
+            .shutdown()
+            .await
+            .expect("shutdown none service");
     }
 
     #[tokio::test]

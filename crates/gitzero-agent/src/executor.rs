@@ -3,7 +3,7 @@ use crate::action::{
 };
 use crate::artifact::{ArtifactLimits, ArtifactService};
 use crate::artifact_subject::{ArtifactSubjects, artifacts_file_enabled};
-use crate::cache::{CacheLimits, CacheService};
+use crate::cache::{CacheLimits, CacheMode, CacheService};
 use crate::concurrency::{ConcurrencyAcquisition, ConcurrencyClient};
 use crate::problem_matcher::ProblemMatcherRegistry;
 use crate::repository_access::{ExpiringToken, RepositoryAccessClient};
@@ -314,7 +314,27 @@ pub struct Executor {
     config: ExecutorConfig,
     execution_slots: Arc<Semaphore>,
     runner_targeting: RunnerTargeting,
+    features: ExecutorFeatures,
+}
+
+#[derive(Clone, Copy)]
+struct ExecutorFeatures {
     allow_artifacts_file: bool,
+    cache_mode: CacheMode,
+}
+
+#[cfg(test)]
+const fn test_executor_features(allow_artifacts_file: bool) -> ExecutorFeatures {
+    ExecutorFeatures {
+        allow_artifacts_file,
+        cache_mode: CacheMode::Write,
+    }
+}
+
+#[derive(Clone)]
+struct JobRuntime {
+    artifact_subjects: ArtifactSubjects,
+    cache_mode: CacheMode,
 }
 
 #[derive(Clone, Debug)]
@@ -352,12 +372,20 @@ impl Executor {
             config,
             execution_slots,
             runner_targeting: default_runner_targeting(),
-            allow_artifacts_file: artifacts_file_enabled(
-                std::env::var("ACTIONS_RUNNER_ALLOW_ARTIFACTS_FILE")
-                    .ok()
-                    .as_deref(),
-            ),
+            features: ExecutorFeatures {
+                allow_artifacts_file: artifacts_file_enabled(
+                    std::env::var("ACTIONS_RUNNER_ALLOW_ARTIFACTS_FILE")
+                        .ok()
+                        .as_deref(),
+                ),
+                cache_mode: CacheMode::Write,
+            },
         }
+    }
+
+    pub fn with_cache_mode(mut self, cache_mode: CacheMode) -> Self {
+        self.features.cache_mode = cache_mode;
+        self
     }
 
     pub fn with_runner_targeting(
@@ -424,6 +452,7 @@ impl Executor {
             &repository,
             &cache_scope,
             &runtime_token,
+            self.features.cache_mode,
             CacheLimits {
                 maximum_bytes: self.config.cache_max_bytes,
                 maximum_entry_bytes: self.config.cache_max_entry_bytes,
@@ -549,7 +578,7 @@ impl Executor {
                     &outbound,
                     &sequence,
                     &self.execution_slots,
-                    self.allow_artifacts_file,
+                    self.features,
                     &self.runner_targeting,
                     &job_summaries,
                     &environment_variable_cache,
@@ -2309,7 +2338,7 @@ async fn execute_plan(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
     execution_slots: &Arc<Semaphore>,
-    allow_artifacts_file: bool,
+    features: ExecutorFeatures,
     runner_targeting: &RunnerTargeting,
     job_summaries: &Arc<Mutex<Vec<JobSummary>>>,
     environment_variable_cache: &EnvironmentVariableCache,
@@ -2330,7 +2359,7 @@ async fn execute_plan(
             outbound,
             sequence,
             execution_slots,
-            allow_artifacts_file,
+            features,
             runner_targeting,
             job_summaries,
             environment_variable_cache,
@@ -2396,7 +2425,7 @@ async fn execute_plan(
         outbound,
         sequence,
         execution_slots,
-        allow_artifacts_file,
+        features,
         runner_targeting,
         job_summaries,
         environment_variable_cache,
@@ -2435,7 +2464,7 @@ async fn execute_plan_inner(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
     execution_slots: &Arc<Semaphore>,
-    allow_artifacts_file: bool,
+    features: ExecutorFeatures,
     runner_targeting: &RunnerTargeting,
     job_summaries: &Arc<Mutex<Vec<JobSummary>>>,
     environment_variable_cache: &EnvironmentVariableCache,
@@ -2523,7 +2552,7 @@ async fn execute_plan_inner(
                     outbound,
                     sequence,
                     execution_slots,
-                    allow_artifacts_file,
+                    features,
                     runner_targeting,
                     job_summaries,
                     environment_variable_cache,
@@ -3187,7 +3216,7 @@ async fn execute_base_group(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
     execution_slots: &Arc<Semaphore>,
-    allow_artifacts_file: bool,
+    features: ExecutorFeatures,
     runner_targeting: &RunnerTargeting,
     job_summaries: &Arc<Mutex<Vec<JobSummary>>>,
     environment_variable_cache: &EnvironmentVariableCache,
@@ -3508,7 +3537,7 @@ async fn execute_base_group(
                 &outbound,
                 &sequence,
                 runner_targeting,
-                allow_artifacts_file,
+                features,
                 &job_timed_out,
                 &job_summaries,
                 &environment_variable_cache,
@@ -3799,7 +3828,7 @@ fn start_background_step(
     workflow_commands: Arc<StdMutex<WorkflowCommandProcessor>>,
     repository_access: RunRepositoryAccess,
     checkout_secret_values: BTreeSet<String>,
-    artifact_subjects: ArtifactSubjects,
+    job_runtime: JobRuntime,
     slots: Arc<Semaphore>,
 ) -> BackgroundStepRuntime {
     let (step_cancel, local_cancel) = watch::channel(false);
@@ -3848,7 +3877,7 @@ fn start_background_step(
             &workflow_commands,
             &repository_access,
             &checkout_secret_values,
-            &artifact_subjects,
+            &job_runtime,
         )
         .await;
         drop(permit);
@@ -4027,7 +4056,7 @@ async fn execute_job(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
     runner_targeting: &RunnerTargeting,
-    allow_artifacts_file: bool,
+    features: ExecutorFeatures,
     job_timed_out: &Arc<AtomicBool>,
     job_summaries: &Arc<Mutex<Vec<JobSummary>>>,
     environment_variable_cache: &EnvironmentVariableCache,
@@ -4049,7 +4078,13 @@ async fn execute_job(
                 job_temp_directory.display()
             )
         })?;
-    let artifact_subjects = ArtifactSubjects::new(allow_artifacts_file, workspace.to_path_buf());
+    let job_runtime = JobRuntime {
+        artifact_subjects: ArtifactSubjects::new(
+            features.allow_artifacts_file,
+            workspace.to_path_buf(),
+        ),
+        cache_mode: features.cache_mode,
+    };
     let _checkout_credential_guard =
         SensitiveDirectoryGuard(job_temp_directory.join("_checkout-credentials"));
     let mut workflow_token = repository_access
@@ -4229,6 +4264,8 @@ async fn execute_job(
             &rendered_job_name,
             workspace,
             outbound,
+            sequence,
+            features.cache_mode,
         )
         .await?;
 
@@ -4308,7 +4345,7 @@ async fn execute_job(
                         workflow_commands.clone(),
                         repository_access.clone(),
                         checkout_secret_values.clone(),
-                        artifact_subjects.clone(),
+                        job_runtime.clone(),
                         background_slots.clone(),
                     );
                     background_order.push(step.id.clone());
@@ -4432,7 +4469,7 @@ async fn execute_job(
                     workflow_commands,
                     repository_access,
                     &checkout_secret_values,
-                    &artifact_subjects,
+                    &job_runtime,
                 )
                 .await?;
                 if execution.ran {
@@ -4537,7 +4574,7 @@ async fn execute_job(
                     &mut job_summary,
                     &summary_name,
                     workflow_commands,
-                    &artifact_subjects,
+                    &job_runtime,
                 )
                 .await?;
                 let conclusion = match execution.conclusion {
@@ -4702,6 +4739,8 @@ async fn prepare_workspace(
     job_name: &str,
     workspace: &Path,
     outbound: &mpsc::Sender<AgentMessage>,
+    sequence: &Arc<AtomicU64>,
+    cache_mode: CacheMode,
 ) -> Result<()> {
     let step_id = format!("{event_job_id}/gitzero-prepare");
     send(
@@ -4711,6 +4750,18 @@ async fn prepare_workspace(
             job_id,
             step_id: step_id.clone(),
             name: format!("{workflow_name} / {job_name} / Prepare isolated workspace"),
+        },
+    )
+    .await?;
+    send(
+        outbound,
+        AgentMessage::LogChunk {
+            message_id: Uuid::new_v4(),
+            job_id,
+            step_id: step_id.clone(),
+            sequence: sequence.fetch_add(1, Ordering::Relaxed),
+            stream: LogStream::System,
+            data: format!("Cache mode: {cache_mode}\n"),
         },
     )
     .await?;
@@ -4756,7 +4807,7 @@ async fn execute_step(
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
     repository_access: &RunRepositoryAccess,
     checkout_secret_values: &BTreeSet<String>,
-    artifact_subjects: &ArtifactSubjects,
+    job_runtime: &JobRuntime,
 ) -> Result<StepExecution> {
     let mut step_context = context.clone();
     step_context.extend_json_object(
@@ -4909,7 +4960,7 @@ async fn execute_step(
                 workflow_commands,
                 repository_access,
                 checkout_secret_values,
-                artifact_subjects,
+                job_runtime,
             )
             .await;
         }
@@ -4929,7 +4980,8 @@ async fn execute_step(
     let output_file = temp_dir.join(format!("output-{}.txt", sanitize_id(&step_id)));
     let path_file = temp_dir.join(format!("path-{}.txt", sanitize_id(&step_id)));
     let summary_file = temp_dir.join(format!("summary-{}.md", sanitize_id(&step_id)));
-    let artifact_files = artifact_subjects
+    let artifact_files = job_runtime
+        .artifact_subjects
         .initialize_files(&temp_dir, &format!("step-{}", sanitize_id(&step_id)))
         .await?;
     let script_file = temp_dir.join(format!(
@@ -4983,7 +5035,7 @@ async fn execute_step(
     )
     .await?;
     let artifact_subjects_failed = capture_artifact_subjects(
-        artifact_subjects,
+        &job_runtime.artifact_subjects,
         &artifact_files.declarations,
         job_id,
         &step_id,
@@ -7018,7 +7070,7 @@ async fn execute_action_step(
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
     repository_access: &RunRepositoryAccess,
     checkout_secret_values: &BTreeSet<String>,
-    artifact_subjects: &ArtifactSubjects,
+    job_runtime: &JobRuntime,
 ) -> Result<StepExecution> {
     let step_timed_out = Arc::new(AtomicBool::new(false));
     let (effective_cancel, timeout_task) =
@@ -7155,7 +7207,7 @@ async fn execute_action_step(
             workflow_commands,
             repository_access,
             checkout_secret_values,
-            artifact_subjects,
+            job_runtime,
         )
         .await?;
         if job_timed_out.load(Ordering::Acquire) {
@@ -7233,7 +7285,7 @@ async fn execute_action_step(
                 job_summary,
                 &summary_name,
                 workflow_commands,
-                artifact_subjects,
+                job_runtime,
             )
             .await?;
             state.extend(execution.state.clone());
@@ -7265,7 +7317,7 @@ async fn execute_action_step(
             job_summary,
             &summary_name,
             workflow_commands,
-            artifact_subjects,
+            job_runtime,
         )
         .await?;
         state.extend(execution.state.clone());
@@ -7342,7 +7394,7 @@ async fn execute_composite_action(
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
     repository_access: &RunRepositoryAccess,
     checkout_secret_values: &BTreeSet<String>,
-    artifact_subjects: &ArtifactSubjects,
+    job_runtime: &JobRuntime,
 ) -> Result<ActionPhaseExecution> {
     if definition.runs.main.is_some()
         || definition.runs.pre.is_some()
@@ -7391,7 +7443,7 @@ async fn execute_composite_action(
             workflow_commands,
             repository_access,
             checkout_secret_values,
-            artifact_subjects,
+            job_runtime,
         ))
         .await?;
         steps.insert(
@@ -8259,7 +8311,7 @@ async fn execute_node_action_phase(
     job_summary: &mut JobSummaryBuilder,
     summary_name: &str,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
-    artifact_subjects: &ArtifactSubjects,
+    job_runtime: &JobRuntime,
 ) -> Result<ActionPhaseExecution> {
     let script = action_directory.join(script);
     ensure_within(action_directory, &script).await?;
@@ -8274,7 +8326,8 @@ async fn execute_node_action_phase(
     let path_file = temp_dir.join(format!("action-{phase}-{nonce}-path.txt"));
     let state_file = temp_dir.join(format!("action-{phase}-{nonce}-state.txt"));
     let summary_file = temp_dir.join(format!("action-{phase}-{nonce}-summary.md"));
-    let artifact_files = artifact_subjects
+    let artifact_files = job_runtime
+        .artifact_subjects
         .initialize_files(&temp_dir, &format!("action-{phase}"))
         .await?;
     for path in [
@@ -8308,6 +8361,7 @@ async fn execute_node_action_phase(
         .current_dir(workspace)
         .envs(environment.iter())
         .envs(phase_environment.iter())
+        .env("ACTIONS_CACHE_MODE", job_runtime.cache_mode.as_str())
         .env("GITHUB_ENV", &env_file)
         .env("GITHUB_OUTPUT", &output_file)
         .env("GITHUB_PATH", &path_file)
@@ -8337,7 +8391,7 @@ async fn execute_node_action_phase(
     )
     .await?;
     let artifact_subjects_failed = capture_artifact_subjects(
-        artifact_subjects,
+        &job_runtime.artifact_subjects,
         &artifact_files.declarations,
         job_id,
         step_id,
@@ -13879,6 +13933,7 @@ jobs:
           const assert = require('assert');
           const fs = require('fs');
           const path = require('path');
+          assert.strictEqual(process.env.ACTIONS_CACHE_MODE, 'write');
           const list = JSON.parse(fs.readFileSync(process.env.GITHUB_ARTIFACTS_LIST, 'utf8'));
           assert.deepStrictEqual(list.subjects.map(subject => subject.name), ['example/image', 'subject.txt']);
           fs.writeFileSync(process.env.GITHUB_ARTIFACTS_LIST, 'ignored by the runner');
@@ -13890,6 +13945,7 @@ jobs:
           const assert = require('assert');
           const fs = require('fs');
           const path = require('path');
+          assert.strictEqual(process.env.ACTIONS_CACHE_MODE, 'write');
           const list = JSON.parse(fs.readFileSync(process.env.GITHUB_ARTIFACTS_LIST, 'utf8'));
           assert.deepStrictEqual(list.subjects.map(subject => subject.name), ['example/image', 'js.txt', 'subject.txt']);
           fs.writeFileSync(path.join(process.env.GITHUB_WORKSPACE, 'post.txt'), 'post subject');
@@ -13898,6 +13954,7 @@ jobs:
           POST
       - name: Declare shell subjects
         run: |
+          test -z "${ACTIONS_CACHE_MODE+x}"
           test -f "$GITHUB_ARTIFACTS"
           test -f "$GITHUB_ARTIFACTS_LIST"
           test "$(cat "$GITHUB_ARTIFACTS_LIST")" = '{"version":1,"subjects":[]}'
@@ -13963,7 +14020,7 @@ jobs:
             &outbound,
             &sequence,
             &execution_slots,
-            true,
+            test_executor_features(true),
             &runner_targeting,
             &job_summaries,
             &environment_variable_cache,
@@ -13993,6 +14050,7 @@ jobs:
             })
             .collect::<String>();
         for expected in [
+            "Cache mode: write",
             "Captured 2 artifact subject(s) from this step (job total: 2).",
             "artifact-main-list:2",
             "Captured 1 artifact subject(s) from this step (job total: 3).",
@@ -14173,7 +14231,7 @@ jobs:
             &outbound,
             &sequence,
             &execution_slots,
-            false,
+            test_executor_features(false),
             &runner_targeting,
             &job_summaries,
             &environment_variable_cache,
@@ -14312,7 +14370,7 @@ jobs:
             &outbound,
             &sequence,
             &execution_slots,
-            false,
+            test_executor_features(false),
             &runner_targeting,
             &job_summaries,
             &environment_variable_cache,
@@ -14429,7 +14487,7 @@ jobs:
             &outbound,
             &sequence,
             &execution_slots,
-            false,
+            test_executor_features(false),
             &runner_targeting,
             &job_summaries,
             &environment_variable_cache,
@@ -17066,7 +17124,7 @@ jobs:
             &outbound,
             &sequence,
             &execution_slots,
-            false,
+            test_executor_features(false),
             &runner_targeting,
             &job_summaries,
             &environment_variable_cache,
@@ -17226,7 +17284,7 @@ jobs:
             &outbound,
             &sequence,
             &execution_slots,
-            false,
+            test_executor_features(false),
             &runner_targeting,
             &job_summaries,
             &environment_variable_cache,
@@ -17363,7 +17421,7 @@ jobs:
             &outbound,
             &sequence,
             &execution_slots,
-            false,
+            test_executor_features(false),
             &runner_targeting,
             &job_summaries,
             &environment_variable_cache,

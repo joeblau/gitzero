@@ -24,6 +24,7 @@ print -rn -- "$GITZERO_AGENT_TOKEN" | sudo packaging/macos/install.sh \
   --parallelism 1 \
   --cache-max-bytes 10737418240 \
   --cache-max-entry-bytes 2147483648 \
+  --cache-mode write \
   --artifact-max-bytes 10737418240 \
   --artifact-max-entry-bytes 2147483648
 ```
@@ -52,7 +53,7 @@ Workflow and job `permissions` are enforced per job. The no-declaration baseline
 
 For a job environment whose deployment branch policy allows the workflow ref and which has no reviewer, wait-timer, or custom protection gate, the agent reports start and terminal lifecycle events around the workflow job, including a validated HTTP(S) environment URL after step outputs resolve. It never receives the Worker's deployment-write credential. The control plane durably mirrors those events into GitHub Deployment statuses. Object-form `environment.deployment: false` keeps metadata and branch-policy validation plus environment-scoped variables but suppresses those lifecycle events.
 
-The installer defaults to a 10 GiB total workflow-cache budget and a 2 GiB per-entry limit. `--cache-max-bytes` and `--cache-max-entry-bytes` write the matching protected launchd environment values; the total must be at least the per-entry limit. Entries idle for seven days expire, and least-recently-used entries are evicted before a new immutable entry is committed.
+The installer defaults to a 10 GiB total workflow-cache budget and a 2 GiB per-entry limit. `--cache-max-bytes` and `--cache-max-entry-bytes` write the matching protected launchd environment values; the total must be at least the per-entry limit. `--cache-mode` selects the current runner's effective `none`, `read`, `write`, or `write-only` policy and defaults to `write`, which permits both restore and save. The agent logs that mode at job start and exports it as `ACTIONS_CACHE_MODE` only to JavaScript action phases, matching the runner handler boundary; ordinary shell and composite script steps do not receive it. Current toolkit clients skip disallowed operations locally, while the authenticated cache endpoint separately rejects forbidden lookups/downloads or reservations/uploads/commits so older clients cannot bypass the policy. Entries idle for seven days expire, and least-recently-used entries are evicted before a new immutable entry is committed.
 
 Current-run artifacts have a separate 10 GiB total budget and 2 GiB per-artifact default. `--artifact-max-bytes` and `--artifact-max-entry-bytes` set those bounds. The agent exposes the current GitHub artifact Twirp and block-blob contracts on IPv4 loopback, so unchanged `actions/upload-artifact@v4+` and `actions/download-artifact@v4+` jobs can transfer archived or direct-file artifacts between jobs in the same assigned run. These artifacts are transient and disappear during normal run cleanup; they are not copied to another Mac, retained after the run, listed in GitHub's artifact UI, or available to cross-run/cross-repository downloads.
 

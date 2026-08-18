@@ -3,7 +3,7 @@ set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 usage() {
-  print -u2 "usage: sudo $0 --binary PATH --control-plane URL --workspace ID (--token-stdin | --token TOKEN) [--user USER] [--agent-id ID] [--labels LABEL,...] [--runner-group GROUP] [--parallelism N] [--cache-max-bytes N] [--cache-max-entry-bytes N] [--artifact-max-bytes N] [--artifact-max-entry-bytes N] [--allow-artifacts-file]"
+  print -u2 "usage: sudo $0 --binary PATH --control-plane URL --workspace ID (--token-stdin | --token TOKEN) [--user USER] [--agent-id ID] [--labels LABEL,...] [--runner-group GROUP] [--parallelism N] [--cache-max-bytes N] [--cache-max-entry-bytes N] [--cache-mode MODE] [--artifact-max-bytes N] [--artifact-max-entry-bytes N] [--allow-artifacts-file]"
   exit 64
 }
 
@@ -19,6 +19,7 @@ runner_group=""
 parallelism="1"
 cache_max_bytes="10737418240"
 cache_max_entry_bytes="2147483648"
+cache_mode="write"
 artifact_max_bytes="10737418240"
 artifact_max_entry_bytes="2147483648"
 allow_artifacts_file="false"
@@ -37,6 +38,7 @@ while (( $# > 0 )); do
     --parallelism) parallelism="${2:-}"; shift 2 ;;
     --cache-max-bytes) cache_max_bytes="${2:-}"; shift 2 ;;
     --cache-max-entry-bytes) cache_max_entry_bytes="${2:-}"; shift 2 ;;
+    --cache-mode) cache_mode="${2:-}"; shift 2 ;;
     --artifact-max-bytes) artifact_max_bytes="${2:-}"; shift 2 ;;
     --artifact-max-entry-bytes) artifact_max_entry_bytes="${2:-}"; shift 2 ;;
     --allow-artifacts-file) allow_artifacts_file="true"; shift ;;
@@ -65,6 +67,7 @@ id "$agent_user" >/dev/null 2>&1 || { print -u2 "user '$agent_user' does not exi
 [[ "$cache_max_bytes" == <-> && "$cache_max_bytes" -ge 1 ]] || usage
 [[ "$cache_max_entry_bytes" == <-> && "$cache_max_entry_bytes" -ge 1 ]] || usage
 (( cache_max_bytes >= cache_max_entry_bytes )) || usage
+[[ "$cache_mode" == "none" || "$cache_mode" == "read" || "$cache_mode" == "write" || "$cache_mode" == "write-only" ]] || usage
 [[ "$artifact_max_bytes" == <-> && "$artifact_max_bytes" -ge 1 ]] || usage
 [[ "$artifact_max_entry_bytes" == <-> && "$artifact_max_entry_bytes" -ge 1 ]] || usage
 (( artifact_max_bytes >= artifact_max_entry_bytes )) || usage
@@ -104,6 +107,7 @@ fi
 plutil -replace EnvironmentVariables.GITZERO_MAX_PARALLELISM -string "$parallelism" "$temporary_plist"
 plutil -replace EnvironmentVariables.GITZERO_CACHE_MAX_BYTES -string "$cache_max_bytes" "$temporary_plist"
 plutil -replace EnvironmentVariables.GITZERO_CACHE_MAX_ENTRY_BYTES -string "$cache_max_entry_bytes" "$temporary_plist"
+plutil -replace EnvironmentVariables.GITZERO_CACHE_MODE -string "$cache_mode" "$temporary_plist"
 plutil -replace EnvironmentVariables.GITZERO_ARTIFACT_MAX_BYTES -string "$artifact_max_bytes" "$temporary_plist"
 plutil -replace EnvironmentVariables.GITZERO_ARTIFACT_MAX_ENTRY_BYTES -string "$artifact_max_entry_bytes" "$temporary_plist"
 if [[ "$allow_artifacts_file" == "true" ]]; then
