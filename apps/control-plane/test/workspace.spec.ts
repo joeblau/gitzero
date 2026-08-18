@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { QueuedJob } from "../src/protocol";
+import type { ManagedSecretInput } from "../src/secrets";
 
 const INSTALLATION_TOKEN_EXPIRY = "2100-01-01T00:00:00Z";
 const INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS = 4_102_444_800;
@@ -460,7 +461,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 13,
+          protocol_version: 14,
           agent_id: "mini-1",
           name: "Test Mini",
           version: "0.1.0",
@@ -471,7 +472,7 @@ describe("Workspace Durable Object", () => {
     );
 
     const [welcome, assignment] = await messages;
-    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 13 });
+    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 14 });
     expect(assignment).toMatchObject({
       type: "run_job",
       job: {
@@ -758,7 +759,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 13,
+          protocol_version: 14,
           agent_id: "mini-1",
           name: "duplicate",
           version: "0.1.0",
@@ -1124,7 +1125,10 @@ describe("Workspace Durable Object", () => {
           state.storage.sql
             .exec<{
               count: number;
-            }>("SELECT COUNT(*) AS count FROM deployments WHERE job_id = ? AND unit_id = 'late-deploy'", job.id)
+            }>(
+              "SELECT COUNT(*) AS count FROM deployments WHERE job_id = ? AND unit_id = 'late-deploy'",
+              job.id,
+            )
             .one().count,
       );
       expect(lateDeployments).toBe(0);
@@ -1322,6 +1326,24 @@ describe("Workspace Durable Object", () => {
       type: "workflow_token_denied",
       request_id: workflowRequestId,
       reason: "The parent GitZero run is not authorized for GitHub tokens.",
+    });
+    const secretRequestId = crypto.randomUUID();
+    const secretDenied = collectMessageOfType(agent, "secret_denied");
+    agent.send(
+      JSON.stringify({
+        type: "secret_request",
+        message_id: crypto.randomUUID(),
+        job_id: job.id,
+        request_id: secretRequestId,
+        unit_id: "manual-job",
+        environment: null,
+      }),
+    );
+    await expect(secretDenied).resolves.toEqual({
+      type: "secret_denied",
+      request_id: secretRequestId,
+      reason:
+        "Managed secrets are unavailable to manual, fork, Dependabot, or unverified pull request runs.",
     });
     agent.close(1000, "test complete");
   });
@@ -1580,6 +1602,9 @@ describe("Workspace Durable Object", () => {
         if (url.pathname.endsWith("/actions/variables")) {
           return Response.json({ total_count: 0, variables: [] });
         }
+        if (url.pathname.endsWith("/check-runs")) {
+          return Response.json({ id: 711 }, { status: 201 });
+        }
         return Response.json(installationToken("downgraded-read-token"));
       }),
     );
@@ -1608,6 +1633,7 @@ describe("Workspace Durable Object", () => {
       for (const { job, headRepository, author } of jobs) {
         job.installation_id = 7011;
         job.requires_github_token = true;
+        job.report_to_github = true;
         job.repository.owner = "acme";
         job.repository.name = "caller";
         job.repository.clone_url = "https://github.com/acme/caller.git";
@@ -1642,6 +1668,23 @@ describe("Workspace Durable Object", () => {
           request_id: requestId,
           token: "downgraded-read-token",
           expires_at_epoch_seconds: INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS,
+        });
+        const secretRequestId = crypto.randomUUID();
+        const denied = collectMessageOfType(agent, "secret_denied");
+        agent.send(
+          JSON.stringify({
+            type: "secret_request",
+            message_id: crypto.randomUUID(),
+            job_id: job.id,
+            request_id: secretRequestId,
+            unit_id: "untrusted-job",
+            environment: null,
+          }),
+        );
+        await expect(denied).resolves.toMatchObject({
+          type: "secret_denied",
+          request_id: secretRequestId,
+          reason: expect.stringContaining("unavailable"),
         });
       }
       expect(requests).toHaveLength(3);
@@ -1926,6 +1969,194 @@ describe("Workspace Durable Object", () => {
       }),
     );
   });
+
+  it("snapshots trusted repository secrets and resolves current environment precedence on demand", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const originals = {
+      appId: env.GITHUB_APP_ID,
+      privateKey: env.GITHUB_APP_PRIVATE_KEY,
+      encryptionKey: env.SECRETS_ENCRYPTION_KEY,
+    };
+    Reflect.set(env, "GITHUB_APP_ID", "1234");
+    Reflect.set(env, "GITHUB_APP_PRIVATE_KEY", privateKey);
+    Reflect.set(
+      env,
+      "SECRETS_ENCRYPTION_KEY",
+      "workspace-secret-encryption-".padEnd(48, "e"),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith("/access_tokens")) {
+          return Response.json(installationToken("managed-secret-test-token"));
+        }
+        if (
+          url.pathname.endsWith("/actions/variables") ||
+          url.pathname.endsWith("/actions/organization-variables")
+        ) {
+          return Response.json({ total_count: 0, variables: [] });
+        }
+        if (url.pathname.endsWith("/check-runs")) {
+          return Response.json({ id: 412 }, { status: 201 });
+        }
+        throw new Error(`unexpected GitHub request: ${url.pathname}`);
+      }),
+    );
+
+    try {
+      const workspaceId = "7412";
+      const workspace = env.WORKSPACES.getByName(workspaceId);
+      const put = (input: ManagedSecretInput) =>
+        workspace.putManagedSecret(workspaceId, input);
+      await put({
+        scope: "organization",
+        owner: "octocat",
+        name: "ORG_ONLY",
+        value: "organization-secret-value",
+        visibility: "all",
+        selected_repositories: [],
+      });
+      await put({
+        scope: "organization",
+        owner: "octocat",
+        name: "SHARED",
+        value: "organization-shared-value",
+        visibility: "all",
+        selected_repositories: [],
+      });
+      await put({
+        scope: "organization",
+        owner: "octocat",
+        name: "PRIVATE_ONLY",
+        value: "private-repository-secret-value",
+        visibility: "private",
+        selected_repositories: [],
+      });
+      await put({
+        scope: "organization",
+        owner: "octocat",
+        name: "SELECTED_OTHER",
+        value: "must-not-be-granted",
+        visibility: "selected",
+        selected_repositories: ["octocat/another-repository"],
+      });
+      await put({
+        scope: "repository",
+        owner: "octocat",
+        repository: "Hello-World",
+        name: "SHARED",
+        value: "repository-shared-value",
+      });
+      await put({
+        scope: "repository",
+        owner: "octocat",
+        repository: "Hello-World",
+        name: "QUEUED",
+        value: "repository-queued-value",
+      });
+      await put({
+        scope: "environment",
+        owner: "octocat",
+        repository: "Hello-World",
+        environment: "Production",
+        name: "SHARED",
+        value: "environment-original-value",
+      });
+
+      const agent = await connectAgent(
+        workspace,
+        workspaceId,
+        "mini-secret",
+        1,
+      );
+      const assignment = collectMessageOfType(agent, "run_job");
+      const job = fixtureJob(workspaceId);
+      job.installation_id = Number(workspaceId);
+      job.requires_github_token = true;
+      job.report_to_github = true;
+      job.event = {
+        repository: {
+          full_name: "octocat/Hello-World",
+          private: true,
+          owner: { type: "Organization" },
+        },
+        pull_request: {
+          head: { repo: { full_name: "octocat/Hello-World" } },
+          user: { login: "trusted-author" },
+        },
+      };
+      await workspace.enqueue(job, "managed-secret-snapshot");
+      await put({
+        scope: "repository",
+        owner: "octocat",
+        repository: "Hello-World",
+        name: "QUEUED",
+        value: "repository-updated-after-queue",
+      });
+      await put({
+        scope: "environment",
+        owner: "octocat",
+        repository: "Hello-World",
+        environment: "Production",
+        name: "SHARED",
+        value: "environment-current-value",
+      });
+      await expect(assignment).resolves.toMatchObject({
+        type: "run_job",
+        job: { id: job.id, managed_secrets: true },
+      });
+
+      const stored = await runInDurableObject(workspace, (_instance, state) =>
+        state.storage.sql
+          .exec<{ ciphertext: string; nonce: string }>(
+            `SELECT ciphertext, nonce FROM managed_secrets
+               UNION ALL SELECT ciphertext, nonce FROM job_secrets`,
+          )
+          .toArray(),
+      );
+      const serializedStorage = JSON.stringify(stored);
+      for (const plaintext of [
+        "organization-secret-value",
+        "private-repository-secret-value",
+        "must-not-be-granted",
+        "repository-shared-value",
+        "repository-queued-value",
+        "repository-updated-after-queue",
+        "environment-current-value",
+      ]) {
+        expect(serializedStorage).not.toContain(plaintext);
+      }
+
+      const requestId = crypto.randomUUID();
+      const granted = collectMessageOfType(agent, "secret_granted");
+      agent.send(
+        JSON.stringify({
+          type: "secret_request",
+          message_id: crypto.randomUUID(),
+          job_id: job.id,
+          request_id: requestId,
+          unit_id: "deploy-production",
+          environment: "Production",
+        }),
+      );
+      await expect(granted).resolves.toEqual({
+        type: "secret_granted",
+        request_id: requestId,
+        secrets: {
+          ORG_ONLY: "organization-secret-value",
+          PRIVATE_ONLY: "private-repository-secret-value",
+          QUEUED: "repository-queued-value",
+          SHARED: "environment-current-value",
+        },
+      });
+      agent.close(1000, "test complete");
+    } finally {
+      Reflect.set(env, "GITHUB_APP_ID", originals.appId);
+      Reflect.set(env, "GITHUB_APP_PRIVATE_KEY", originals.privateKey);
+      Reflect.set(env, "SECRETS_ENCRYPTION_KEY", originals.encryptionKey);
+    }
+  });
 });
 
 async function connectAgent(
@@ -1966,7 +2197,7 @@ async function connectAgentWithTargeting(
     JSON.stringify({
       type: "hello",
       hello: {
-        protocol_version: 13,
+        protocol_version: 14,
         agent_id: agentId,
         name: agentId,
         version: "0.1.0",

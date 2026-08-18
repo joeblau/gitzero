@@ -39,6 +39,7 @@ describe("HTTP entrypoint", () => {
       webhookSecret: env.GITHUB_WEBHOOK_SECRET,
       agentSigningKey: env.AGENT_SHARED_TOKEN,
       adminToken: env.ADMIN_TOKEN,
+      encryptionKey: env.SECRETS_ENCRYPTION_KEY,
     };
     const adminToken = "admin-ready-".padEnd(48, "a");
     Reflect.set(env, "GITHUB_APP_ID", "1234");
@@ -46,6 +47,11 @@ describe("HTTP entrypoint", () => {
     Reflect.set(env, "GITHUB_WEBHOOK_SECRET", "webhook-ready-".padEnd(48, "w"));
     Reflect.set(env, "AGENT_SHARED_TOKEN", "agent-ready-".padEnd(48, "g"));
     Reflect.set(env, "ADMIN_TOKEN", adminToken);
+    Reflect.set(
+      env,
+      "SECRETS_ENCRYPTION_KEY",
+      "encryption-ready-".padEnd(48, "e"),
+    );
     try {
       const response = await exports.default.fetch(
         new Request("http://example.test/readyz", {
@@ -61,6 +67,7 @@ describe("HTTP entrypoint", () => {
           webhook_secret: true,
           agent_signing_key: true,
           admin_token: true,
+          secrets_encryption_key: true,
           secrets_are_distinct: true,
         },
       });
@@ -70,6 +77,7 @@ describe("HTTP entrypoint", () => {
       Reflect.set(env, "GITHUB_WEBHOOK_SECRET", originals.webhookSecret);
       Reflect.set(env, "AGENT_SHARED_TOKEN", originals.agentSigningKey);
       Reflect.set(env, "ADMIN_TOKEN", originals.adminToken);
+      Reflect.set(env, "SECRETS_ENCRYPTION_KEY", originals.encryptionKey);
     }
   });
 
@@ -78,6 +86,86 @@ describe("HTTP entrypoint", () => {
       new Request("http://example.test/private"),
     );
     expect(response.status).toBe(404);
+  });
+
+  it("manages encrypted secret metadata only through the administrator API", async () => {
+    const workspaceId = crypto.randomUUID();
+    const url = `http://example.test/v1/workspaces/${workspaceId}/secrets`;
+    const originalEncryptionKey = env.SECRETS_ENCRYPTION_KEY;
+    Reflect.set(
+      env,
+      "SECRETS_ENCRYPTION_KEY",
+      "http-secret-encryption-".padEnd(48, "e"),
+    );
+    const requestBody = {
+      scope: "repository",
+      owner: "Acme",
+      repository: "Widget",
+      name: "release_token",
+      value: "http-managed-secret-value",
+    };
+    try {
+      const unauthorized = await exports.default.fetch(
+        new Request(url, {
+          method: "PUT",
+          body: JSON.stringify(requestBody),
+        }),
+      );
+      expect(unauthorized.status).toBe(401);
+
+      const created = await exports.default.fetch(
+        new Request(url, {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${env.ADMIN_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(requestBody),
+        }),
+      );
+      expect(created.status).toBe(201);
+      const createdBody = await created.text();
+      expect(createdBody).not.toContain(requestBody.value);
+      expect(JSON.parse(createdBody)).toMatchObject({
+        created: true,
+        secret: {
+          scope: "repository",
+          owner: "acme",
+          repository: "widget",
+          name: "RELEASE_TOKEN",
+        },
+      });
+
+      const listed = await exports.default.fetch(
+        new Request(url, {
+          headers: { Authorization: `Bearer ${env.ADMIN_TOKEN}` },
+        }),
+      );
+      const listedBody = await listed.text();
+      expect(listedBody).not.toContain(requestBody.value);
+      expect(JSON.parse(listedBody)).toMatchObject({
+        secrets: [{ name: "RELEASE_TOKEN" }],
+      });
+
+      const deleted = await exports.default.fetch(
+        new Request(url, {
+          method: "DELETE",
+          headers: {
+            Authorization: `Bearer ${env.ADMIN_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            scope: "repository",
+            owner: "acme",
+            repository: "widget",
+            name: "release_token",
+          }),
+        }),
+      );
+      await expect(deleted.json()).resolves.toEqual({ deleted: true });
+    } finally {
+      Reflect.set(env, "SECRETS_ENCRYPTION_KEY", originalEncryptionKey);
+    }
   });
 
   it("accepts a signed nondefault activity for a draft PR without waiting for GitHub API work", async () => {
@@ -364,7 +452,7 @@ describe("HTTP entrypoint", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 13,
+          protocol_version: 14,
           agent_id: "readiness-mini",
           name: "readiness-mini",
           version: "0.1.0",

@@ -5,6 +5,11 @@ export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
+      miniflare: {
+        bindings: {
+          SECRETS_ENCRYPTION_KEY: "test-only-encryption-key".padEnd(48, "e"),
+        },
+      },
     }),
   ],
   test: {

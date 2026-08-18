@@ -15,6 +15,7 @@
       "GITHUB_APP_PRIVATE_KEY",
       "AGENT_SHARED_TOKEN",
       "ADMIN_TOKEN",
+      "SECRETS_ENCRYPTION_KEY",
     ],
   },
   "durable_objects": {

@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 13;
+export const PROTOCOL_VERSION = 14;
 
 export const repositoryTokenPurposeSchema = z.enum([
   "source",
@@ -188,6 +188,7 @@ export const runSpecSchema = queuedJobSchema
       .nullable()
       .default(null),
     github_api_version: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    managed_secrets: z.boolean().default(false),
     changed_paths: z.array(z.string().min(1).max(4_096)).max(3_000).optional(),
   })
   .superRefine((run, context) => {
@@ -372,6 +373,14 @@ export const agentMessageSchema = z.discriminatedUnion("type", [
   }),
   workflowTokenRequestSchema,
   z.object({
+    type: z.literal("secret_request"),
+    message_id: uuid,
+    job_id: uuid,
+    request_id: uuid,
+    unit_id: deploymentUnitId,
+    environment: deploymentEnvironment.nullable(),
+  }),
+  z.object({
     type: z.literal("deployment_started"),
     message_id: uuid,
     job_id: uuid,
@@ -448,6 +457,12 @@ export type ServerMessage =
       expires_at_epoch_seconds: number;
     }
   | { type: "workflow_token_denied"; request_id: string; reason: string }
+  | {
+      type: "secret_granted";
+      request_id: string;
+      secrets: Record<string, string>;
+    }
+  | { type: "secret_denied"; request_id: string; reason: string }
   | { type: "ack"; message_id: string }
   | { type: "error"; code: string; message: string };
 

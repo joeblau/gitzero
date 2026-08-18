@@ -16,10 +16,15 @@ import {
   buildRepositoryReadiness,
   findSuccessfulCheckCandidate,
 } from "./readiness";
+import {
+  managedSecretIdentitySchema,
+  managedSecretInputSchema,
+} from "./secrets";
 export { Workspace } from "./workspace";
 
 const MAX_WEBHOOK_BYTES = 5 * 1024 * 1024;
 const MAX_ONBOARDING_BODY_BYTES = 16 * 1024;
+const MAX_MANAGED_SECRET_BODY_BYTES = 64 * 1024;
 export const SUPPORTED_PULL_REQUEST_ACTIONS = [
   "assigned",
   "unassigned",
@@ -175,6 +180,16 @@ export default {
           decodeURIComponent(requiredMatch(readiness[1])),
         );
       }
+      const secrets = url.pathname.match(
+        /^\/v1\/workspaces\/([^/]+)\/secrets$/,
+      );
+      if (["GET", "PUT", "DELETE"].includes(request.method) && secrets) {
+        return handleManagedSecrets(
+          request,
+          env,
+          decodeURIComponent(requiredMatch(secrets[1])),
+        );
+      }
       const onboard = url.pathname.match(
         /^\/v1\/workspaces\/([^/]+)\/onboard$/,
       );
@@ -280,20 +295,38 @@ async function handleServiceReadiness(
   } catch {
     githubApp = false;
   }
-  const [webhookMatchesAgent, webhookMatchesAdmin, agentMatchesAdmin] =
-    await Promise.all([
-      timingSafeSecretEqual(env.GITHUB_WEBHOOK_SECRET, env.AGENT_SHARED_TOKEN),
-      timingSafeSecretEqual(env.GITHUB_WEBHOOK_SECRET, env.ADMIN_TOKEN),
-      timingSafeSecretEqual(env.AGENT_SHARED_TOKEN, env.ADMIN_TOKEN),
-    ]);
+  const [
+    webhookMatchesAgent,
+    webhookMatchesAdmin,
+    webhookMatchesEncryption,
+    agentMatchesAdmin,
+    agentMatchesEncryption,
+    adminMatchesEncryption,
+  ] = await Promise.all([
+    timingSafeSecretEqual(env.GITHUB_WEBHOOK_SECRET, env.AGENT_SHARED_TOKEN),
+    timingSafeSecretEqual(env.GITHUB_WEBHOOK_SECRET, env.ADMIN_TOKEN),
+    timingSafeSecretEqual(
+      env.GITHUB_WEBHOOK_SECRET,
+      env.SECRETS_ENCRYPTION_KEY,
+    ),
+    timingSafeSecretEqual(env.AGENT_SHARED_TOKEN, env.ADMIN_TOKEN),
+    timingSafeSecretEqual(env.AGENT_SHARED_TOKEN, env.SECRETS_ENCRYPTION_KEY),
+    timingSafeSecretEqual(env.ADMIN_TOKEN, env.SECRETS_ENCRYPTION_KEY),
+  ]);
   const checks = {
     github_app_credentials: githubApp,
     github_api_version: /^\d{4}-\d{2}-\d{2}$/.test(env.GITHUB_API_VERSION),
     webhook_secret: hasMinimumSecretEntropy(env.GITHUB_WEBHOOK_SECRET),
     agent_signing_key: hasMinimumSecretEntropy(env.AGENT_SHARED_TOKEN),
     admin_token: hasMinimumSecretEntropy(env.ADMIN_TOKEN),
+    secrets_encryption_key: hasMinimumSecretEntropy(env.SECRETS_ENCRYPTION_KEY),
     secrets_are_distinct:
-      !webhookMatchesAgent && !webhookMatchesAdmin && !agentMatchesAdmin,
+      !webhookMatchesAgent &&
+      !webhookMatchesAdmin &&
+      !webhookMatchesEncryption &&
+      !agentMatchesAdmin &&
+      !agentMatchesEncryption &&
+      !adminMatchesEncryption,
   };
   const ready = Object.values(checks).every(Boolean);
   return Response.json(
@@ -426,6 +459,72 @@ async function handleWorkspaceStatus(
   }
   const snapshot = await env.WORKSPACES.getByName(workspaceId).getSnapshot();
   return Response.json(snapshot);
+}
+
+async function handleManagedSecrets(
+  request: Request,
+  env: Cloudflare.Env,
+  workspaceId: string,
+): Promise<Response> {
+  if (!(await verifyBearer(request, env.ADMIN_TOKEN))) {
+    return Response.json({ error: "unauthorized" }, { status: 401 });
+  }
+  const workspace = env.WORKSPACES.getByName(workspaceId);
+  if (request.method === "GET") {
+    return Response.json({
+      secrets: await workspace.listManagedSecrets(workspaceId),
+    });
+  }
+  let body: unknown;
+  try {
+    const bytes = await readBoundedBody(request, MAX_MANAGED_SECRET_BODY_BYTES);
+    body = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return Response.json(
+      {
+        error: "invalid_secret_request",
+        message: "a bounded JSON managed-secret request is required.",
+      },
+      { status: 400 },
+    );
+  }
+  if (request.method === "PUT") {
+    const parsed = managedSecretInputSchema.safeParse(body);
+    if (!parsed.success) {
+      return Response.json(
+        {
+          error: "invalid_secret_request",
+          message:
+            "managed-secret scope, identity, name, and value are invalid.",
+        },
+        { status: 400 },
+      );
+    }
+    try {
+      const result = await workspace.putManagedSecret(workspaceId, parsed.data);
+      return Response.json(result, { status: result.created ? 201 : 200 });
+    } catch {
+      return Response.json(
+        {
+          error: "secret_update_rejected",
+          message: "the managed secret could not be stored in this scope.",
+        },
+        { status: 409 },
+      );
+    }
+  }
+  const parsed = managedSecretIdentitySchema.safeParse(body);
+  if (!parsed.success) {
+    return Response.json(
+      {
+        error: "invalid_secret_request",
+        message: "managed-secret scope, identity, and name are invalid.",
+      },
+      { status: 400 },
+    );
+  }
+  const result = await workspace.deleteManagedSecret(workspaceId, parsed.data);
+  return Response.json(result, { status: result.deleted ? 200 : 404 });
 }
 
 async function handleRepositoryReadiness(

@@ -12,6 +12,7 @@ export const REQUIRED_SECRETS = [
   "GITHUB_APP_PRIVATE_KEY",
   "AGENT_SHARED_TOKEN",
   "ADMIN_TOKEN",
+  "SECRETS_ENCRYPTION_KEY",
 ];
 
 const SCRIPT_DIRECTORY = dirname(fileURLToPath(import.meta.url));
@@ -158,6 +159,7 @@ export function parseAndValidateSecrets(source) {
     "GITHUB_WEBHOOK_SECRET",
     "AGENT_SHARED_TOKEN",
     "ADMIN_TOKEN",
+    "SECRETS_ENCRYPTION_KEY",
   ]) {
     if (Buffer.byteLength(parsed[name], "utf8") < 32) {
       throw new Error(`secret ${name} must contain at least 32 UTF-8 bytes`);
@@ -167,10 +169,11 @@ export function parseAndValidateSecrets(source) {
     parsed.GITHUB_WEBHOOK_SECRET,
     parsed.AGENT_SHARED_TOKEN,
     parsed.ADMIN_TOKEN,
+    parsed.SECRETS_ENCRYPTION_KEY,
   ]);
-  if (distinct.size !== 3) {
+  if (distinct.size !== 4) {
     throw new Error(
-      "webhook, agent-signing, and administrator secrets must be distinct",
+      "webhook, agent-signing, administrator, and encryption secrets must be distinct",
     );
   }
   let privateKey;

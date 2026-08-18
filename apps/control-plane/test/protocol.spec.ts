@@ -14,8 +14,8 @@ const baseRequest = {
 };
 
 describe("agent protocol", () => {
-  it("requires protocol v13 run assignments to carry an exact execution snapshot and credential expiry", () => {
-    expect(PROTOCOL_VERSION).toBe(13);
+  it("requires protocol v14 run assignments to carry an exact execution snapshot and credential expiry", () => {
+    expect(PROTOCOL_VERSION).toBe(14);
     const queued = queuedJobSchema.parse({
       id: "11111111-1111-4111-8111-111111111111",
       workspace_id: "7001",

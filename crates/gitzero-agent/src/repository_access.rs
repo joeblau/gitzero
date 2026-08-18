@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
-use gitzero_protocol::{AgentMessage, RepositoryTokenPurpose};
+use gitzero_protocol::{AgentMessage, RepositoryTokenPurpose, SecretMap};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -45,6 +45,7 @@ impl std::fmt::Debug for ExpiringToken {
 struct RemoteRepositoryAccessClient {
     outbound: mpsc::Sender<AgentMessage>,
     requests: Mutex<HashMap<Uuid, oneshot::Sender<std::result::Result<ExpiringToken, String>>>>,
+    secret_requests: Mutex<HashMap<Uuid, oneshot::Sender<std::result::Result<SecretMap, String>>>>,
 }
 
 impl RepositoryAccessClient {
@@ -58,7 +59,66 @@ impl RepositoryAccessClient {
             remote: Some(Arc::new(RemoteRepositoryAccessClient {
                 outbound,
                 requests: Mutex::new(HashMap::new()),
+                secret_requests: Mutex::new(HashMap::new()),
             })),
+        }
+    }
+
+    pub(crate) async fn request_managed_secrets(
+        &self,
+        run_id: Uuid,
+        unit_id: &str,
+        environment: Option<&str>,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<BTreeMap<String, String>> {
+        let Some(remote) = &self.remote else {
+            bail!("managed secret access requires the connected control plane");
+        };
+        let request_id = Uuid::new_v4();
+        let (decision_tx, mut decision_rx) = oneshot::channel();
+        remote
+            .secret_requests
+            .lock()
+            .await
+            .insert(request_id, decision_tx);
+        if remote
+            .outbound
+            .send(AgentMessage::SecretRequest {
+                message_id: Uuid::new_v4(),
+                job_id: run_id,
+                request_id,
+                unit_id: unit_id.to_owned(),
+                environment: environment.map(str::to_owned),
+            })
+            .await
+            .is_err()
+        {
+            remote.secret_requests.lock().await.remove(&request_id);
+            bail!("control plane event channel closed while requesting managed secrets");
+        }
+
+        let mut cancellation = cancel.clone();
+        let response = loop {
+            if *cancellation.borrow() {
+                remote.secret_requests.lock().await.remove(&request_id);
+                bail!("run cancelled while requesting managed secrets");
+            }
+            tokio::select! {
+                response = &mut decision_rx => break response,
+                changed = cancellation.changed() => {
+                    if changed.is_err() {
+                        break decision_rx.await;
+                    }
+                }
+            }
+        };
+        match response {
+            Ok(Ok(secrets)) => Ok(secrets.into_inner()),
+            Ok(Err(reason)) => bail!("{reason}"),
+            Err(_) => {
+                remote.secret_requests.lock().await.remove(&request_id);
+                bail!("managed secret request ended without a control plane decision")
+            }
         }
     }
 
@@ -192,6 +252,24 @@ impl RepositoryAccessClient {
         }
     }
 
+    pub(crate) async fn handle_secrets_granted(&self, request_id: Uuid, secrets: SecretMap) {
+        let Some(remote) = &self.remote else {
+            return;
+        };
+        if let Some(request) = remote.secret_requests.lock().await.remove(&request_id) {
+            let _ = request.send(Ok(secrets));
+        }
+    }
+
+    pub(crate) async fn handle_secrets_denied(&self, request_id: Uuid, reason: String) {
+        let Some(remote) = &self.remote else {
+            return;
+        };
+        if let Some(request) = remote.secret_requests.lock().await.remove(&request_id) {
+            let _ = request.send(Err(reason));
+        }
+    }
+
     pub(crate) async fn cancel_all(&self) {
         let Some(remote) = &self.remote else {
             return;
@@ -204,6 +282,16 @@ impl RepositoryAccessClient {
             .map(|(_, request)| request)
             .collect::<Vec<_>>();
         for request in requests {
+            let _ = request.send(Err("Control plane connection closed.".to_owned()));
+        }
+        let secret_requests = remote
+            .secret_requests
+            .lock()
+            .await
+            .drain()
+            .map(|(_, request)| request)
+            .collect::<Vec<_>>();
+        for request in secret_requests {
             let _ = request.send(Err("Control plane connection closed.".to_owned()));
         }
     }
@@ -396,6 +484,55 @@ mod tests {
                 token: "read-scoped-workflow-token".to_owned(),
                 expires_at_epoch_seconds: 4_102_444_800,
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_managed_secret_requests_are_redacted_and_environment_scoped() {
+        let (outbound, mut events) = mpsc::channel(4);
+        let client = RepositoryAccessClient::remote(outbound);
+        let run_id = Uuid::new_v4();
+        let (_, cancel) = watch::channel(false);
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .request_managed_secrets(
+                        run_id,
+                        "deploy / production",
+                        Some("Production"),
+                        &cancel,
+                    )
+                    .await
+            })
+        };
+        let request_id = match events.recv().await.expect("managed secret request") {
+            AgentMessage::SecretRequest {
+                job_id,
+                request_id,
+                unit_id,
+                environment,
+                ..
+            } => {
+                assert_eq!(job_id, run_id);
+                assert_eq!(unit_id, "deploy / production");
+                assert_eq!(environment.as_deref(), Some("Production"));
+                request_id
+            }
+            message => panic!("unexpected event: {message:?}"),
+        };
+        let secrets = SecretMap::from(BTreeMap::from([(
+            "API_TOKEN".to_owned(),
+            "managed-secret-value".to_owned(),
+        )]));
+        assert!(!format!("{secrets:?}").contains("managed-secret-value"));
+        client.handle_secrets_granted(request_id, secrets).await;
+        assert_eq!(
+            request
+                .await
+                .expect("join request")
+                .expect("managed secrets"),
+            BTreeMap::from([("API_TOKEN".to_owned(), "managed-secret-value".to_owned())])
         );
     }
 }

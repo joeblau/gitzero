@@ -31,6 +31,23 @@ import {
   type ServerMessage,
   type SocketAttachment,
 } from "./protocol";
+import {
+  MAX_ENVIRONMENT_SECRETS,
+  MAX_JOB_ORGANIZATION_SECRETS,
+  MAX_ORGANIZATION_SECRETS,
+  MAX_REPOSITORY_SECRETS,
+  decryptManagedSecret,
+  deriveManagedSecretKey,
+  encryptManagedSecret,
+  managedSecretIdentitySchema,
+  managedSecretInputSchema,
+  normalizedSecretIdentity,
+  type ManagedSecretIdentity,
+  type ManagedSecretInput,
+  type ManagedSecretMetadata,
+  type ManagedSecretScope,
+  type SecretBinding,
+} from "./secrets";
 
 const LEASE_MILLISECONDS = 60_000;
 const CHECK_RETRY_MILLISECONDS = 30_000;
@@ -128,6 +145,20 @@ interface DeploymentKeyRow extends Record<string, SqlStorageValue> {
   unit_id: string;
 }
 
+interface ManagedSecretRow extends Record<string, SqlStorageValue> {
+  scope: ManagedSecretScope;
+  owner_key: string;
+  repository_key: string;
+  environment_key: string;
+  name: string;
+  visibility: "all" | "private" | "selected";
+  selected_repositories_json: string;
+  ciphertext: string;
+  nonce: string;
+  created_at: number;
+  updated_at: number;
+}
+
 interface AgentCandidate {
   socket: WebSocket;
   hello: AgentHello;
@@ -141,6 +172,116 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => this.migrate());
+  }
+
+  async listManagedSecrets(
+    workspaceId: string,
+  ): Promise<ManagedSecretMetadata[]> {
+    this.ensureWorkspaceId(workspaceId);
+    return this.ctx.storage.sql
+      .exec<ManagedSecretRow>(
+        `SELECT * FROM managed_secrets
+         ORDER BY scope, owner_key, repository_key, environment_key, name`,
+      )
+      .toArray()
+      .map(secretMetadata);
+  }
+
+  async putManagedSecret(
+    workspaceId: string,
+    untrustedInput: ManagedSecretInput,
+  ): Promise<{ created: boolean; secret: ManagedSecretMetadata }> {
+    this.ensureWorkspaceId(workspaceId);
+    const input = managedSecretInputSchema.parse(untrustedInput);
+    const identity = normalizedSecretIdentity(input);
+    const selectedRepositories =
+      input.scope === "organization" && input.visibility === "selected"
+        ? input.selected_repositories
+        : [];
+    if (
+      input.scope === "organization" &&
+      input.visibility === "selected" &&
+      selectedRepositories.length === 0
+    ) {
+      throw new Error(
+        "selected organization secrets require at least one repository",
+      );
+    }
+    const visibility =
+      input.scope === "organization" ? input.visibility : "all";
+    const key = await deriveManagedSecretKey(this.env.SECRETS_ENCRYPTION_KEY);
+    const encrypted = await encryptManagedSecret(
+      key,
+      { workspaceId, ...identity },
+      input.value,
+    );
+    const now = Date.now();
+    let created = false;
+    this.ctx.storage.transactionSync(() => {
+      const existing = this.ctx.storage.sql
+        .exec<CountRow>(
+          `SELECT COUNT(*) AS count FROM managed_secrets
+           WHERE scope = ? AND owner_key = ? AND repository_key = ?
+             AND environment_key = ? AND name = ?`,
+          identity.scope,
+          identity.owner,
+          identity.repository,
+          identity.environment,
+          identity.name,
+        )
+        .one().count;
+      created = existing === 0;
+      if (created) this.ensureManagedSecretCapacity(identity);
+      this.ctx.storage.sql.exec(
+        `INSERT INTO managed_secrets (
+          scope, owner_key, repository_key, environment_key, name,
+          visibility, selected_repositories_json, ciphertext, nonce,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (scope, owner_key, repository_key, environment_key, name)
+        DO UPDATE SET visibility = excluded.visibility,
+          selected_repositories_json = excluded.selected_repositories_json,
+          ciphertext = excluded.ciphertext, nonce = excluded.nonce,
+          updated_at = excluded.updated_at`,
+        identity.scope,
+        identity.owner,
+        identity.repository,
+        identity.environment,
+        identity.name,
+        visibility,
+        JSON.stringify(selectedRepositories),
+        encrypted.ciphertext,
+        encrypted.nonce,
+        now,
+        now,
+      );
+    });
+    const row = this.managedSecretRow(identity);
+    return { created, secret: secretMetadata(row) };
+  }
+
+  async deleteManagedSecret(
+    workspaceId: string,
+    untrustedIdentity: ManagedSecretIdentity,
+  ): Promise<{ deleted: boolean }> {
+    this.ensureWorkspaceId(workspaceId);
+    const identity = normalizedSecretIdentity(
+      managedSecretIdentitySchema.parse(untrustedIdentity),
+    );
+    const deleted = this.ctx.storage.sql
+      .exec<{ name: string }>(
+        `DELETE FROM managed_secrets
+         WHERE scope = ? AND owner_key = ? AND repository_key = ?
+           AND environment_key = ? AND name = ?
+         RETURNING name`,
+        identity.scope,
+        identity.owner,
+        identity.repository,
+        identity.environment,
+        identity.name,
+      )
+      .toArray().length;
+    return { deleted: deleted === 1 };
   }
 
   async enqueue(
@@ -193,6 +334,7 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
       needsInitialization ? 1 : 0,
       needsInitialization ? now : null,
     );
+    this.snapshotManagedSecrets(job);
     this.persistEvent(job.id, job.event);
 
     this.broadcast("job_queued", { job: publicJob(persistedJob) });
@@ -550,6 +692,36 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
       CREATE INDEX IF NOT EXISTS deployments_sync
         ON deployments(sync_retry_at)
         WHERE sync_needed != 0;
+      CREATE TABLE IF NOT EXISTS managed_secrets (
+        scope TEXT NOT NULL
+          CHECK (scope IN ('organization', 'repository', 'environment')),
+        owner_key TEXT NOT NULL,
+        repository_key TEXT NOT NULL,
+        environment_key TEXT NOT NULL,
+        name TEXT NOT NULL,
+        visibility TEXT NOT NULL
+          CHECK (visibility IN ('all', 'private', 'selected')),
+        selected_repositories_json TEXT NOT NULL DEFAULT '[]',
+        ciphertext TEXT NOT NULL,
+        nonce TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (scope, owner_key, repository_key, environment_key, name)
+      );
+      CREATE INDEX IF NOT EXISTS managed_secrets_scope
+        ON managed_secrets(scope, owner_key, repository_key, environment_key, name);
+      CREATE TABLE IF NOT EXISTS job_secrets (
+        job_id TEXT NOT NULL,
+        scope TEXT NOT NULL CHECK (scope IN ('organization', 'repository')),
+        owner_key TEXT NOT NULL,
+        repository_key TEXT NOT NULL,
+        environment_key TEXT NOT NULL,
+        name TEXT NOT NULL,
+        ciphertext TEXT NOT NULL,
+        nonce TEXT NOT NULL,
+        PRIMARY KEY (job_id, scope, name)
+      );
+      CREATE INDEX IF NOT EXISTS job_secrets_job ON job_secrets(job_id, scope, name);
       CREATE TABLE IF NOT EXISTS _sql_schema_migrations (
         id INTEGER PRIMARY KEY,
         applied_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -616,6 +788,7 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
         ON job_annotations(job_id, annotation_index);
       INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (7);
       INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (8);
+      INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (9);
     `);
   }
 
@@ -791,6 +964,153 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
     if (stored !== workspaceId) {
       throw new Error("workspace ID does not match Durable Object identity");
     }
+  }
+
+  private ensureManagedSecretCapacity(identity: {
+    scope: ManagedSecretScope;
+    owner: string;
+    repository: string;
+    environment: string;
+  }): void {
+    const count = this.ctx.storage.sql
+      .exec<CountRow>(
+        `SELECT COUNT(*) AS count FROM managed_secrets
+         WHERE scope = ? AND owner_key = ? AND repository_key = ?
+           AND environment_key = ?`,
+        identity.scope,
+        identity.owner,
+        identity.repository,
+        identity.environment,
+      )
+      .one().count;
+    const limit =
+      identity.scope === "organization"
+        ? MAX_ORGANIZATION_SECRETS
+        : identity.scope === "repository"
+          ? MAX_REPOSITORY_SECRETS
+          : MAX_ENVIRONMENT_SECRETS;
+    if (count >= limit) {
+      throw new Error(
+        `${identity.scope} secret scope already contains its ${limit}-secret limit`,
+      );
+    }
+  }
+
+  private managedSecretRow(identity: {
+    scope: ManagedSecretScope;
+    owner: string;
+    repository: string;
+    environment: string;
+    name: string;
+  }): ManagedSecretRow {
+    return this.ctx.storage.sql
+      .exec<ManagedSecretRow>(
+        `SELECT * FROM managed_secrets
+         WHERE scope = ? AND owner_key = ? AND repository_key = ?
+           AND environment_key = ? AND name = ?`,
+        identity.scope,
+        identity.owner,
+        identity.repository,
+        identity.environment,
+        identity.name,
+      )
+      .one();
+  }
+
+  private snapshotManagedSecrets(job: QueuedJob): void {
+    if (!managedSecretsAllowed(job, job.event)) return;
+    const owner = job.repository.owner.toLowerCase();
+    const repository = job.repository.name.toLowerCase();
+    const repositoryKey = `${owner}/${repository}`;
+    const privateRepository = eventBoolean(job.event, [
+      "repository",
+      "private",
+    ]);
+    const organization = this.ctx.storage.sql
+      .exec<ManagedSecretRow>(
+        `SELECT * FROM managed_secrets
+         WHERE scope = 'organization' AND owner_key = ? ORDER BY name`,
+        owner,
+      )
+      .toArray()
+      .filter((row) => {
+        if (row.visibility === "all") return true;
+        if (row.visibility === "private") return privateRepository;
+        return selectedRepositories(row).includes(repositoryKey);
+      })
+      .slice(0, MAX_JOB_ORGANIZATION_SECRETS);
+    const repositorySecrets = this.ctx.storage.sql
+      .exec<ManagedSecretRow>(
+        `SELECT * FROM managed_secrets
+         WHERE scope = 'repository' AND owner_key = ? AND repository_key = ?
+         ORDER BY name`,
+        owner,
+        repository,
+      )
+      .toArray();
+    this.ctx.storage.transactionSync(() => {
+      for (const row of [...organization, ...repositorySecrets]) {
+        this.ctx.storage.sql.exec(
+          `INSERT OR REPLACE INTO job_secrets (
+            job_id, scope, owner_key, repository_key, environment_key,
+            name, ciphertext, nonce
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          job.id,
+          row.scope,
+          row.owner_key,
+          row.repository_key,
+          row.environment_key,
+          row.name,
+          row.ciphertext,
+          row.nonce,
+        );
+      }
+    });
+  }
+
+  private async managedSecretsForJob(
+    job: QueuedJob,
+    environment: string | null,
+  ): Promise<Record<string, string>> {
+    const rows = this.ctx.storage.sql
+      .exec<ManagedSecretRow>(
+        `SELECT scope, owner_key, repository_key, environment_key, name,
+           ciphertext, nonce, 'all' AS visibility,
+           '[]' AS selected_repositories_json, 0 AS created_at, 0 AS updated_at
+         FROM job_secrets WHERE job_id = ?
+         ORDER BY CASE scope WHEN 'organization' THEN 0 ELSE 1 END, name`,
+        job.id,
+      )
+      .toArray();
+    if (environment !== null) {
+      rows.push(
+        ...this.ctx.storage.sql
+          .exec<ManagedSecretRow>(
+            `SELECT * FROM managed_secrets
+             WHERE scope = 'environment' AND owner_key = ?
+               AND repository_key = ? AND environment_key = ? ORDER BY name`,
+            job.repository.owner.toLowerCase(),
+            job.repository.name.toLowerCase(),
+            environment.toLowerCase(),
+          )
+          .toArray(),
+      );
+    }
+    if (rows.length === 0) return {};
+    const key = await deriveManagedSecretKey(this.env.SECRETS_ENCRYPTION_KEY);
+    const secrets: Record<string, string> = {};
+    for (const row of rows) {
+      const binding: SecretBinding = {
+        workspaceId: job.workspace_id,
+        scope: row.scope,
+        owner: row.owner_key,
+        repository: row.repository_key,
+        environment: row.environment_key,
+        name: row.name,
+      };
+      secrets[row.name] = await decryptManagedSecret(key, binding, row);
+    }
+    return secrets;
   }
 
   private completeInitializingJob(
@@ -1523,6 +1843,65 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
         }
         return;
       }
+      case "secret_request": {
+        const row = this.assignedJob(message.job_id, agentId);
+        if (row.status === "completed") {
+          sendServer(socket, {
+            type: "secret_denied",
+            request_id: message.request_id,
+            reason: "The parent GitZero run is no longer active.",
+          });
+          return;
+        }
+        const job = parseJob(row.job_json);
+        if (!managedSecretsAllowed(job, this.eventPayload(job.id))) {
+          sendServer(socket, {
+            type: "secret_denied",
+            request_id: message.request_id,
+            reason:
+              "Managed secrets are unavailable to manual, fork, Dependabot, or unverified pull request runs.",
+          });
+          return;
+        }
+        try {
+          const secrets = await this.managedSecretsForJob(
+            job,
+            message.environment,
+          );
+          const stillOwned = this.ctx.storage.sql
+            .exec<{ id: string }>(
+              `SELECT id FROM jobs
+               WHERE id = ? AND agent_id = ? AND status IN ('assigned', 'running')`,
+              job.id,
+              agentId,
+            )
+            .toArray().length;
+          if (stillOwned === 0 || socket.readyState !== WebSocket.OPEN) return;
+          sendServer(socket, {
+            type: "secret_granted",
+            request_id: message.request_id,
+            secrets,
+          });
+        } catch (error) {
+          console.error(
+            JSON.stringify({
+              message: "managed secret request denied",
+              jobId: job.id,
+              agentId,
+              environmentRequested: message.environment !== null,
+              error: truncateDiagnostic(error),
+            }),
+          );
+          if (socket.readyState === WebSocket.OPEN) {
+            sendServer(socket, {
+              type: "secret_denied",
+              request_id: message.request_id,
+              reason: "Managed secrets could not be decrypted for this job.",
+            });
+          }
+        }
+        return;
+      }
       case "deployment_started": {
         const row = this.assignedJob(message.job_id, agentId);
         if (row.status === "completed") {
@@ -1839,6 +2218,7 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
           checkout_token_expires_at_epoch_seconds:
             checkoutTokenExpiresAtEpochSeconds,
           github_api_version: this.env.GITHUB_API_VERSION,
+          managed_secrets: managedSecretsAllowed(job, event),
           environment: job.environment,
           variables: job.variables,
         });
@@ -2357,6 +2737,12 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
       cutoff,
     );
     this.ctx.storage.sql.exec(
+      `DELETE FROM job_secrets WHERE job_id IN (
+         SELECT id FROM jobs WHERE status = 'completed' AND completed_at < ?
+       )`,
+      cutoff,
+    );
+    this.ctx.storage.sql.exec(
       "DELETE FROM jobs WHERE status = 'completed' AND completed_at < ?",
       cutoff,
     );
@@ -2442,6 +2828,18 @@ function workflowWritePermissionsAllowed(
   job: QueuedJob,
   event: unknown,
 ): boolean {
+  return trustedPullRequest(job, event);
+}
+
+function managedSecretsAllowed(job: QueuedJob, event: unknown): boolean {
+  return (
+    job.requires_github_token &&
+    job.report_to_github &&
+    trustedPullRequest(job, event)
+  );
+}
+
+function trustedPullRequest(job: QueuedJob, event: unknown): boolean {
   const repository =
     `${job.repository.owner}/${job.repository.name}`.toLowerCase();
   const eventRepository = eventString(event, ["repository", "full_name"]);
@@ -2462,6 +2860,45 @@ function workflowWritePermissionsAllowed(
     pullRequestAuthor.length > 0 &&
     pullRequestAuthor.toLowerCase() !== "dependabot[bot]"
   );
+}
+
+function eventBoolean(event: unknown, path: readonly string[]): boolean {
+  let value = event;
+  for (const component of path) {
+    if (!value || typeof value !== "object") return false;
+    value = Reflect.get(value, component);
+  }
+  return value === true;
+}
+
+function selectedRepositories(row: ManagedSecretRow): string[] {
+  try {
+    const parsed: unknown = JSON.parse(row.selected_repositories_json);
+    return Array.isArray(parsed) &&
+      parsed.every((entry) => typeof entry === "string")
+      ? parsed
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function secretMetadata(row: ManagedSecretRow): ManagedSecretMetadata {
+  return {
+    scope: row.scope,
+    owner: row.owner_key,
+    ...(row.repository_key ? { repository: row.repository_key } : {}),
+    ...(row.environment_key ? { environment: row.environment_key } : {}),
+    name: row.name,
+    ...(row.scope === "organization"
+      ? {
+          visibility: row.visibility,
+          selected_repositories: selectedRepositories(row),
+        }
+      : {}),
+    created_at: new Date(row.created_at).toISOString(),
+    updated_at: new Date(row.updated_at).toISOString(),
+  };
 }
 
 function eventString(event: unknown, path: readonly string[]): string {

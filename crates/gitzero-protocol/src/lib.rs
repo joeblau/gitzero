@@ -3,7 +3,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 pub const MAX_RUNNER_LABELS: usize = 32;
 pub const MAX_RUNNER_REQUIREMENTS: usize = 512;
 pub const MAX_RUNNER_SELECTOR_BYTES: usize = 256;
@@ -60,6 +60,32 @@ impl RepositoryToken {
     }
 }
 
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretMap(BTreeMap<String, String>);
+
+impl SecretMap {
+    pub fn into_inner(self) -> BTreeMap<String, String> {
+        self.0
+    }
+}
+
+impl From<BTreeMap<String, String>> for SecretMap {
+    fn from(value: BTreeMap<String, String>) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Debug for SecretMap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretMap")
+            .field("count", &self.0.len())
+            .field("values", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl From<String> for RepositoryToken {
     fn from(value: String) -> Self {
         Self(value)
@@ -98,6 +124,8 @@ pub struct RunSpec {
     #[serde(default = "default_github_api_version")]
     pub github_api_version: String,
     #[serde(default)]
+    pub managed_secrets: bool,
+    #[serde(default)]
     pub changed_paths: Option<Vec<String>>,
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
@@ -126,6 +154,7 @@ impl std::fmt::Debug for RunSpec {
                 &self.checkout_token_expires_at_epoch_seconds,
             )
             .field("github_api_version", &self.github_api_version)
+            .field("managed_secrets", &self.managed_secrets)
             .field(
                 "changed_path_count",
                 &self.changed_paths.as_ref().map(Vec::len),
@@ -172,6 +201,14 @@ pub enum ServerMessage {
         expires_at_epoch_seconds: u64,
     },
     WorkflowTokenDenied {
+        request_id: Uuid,
+        reason: String,
+    },
+    SecretGranted {
+        request_id: Uuid,
+        secrets: SecretMap,
+    },
+    SecretDenied {
         request_id: Uuid,
         reason: String,
     },
@@ -232,6 +269,13 @@ pub enum AgentMessage {
         request_id: Uuid,
         read_permissions: Vec<String>,
         write_permissions: Vec<String>,
+    },
+    SecretRequest {
+        message_id: Uuid,
+        job_id: Uuid,
+        request_id: Uuid,
+        unit_id: String,
+        environment: Option<String>,
     },
     DeploymentStarted {
         message_id: Uuid,
@@ -457,6 +501,33 @@ mod tests {
             workflow_granted
         );
 
+        let secret_request = AgentMessage::SecretRequest {
+            message_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            request_id,
+            unit_id: "deploy / production".to_owned(),
+            environment: Some("Production".to_owned()),
+        };
+        let json = serde_json::to_string(&secret_request).expect("serialize secret request");
+        assert!(json.contains(r#""type":"secret_request""#));
+        assert_eq!(
+            serde_json::from_str::<AgentMessage>(&json).expect("deserialize secret request"),
+            secret_request
+        );
+
+        let secret_granted = ServerMessage::SecretGranted {
+            request_id,
+            secrets: BTreeMap::from([("API_TOKEN".to_owned(), "managed-secret-value".to_owned())])
+                .into(),
+        };
+        let json = serde_json::to_string(&secret_granted).expect("serialize secret grant");
+        assert!(json.contains("managed-secret-value"));
+        assert!(!format!("{secret_granted:?}").contains("managed-secret-value"));
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&json).expect("deserialize secret grant"),
+            secret_granted
+        );
+
         let deployment_started = AgentMessage::DeploymentStarted {
             message_id: Uuid::new_v4(),
             job_id: Uuid::new_v4(),
@@ -515,9 +586,11 @@ mod tests {
         let object = value.as_object_mut().expect("run object");
         object.remove("variables");
         object.remove("checkout_token_expires_at_epoch_seconds");
+        object.remove("managed_secrets");
         let decoded: RunSpec = serde_json::from_value(value).expect("deserialize");
         assert!(decoded.variables.is_empty());
         assert!(decoded.checkout_token_expires_at_epoch_seconds.is_none());
+        assert!(!decoded.managed_secrets);
     }
 
     fn fixture_run() -> RunSpec {
@@ -549,6 +622,7 @@ mod tests {
             checkout_token: "secret-token".into(),
             checkout_token_expires_at_epoch_seconds: Some(4_102_444_800),
             github_api_version: default_github_api_version(),
+            managed_secrets: false,
             changed_paths: None,
             environment: BTreeMap::new(),
             variables: BTreeMap::from([("RUNTIME".into(), "configured-variable-value".into())]),

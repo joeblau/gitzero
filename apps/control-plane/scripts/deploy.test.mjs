@@ -27,6 +27,7 @@ function validSecrets() {
     GITHUB_APP_PRIVATE_KEY: privateKeyPem,
     AGENT_SHARED_TOKEN: "agent-".padEnd(48, "a"),
     ADMIN_TOKEN: "admin-".padEnd(48, "d"),
+    SECRETS_ENCRYPTION_KEY: "encryption-".padEnd(48, "e"),
   };
 }
 
@@ -184,6 +185,7 @@ test("verifies public health and authenticated readiness without exposing the to
         webhook_secret: true,
         agent_signing_key: true,
         admin_token: true,
+        secrets_encryption_key: true,
         secrets_are_distinct: true,
       },
     });

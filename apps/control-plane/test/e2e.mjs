@@ -48,9 +48,11 @@ try {
     const adminToken = randomSecret();
     const agentSigningKey = randomSecret();
     const webhookSecret = randomSecret();
+    const encryptionKey = randomSecret();
     secrets.add(adminToken);
     secrets.add(agentSigningKey);
     secrets.add(webhookSecret);
+    secrets.add(encryptionKey);
     const envFile = path.join(fixtureRoot, "acceptance.vars");
     await writeFile(
       envFile,
@@ -58,6 +60,7 @@ try {
         `ADMIN_TOKEN=${adminToken}`,
         `AGENT_SHARED_TOKEN=${agentSigningKey}`,
         `GITHUB_WEBHOOK_SECRET=${webhookSecret}`,
+        `SECRETS_ENCRYPTION_KEY=${encryptionKey}`,
         "GITHUB_APP_PRIVATE_KEY=unused-by-local-acceptance",
         "",
       ].join("\n"),

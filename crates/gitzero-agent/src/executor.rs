@@ -77,6 +77,8 @@ const MAX_SPARSE_CHECKOUT_BYTES: usize = 128 * 1_024;
 const MAX_GITHUB_API_RESPONSE_BYTES: usize = 10 * 1_024 * 1_024;
 const MAX_REPOSITORY_TOKENS_PER_RUN: usize = 256;
 const MAX_WORKFLOW_TOKEN_SCOPES_PER_RUN: usize = 256;
+const MAX_MANAGED_SECRETS_PER_JOB: usize = 300;
+const MAX_MANAGED_SECRET_BYTES: usize = 48 * 1_024;
 
 type EnvironmentVariableCache = Arc<Mutex<BTreeMap<String, BTreeMap<String, String>>>>;
 
@@ -240,6 +242,32 @@ impl RunRepositoryAccess {
         let value = token.token.clone();
         tokens.insert(permissions.clone(), token);
         Ok(Some(value))
+    }
+
+    async fn managed_secrets(
+        &self,
+        run: &RunSpec,
+        unit_id: &str,
+        environment: Option<&str>,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<BTreeMap<String, String>> {
+        if !run.managed_secrets {
+            return Ok(BTreeMap::new());
+        }
+        let secrets = self
+            .client
+            .request_managed_secrets(run.id, unit_id, environment, cancel)
+            .await?;
+        if secrets.len() > MAX_MANAGED_SECRETS_PER_JOB {
+            bail!("control plane returned more than {MAX_MANAGED_SECRETS_PER_JOB} managed secrets");
+        }
+        for (name, value) in &secrets {
+            if !valid_managed_secret_name(name) || value.len() > MAX_MANAGED_SECRET_BYTES {
+                bail!("control plane returned an invalid managed secret");
+            }
+        }
+        register_managed_secret_masks(&self.workflow_commands, &secrets);
+        Ok(secrets)
     }
 
     async fn clear(&self) {
@@ -2285,27 +2313,44 @@ fn resolve_reusable_inputs(job: &PlannedJob, context: &EvaluationContext) -> Res
     Ok(resolved_inputs)
 }
 
+#[cfg(test)]
 fn resolve_reusable_secret_names(job: &PlannedJob) -> Result<BTreeSet<String>> {
-    let mut available = BTreeSet::from(["GITHUB_TOKEN".to_owned()]);
+    Ok(resolve_reusable_secrets(
+        job,
+        &BTreeMap::from([("GITHUB_TOKEN".to_owned(), String::new())]),
+    )?
+    .into_keys()
+    .collect())
+}
+
+fn resolve_reusable_secrets(
+    job: &PlannedJob,
+    base_secrets: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    let mut available = base_secrets.clone();
     for scope in &job.reusable_secret_scopes {
         let previous = available;
-        let mut current = BTreeSet::from(["GITHUB_TOKEN".to_owned()]);
+        let mut current = BTreeMap::new();
+        if let Some((name, value)) = case_insensitive_secret(&previous, "GITHUB_TOKEN") {
+            current.insert(name.clone(), value.clone());
+        }
         if scope.inherit {
-            current.extend(previous.iter().cloned());
+            current.extend(
+                previous
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
         }
         for (target, source) in &scope.mappings {
-            if previous
-                .iter()
-                .any(|available| available.eq_ignore_ascii_case(source))
-            {
-                current.insert(target.clone());
+            if let Some((_, value)) = case_insensitive_secret(&previous, source) {
+                current.insert(target.clone(), value.clone());
             }
         }
-        if let Some(missing) = scope.required.iter().find(|required| {
-            !current
-                .iter()
-                .any(|available| available.eq_ignore_ascii_case(required))
-        }) {
+        if let Some(missing) = scope
+            .required
+            .iter()
+            .find(|required| case_insensitive_secret(&current, required).is_none())
+        {
             bail!(
                 "required reusable workflow secret '{missing}' is unavailable for job '{}'",
                 job.base_id
@@ -2314,6 +2359,15 @@ fn resolve_reusable_secret_names(job: &PlannedJob) -> Result<BTreeSet<String>> {
         available = current;
     }
     Ok(available)
+}
+
+fn case_insensitive_secret<'a>(
+    secrets: &'a BTreeMap<String, String>,
+    requested: &str,
+) -> Option<(&'a String, &'a String)> {
+    secrets
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(requested))
 }
 
 fn is_exact_expression(value: &str) -> bool {
@@ -3209,6 +3263,20 @@ async fn execute_job(
         }
         None => run.variables.clone(),
     };
+    let managed_secrets = repository_access
+        .managed_secrets(
+            run,
+            event_job_id,
+            selected_environment_name.as_deref(),
+            cancel,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "load managed secrets for workflow '{workflow_name}' job '{}'",
+                job.id
+            )
+        })?;
     context = expression_context_with_variables(
         run,
         &runtime_variables,
@@ -3222,6 +3290,7 @@ async fn execute_job(
         workspace,
         run_dir,
         workflow_token.as_deref(),
+        &managed_secrets,
     )?;
     job_environment.extend(render_environment(&job.environment, &context)?);
     restore_default_environment(&mut job_environment, environment);
@@ -3247,6 +3316,7 @@ async fn execute_job(
         workspace,
         run_dir,
         workflow_token.as_deref(),
+        &managed_secrets,
     )?;
     let tracked_environment = job
         .deployment_environment
@@ -3325,6 +3395,7 @@ async fn execute_job(
                     workspace,
                     run_dir,
                     workflow_token.as_deref(),
+                    &managed_secrets,
                 )?;
                 let execution = execute_step(
                     job_id,
@@ -3478,6 +3549,7 @@ async fn execute_job(
                 workspace,
                 run_dir,
                 workflow_token.as_deref(),
+                &managed_secrets,
             )?;
             if let (Some(deployment), Some(environment_name)) = (
                 &job.deployment_environment,
@@ -6338,6 +6410,7 @@ fn expression_context(
         workspace,
         run_dir,
         github_token,
+        &BTreeMap::new(),
     )
 }
 
@@ -6355,6 +6428,7 @@ fn expression_context_with_variables(
     workspace: &Path,
     run_dir: &Path,
     github_token: Option<&str>,
+    managed_secrets: &BTreeMap<String, String>,
 ) -> Result<EvaluationContext> {
     let repository = format!("{}/{}", run.repository.owner, run.repository.name);
     let github_ref = run.pull_request.execution_ref.clone();
@@ -6416,13 +6490,17 @@ fn expression_context_with_variables(
             "workspace": workspace.display().to_string(),
             "job": job.base_id,
             "token": github_token.map_or(JsonValue::Null, |token| JsonValue::String(token.to_owned())),
-            "secret_source": if github_token.is_some() { "Actions" } else { "None" },
+            "secret_source": if github_token.is_some() || !managed_secrets.is_empty() { "Actions" } else { "None" },
         }),
     )?;
+    let mut base_secrets = managed_secrets.clone();
     if let Some(github_token) = github_token {
-        let secrets = resolve_reusable_secret_names(job)?
+        base_secrets.insert("GITHUB_TOKEN".to_owned(), github_token.to_owned());
+    }
+    if !base_secrets.is_empty() {
+        let secrets = resolve_reusable_secrets(job, &base_secrets)?
             .into_iter()
-            .map(|name| (name, JsonValue::String(github_token.to_owned())))
+            .map(|(name, value)| (name, JsonValue::String(value)))
             .collect::<serde_json::Map<_, _>>();
         context.insert_json("secrets", JsonValue::Object(secrets))?;
     }
@@ -7823,6 +7901,27 @@ fn register_repository_token_masks(
     commands.register_global_mask(token.to_owned());
 }
 
+fn register_managed_secret_masks(
+    commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
+    secrets: &BTreeMap<String, String>,
+) {
+    let mut commands = commands
+        .lock()
+        .expect("workflow command processor was poisoned");
+    for value in secrets.values().filter(|value| !value.is_empty()) {
+        commands.register_global_mask(value.clone());
+    }
+}
+
+fn valid_managed_secret_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_uppercase() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        && !name.starts_with("GITHUB_")
+}
+
 async fn relay_masked_events(
     mut incoming: mpsc::Receiver<AgentMessage>,
     outbound: mpsc::Sender<AgentMessage>,
@@ -7912,6 +8011,7 @@ async fn relay_masked_events(
             | AgentMessage::ConcurrencyRelease { .. }
             | AgentMessage::RepositoryTokenRequest { .. }
             | AgentMessage::WorkflowTokenRequest { .. }
+            | AgentMessage::SecretRequest { .. }
             | AgentMessage::DeploymentStarted { .. }
             | AgentMessage::DeploymentFinished { .. }
             | AgentMessage::JobStarted { .. } => {}
@@ -10186,6 +10286,7 @@ jobs:
             Path::new("/tmp/workspace"),
             Path::new("/tmp/run"),
             None,
+            &BTreeMap::new(),
         )
         .expect("runtime context");
         assert_eq!(
@@ -11187,6 +11288,82 @@ jobs:
     }
 
     #[test]
+    fn exposes_and_masks_managed_secrets_without_adding_them_to_process_environment() {
+        let workflow = parse(
+            r#"
+name: Managed secrets
+on: pull_request
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      FROM_SECRET: ${{ secrets.API_TOKEN }}
+    steps:
+      - run: test "$FROM_SECRET" = expected
+"#,
+        )
+        .expect("parse workflow");
+        let plan = gitzero_workflow::compile(
+            &workflow,
+            Path::new(".github/workflows/managed-secrets.yml"),
+        )
+        .expect("compile workflow");
+        let run = fixture_run(
+            Uuid::new_v4(),
+            "1".repeat(40),
+            "2".repeat(40),
+            "https://github.com/octocat/Hello-World.git".to_owned(),
+        );
+        let process_environment = BTreeMap::new();
+        let managed =
+            BTreeMap::from([("API_TOKEN".to_owned(), "managed-runtime-secret".to_owned())]);
+        let context = expression_context_with_variables(
+            &run,
+            &BTreeMap::new(),
+            &plan.jobs[0],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &process_environment,
+            &JsonValue::Object(Default::default()),
+            &JsonValue::Object(Default::default()),
+            ExecutionStatus::Success,
+            Path::new("/tmp/workspace"),
+            Path::new("/tmp/run"),
+            None,
+            &managed,
+        )
+        .expect("managed secret context");
+        assert_eq!(
+            context
+                .render("${{ secrets.API_TOKEN }}")
+                .expect("render secret"),
+            "managed-runtime-secret"
+        );
+        assert_eq!(
+            context
+                .render("${{ secrets.UNSET_VALUE }}")
+                .expect("render unset secret"),
+            ""
+        );
+        assert!(!process_environment.contains_key("API_TOKEN"));
+        assert_eq!(
+            context
+                .evaluate_json("github.secret_source")
+                .expect("secret source"),
+            JsonValue::String("Actions".to_owned())
+        );
+
+        let commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        register_managed_secret_masks(&commands, &managed);
+        let mut log = "value=managed-runtime-secret".to_owned();
+        commands
+            .lock()
+            .expect("workflow commands")
+            .mask_all(&mut log);
+        assert_eq!(log, "value=***");
+    }
+
+    #[test]
     fn reusable_secret_aliases_are_scoped_to_each_direct_call() {
         let caller_source = r#"
 name: Caller
@@ -11250,6 +11427,20 @@ jobs:
             !names.contains("outer_token"),
             "a named secret leaked beyond the directly called workflow"
         );
+        let values = resolve_reusable_secrets(
+            inner_job,
+            &BTreeMap::from([
+                ("GITHUB_TOKEN".to_owned(), "scoped-token".to_owned()),
+                ("UNRELATED".to_owned(), "must-not-leak".to_owned()),
+            ]),
+        )
+        .expect("resolve reusable secret values");
+        assert_eq!(
+            values.get("inner_token").map(String::as_str),
+            Some("scoped-token")
+        );
+        assert!(!values.contains_key("outer_token"));
+        assert!(!values.contains_key("UNRELATED"));
 
         let unavailable =
             compile(&caller_source.replace("secrets.GITHUB_TOKEN", "secrets.UNAVAILABLE_TOKEN"))
@@ -14240,6 +14431,7 @@ jobs:
             checkout_token: String::new(),
             checkout_token_expires_at_epoch_seconds: None,
             github_api_version: "2026-03-10".to_owned(),
+            managed_secrets: false,
             changed_paths: None,
             environment: BTreeMap::new(),
             variables: BTreeMap::new(),
