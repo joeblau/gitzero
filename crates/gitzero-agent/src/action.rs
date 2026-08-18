@@ -8,6 +8,9 @@ pub enum ActionReference {
     Local {
         path: String,
     },
+    SelfRepository {
+        path: String,
+    },
     Remote {
         owner: String,
         repository: String,
@@ -56,10 +59,6 @@ impl RemoteReusableWorkflowReference {
             git_ref,
         })
     }
-
-    pub fn canonical_reference(&self, path: &str) -> String {
-        format!("{}/{}/{path}@{}", self.owner, self.repository, self.git_ref)
-    }
 }
 
 impl ActionReference {
@@ -67,6 +66,13 @@ impl ActionReference {
         if let Some(path) = source.strip_prefix("./") {
             validate_relative_path(path)?;
             return Ok(Self::Local {
+                path: path.to_owned(),
+            });
+        }
+        if let Some(path) = source.strip_prefix("$/") {
+            let path = path.trim_start_matches('/');
+            validate_relative_path(path)?;
+            return Ok(Self::SelfRepository {
                 path: path.to_owned(),
             });
         }
@@ -94,22 +100,6 @@ impl ActionReference {
             path,
             git_ref: git_ref.to_owned(),
         })
-    }
-
-    pub fn repository_name(&self) -> Option<String> {
-        match self {
-            Self::Local { .. } => None,
-            Self::Remote {
-                owner, repository, ..
-            } => Some(format!("{owner}/{repository}")),
-        }
-    }
-
-    pub fn git_ref(&self) -> Option<&str> {
-        match self {
-            Self::Local { .. } => None,
-            Self::Remote { git_ref, .. } => Some(git_ref),
-        }
     }
 }
 
@@ -287,6 +277,14 @@ mod tests {
                 path: ".github/actions/test".to_owned(),
             }
         );
+        assert_eq!(
+            ActionReference::parse("$//.github/actions/test").expect("self repository"),
+            ActionReference::SelfRepository {
+                path: ".github/actions/test".to_owned(),
+            }
+        );
+        assert!(ActionReference::parse("$/").is_err());
+        assert!(ActionReference::parse("$/../escape").is_err());
         assert!(ActionReference::parse("../escape").is_err());
     }
 

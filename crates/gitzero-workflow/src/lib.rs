@@ -885,7 +885,11 @@ fn reusable_path(
     uses: &str,
     reusable_workflows: &BTreeMap<String, Workflow>,
 ) -> Result<String, WorkflowError> {
-    let Some(path) = uses.strip_prefix("./").or_else(|| uses.strip_prefix("$/")) else {
+    let path = if let Some(path) = uses.strip_prefix("./") {
+        path
+    } else if let Some(path) = uses.strip_prefix("$/") {
+        path.trim_start_matches('/')
+    } else {
         if reusable_workflows.contains_key(uses) {
             return Ok(uses.to_owned());
         }
@@ -3735,7 +3739,7 @@ jobs:
         run: echo target
   reusable:
     needs: prepare
-    uses: ./.github/workflows/reusable.yml
+    uses: $//.github/workflows/reusable.yml
     concurrency: caller-${{ needs.prepare.outputs.target }}
     with:
       target: ${{ needs.prepare.outputs.target }}

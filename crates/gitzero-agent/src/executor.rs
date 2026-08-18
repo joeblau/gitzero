@@ -24,9 +24,9 @@ use gitzero_protocol::{
 };
 use gitzero_workflow::{
     ExecutionPlan, MAX_UNIQUE_REUSABLE_WORKFLOWS, PlannedConcurrency, PlannedConcurrencyQueue,
-    PlannedJob, PlannedPermissions, PlannedStep, PlannedVirtualJob, ReusableInputType, StepKind,
-    Workflow, compile_with_reusables, expand_dynamic_reusable_call, expand_matrix_definition,
-    matches_pull_request, parse, requires_pull_request_changed_paths,
+    PlannedJob, PlannedPermissions, PlannedStep, PlannedVirtualJob, ReusableInputType,
+    Step as WorkflowStep, StepKind, Workflow, compile_with_reusables, expand_dynamic_reusable_call,
+    expand_matrix_definition, matches_pull_request, parse, requires_pull_request_changed_paths,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -911,13 +911,51 @@ async fn discover_workflows(
 #[derive(Clone)]
 enum ReusableWorkflowOrigin {
     Local,
-    Remote(RemoteReusableWorkflowReference),
+    Remote(ActionRepositorySource),
 }
 
 #[derive(Clone)]
 struct ReusableWorkflowSource {
     workflow: Workflow,
     origin: ReusableWorkflowOrigin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActionRepositorySource {
+    owner: String,
+    repository: String,
+    git_ref: String,
+}
+
+struct MaterializedAction {
+    directory: PathBuf,
+    source: ActionRepositorySource,
+}
+
+impl ActionRepositorySource {
+    fn for_run(run: &RunSpec) -> Self {
+        Self {
+            owner: run.repository.owner.clone(),
+            repository: run.repository.name.clone(),
+            git_ref: run.pull_request.merge_sha.clone(),
+        }
+    }
+
+    fn from_remote(reference: &RemoteReusableWorkflowReference, git_ref: String) -> Self {
+        Self {
+            owner: reference.owner.clone(),
+            repository: reference.repository.clone(),
+            git_ref,
+        }
+    }
+
+    fn repository_name(&self) -> String {
+        format!("{}/{}", self.owner, self.repository)
+    }
+
+    fn canonical_reference(&self, path: &str) -> String {
+        format!("{}/{}/{path}@{}", self.owner, self.repository, self.git_ref)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1011,7 +1049,7 @@ async fn resolve_reusable_workflow_catalog(
             let Some(remote) = remote else {
                 continue;
             };
-            let workflow = load_remote_reusable_workflow(
+            let (mut workflow, resolved_source) = load_remote_reusable_workflow(
                 &remote,
                 run_dir,
                 run,
@@ -1022,11 +1060,12 @@ async fn resolve_reusable_workflow_catalog(
             )
             .await
             .with_context(|| format!("load remote reusable workflow '{target}'"))?;
+            resolve_workflow_self_repository_actions(&mut workflow, &resolved_source)?;
             sources.insert(
                 target.clone(),
                 ReusableWorkflowSource {
                     workflow,
-                    origin: ReusableWorkflowOrigin::Remote(remote),
+                    origin: ReusableWorkflowOrigin::Remote(resolved_source),
                 },
             );
             pending.push_back(target);
@@ -1039,30 +1078,66 @@ async fn resolve_reusable_workflow_catalog(
 }
 
 fn local_reusable_reference_path(source: &str) -> Option<Result<String>> {
-    source
-        .strip_prefix("./")
-        .or_else(|| source.strip_prefix("$/"))
-        .map(|path| {
-            let path = Path::new(path);
-            if path.is_absolute()
-                || path.components().any(|component| {
-                    matches!(
-                        component,
-                        std::path::Component::ParentDir | std::path::Component::RootDir
-                    )
-                })
-                || path.parent() != Some(Path::new(".github/workflows"))
-                || !path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .is_some_and(|extension| matches!(extension, "yml" | "yaml"))
-            {
-                bail!(
-                    "reusable workflow path '{source}' must name a file directly in .github/workflows"
-                );
-            }
-            Ok(path.to_string_lossy().replace('\\', "/"))
-        })
+    let path = if let Some(path) = source.strip_prefix("./") {
+        path
+    } else if let Some(path) = source.strip_prefix("$/") {
+        path.trim_start_matches('/')
+    } else {
+        return None;
+    };
+    Some((|| {
+        let path = Path::new(path);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::RootDir
+                )
+            })
+            || path.parent() != Some(Path::new(".github/workflows"))
+            || !path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| matches!(extension, "yml" | "yaml"))
+        {
+            bail!(
+                "reusable workflow path '{source}' must name a file directly in .github/workflows"
+            );
+        }
+        Ok(path.to_string_lossy().replace('\\', "/"))
+    })())
+}
+
+fn resolve_workflow_self_repository_actions(
+    workflow: &mut Workflow,
+    source: &ActionRepositorySource,
+) -> Result<()> {
+    for job in workflow.jobs.values_mut() {
+        for step in &mut job.steps {
+            resolve_workflow_step_self_repository_actions(step, source)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_workflow_step_self_repository_actions(
+    step: &mut WorkflowStep,
+    source: &ActionRepositorySource,
+) -> Result<()> {
+    if let Some(action) = &step.uses
+        && action.starts_with("$/")
+    {
+        let ActionReference::SelfRepository { path } = ActionReference::parse(action)? else {
+            unreachable!("self-repository prefix must parse as a self-repository action")
+        };
+        step.uses = Some(source.canonical_reference(&path));
+    }
+    if let Some(parallel) = &mut step.parallel {
+        for child in parallel {
+            resolve_workflow_step_self_repository_actions(child, source)?;
+        }
+    }
+    Ok(())
 }
 
 async fn load_remote_reusable_workflow(
@@ -1073,7 +1148,7 @@ async fn load_remote_reusable_workflow(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
     repository_access: &RunRepositoryAccess,
-) -> Result<Workflow> {
+) -> Result<(Workflow, ActionRepositorySource)> {
     let same_repository = reference.owner.eq_ignore_ascii_case(&run.repository.owner)
         && reference
             .repository
@@ -1106,7 +1181,22 @@ async fn load_remote_reusable_workflow(
     let source = tokio::fs::read_to_string(&path)
         .await
         .with_context(|| format!("read reusable workflow {}", path.display()))?;
-    parse(&source).with_context(|| format!("parse reusable workflow {}", path.display()))
+    let workflow =
+        parse(&source).with_context(|| format!("parse reusable workflow {}", path.display()))?;
+    let resolved_sha = git_output(
+        Command::new("git").arg("-C").arg(&checkout).args([
+            "rev-parse",
+            "--verify",
+            "HEAD^{commit}",
+        ]),
+        "resolve reusable workflow commit",
+    )
+    .await?;
+    validate_remote_commit(&resolved_sha)?;
+    Ok((
+        workflow,
+        ActionRepositorySource::from_remote(reference, resolved_sha),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -6896,7 +6986,7 @@ async fn execute_action_step(
     let _timeout_task = AbortTaskOnDrop(timeout_task);
     let cancel = &effective_cancel;
     let reference = ActionReference::parse(action)?;
-    let action_directory = materialize_action(
+    let materialized_action = materialize_action(
         job_id,
         step_id,
         &reference,
@@ -6909,8 +6999,8 @@ async fn execute_action_step(
         repository_access,
     )
     .await;
-    let action_directory = match action_directory {
-        Ok(directory) => directory,
+    let materialized_action = match materialized_action {
+        Ok(action) => action,
         Err(_error)
             if step_timed_out.load(Ordering::Acquire)
                 || job_timed_out.load(Ordering::Acquire)
@@ -6948,6 +7038,20 @@ async fn execute_action_step(
         }
         Err(error) => return Err(error),
     };
+    let action_directory = materialized_action.directory;
+    let exposed_action_source = match &reference {
+        ActionReference::Local { .. } => None,
+        ActionReference::SelfRepository { .. } => Some((
+            materialized_action.source.repository_name(),
+            materialized_action.source.git_ref.clone(),
+        )),
+        ActionReference::Remote {
+            owner,
+            repository,
+            git_ref,
+            ..
+        } => Some((format!("{owner}/{repository}"), git_ref.clone())),
+    };
     let definition = load_definition(&action_directory).await?;
     let mut action_context = context.clone();
     action_context.extend_json_object(
@@ -6959,15 +7063,17 @@ async fn execute_action_step(
             ),
             (
                 "action_ref".to_owned(),
-                reference
-                    .git_ref()
-                    .map_or(JsonValue::Null, |value| JsonValue::String(value.to_owned())),
+                exposed_action_source
+                    .as_ref()
+                    .map(|(_, git_ref)| JsonValue::String(git_ref.clone()))
+                    .unwrap_or(JsonValue::Null),
             ),
             (
                 "action_repository".to_owned(),
-                reference
-                    .repository_name()
-                    .map_or(JsonValue::Null, JsonValue::String),
+                exposed_action_source
+                    .as_ref()
+                    .map(|(repository, _)| JsonValue::String(repository.clone()))
+                    .unwrap_or(JsonValue::Null),
             ),
         ]),
     )?;
@@ -6983,11 +7089,12 @@ async fn execute_action_step(
         "GITHUB_ACTION_PATH".to_owned(),
         action_directory.display().to_string(),
     );
-    if let Some(repository) = reference.repository_name() {
-        action_environment.insert("GITHUB_ACTION_REPOSITORY".to_owned(), repository);
-    }
-    if let Some(git_ref) = reference.git_ref() {
-        action_environment.insert("GITHUB_ACTION_REF".to_owned(), git_ref.to_owned());
+    if let Some((repository, git_ref)) = &exposed_action_source {
+        action_environment.insert(
+            "GITHUB_ACTION_REPOSITORY".to_owned(),
+            repository.clone(),
+        );
+        action_environment.insert("GITHUB_ACTION_REF".to_owned(), git_ref.clone());
     }
 
     if definition.runs.using == "composite" {
@@ -6995,6 +7102,7 @@ async fn execute_action_step(
             job_id,
             step_id,
             &definition,
+            &materialized_action.source,
             run,
             workspace,
             run_dir,
@@ -7178,6 +7286,7 @@ async fn execute_composite_action(
     job_id: Uuid,
     parent_step_id: &str,
     definition: &ActionDefinition,
+    action_source: &ActionRepositorySource,
     run: &RunSpec,
     workspace: &Path,
     run_dir: &Path,
@@ -7209,7 +7318,7 @@ async fn execute_composite_action(
     let mut status = ExecutionStatus::Success;
 
     for (index, source_step) in definition.runs.steps.iter().enumerate() {
-        let planned = plan_composite_step(source_step, index)?;
+        let planned = plan_composite_step(source_step, index, action_source)?;
         let mut context = action_context.clone();
         context.set_status(status);
         context.extend_json_object(
@@ -7305,7 +7414,11 @@ async fn execute_composite_action(
     })
 }
 
-fn plan_composite_step(step: &ActionStep, index: usize) -> Result<PlannedStep> {
+fn plan_composite_step(
+    step: &ActionStep,
+    index: usize,
+    action_source: &ActionRepositorySource,
+) -> Result<PlannedStep> {
     if let Some(feature) = step.extra.keys().next() {
         bail!("composite step uses unsupported key '{feature}'");
     }
@@ -7336,13 +7449,14 @@ fn plan_composite_step(step: &ActionStep, index: usize) -> Result<PlannedStep> {
             }
         }
         (Some(_), None) => bail!("composite run steps cannot declare with inputs"),
-        (None, Some(action)) if action.starts_with("actions/checkout@") => {
-            StepKind::Checkout { inputs }
+        (None, Some(action)) => {
+            let action = resolve_self_repository_action(action, action_source)?;
+            if action.starts_with("actions/checkout@") {
+                StepKind::Checkout { inputs }
+            } else {
+                StepKind::Uses { action, inputs }
+            }
         }
-        (None, Some(action)) => StepKind::Uses {
-            action: action.clone(),
-            inputs,
-        },
         _ => bail!("composite steps must define exactly one of run or uses"),
     };
     let github_action = step.id.clone().unwrap_or_else(|| match &kind {
@@ -7389,6 +7503,16 @@ fn plan_composite_step(step: &ActionStep, index: usize) -> Result<PlannedStep> {
     })
 }
 
+fn resolve_self_repository_action(action: &str, source: &ActionRepositorySource) -> Result<String> {
+    if !action.starts_with("$/") {
+        return Ok(action.to_owned());
+    }
+    let ActionReference::SelfRepository { path } = ActionReference::parse(action)? else {
+        unreachable!("self-repository prefix must parse as a self-repository action")
+    };
+    Ok(source.canonical_reference(&path))
+}
+
 fn resolve_action_inputs(
     definition: &ActionDefinition,
     supplied: &BTreeMap<String, String>,
@@ -7430,12 +7554,36 @@ async fn materialize_action(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
     repository_access: &RunRepositoryAccess,
-) -> Result<PathBuf> {
+) -> Result<MaterializedAction> {
     match reference {
         ActionReference::Local { path } => {
             let directory = workspace.join(path);
             ensure_within(workspace, &directory).await?;
-            Ok(directory)
+            Ok(MaterializedAction {
+                directory,
+                source: ActionRepositorySource::for_run(run),
+            })
+        }
+        ActionReference::SelfRepository { path } => {
+            let source = ActionRepositorySource::for_run(run);
+            let checkout = materialize_remote_repository_with_shared_access(
+                job_id,
+                step_id,
+                &source.owner,
+                &source.repository,
+                &source.git_ref,
+                &run.repository.clone_url,
+                run,
+                repository_access,
+                run_dir,
+                cancel,
+                outbound,
+                sequence,
+            )
+            .await?;
+            let directory = checkout.join(path);
+            ensure_within(&checkout, &directory).await?;
+            Ok(MaterializedAction { directory, source })
         }
         ActionReference::Remote {
             owner,
@@ -7443,7 +7591,13 @@ async fn materialize_action(
             path,
             git_ref,
         } => {
-            let remote = format!("https://github.com/{owner}/{repository}.git");
+            let remote = if owner.eq_ignore_ascii_case(&run.repository.owner)
+                && repository.eq_ignore_ascii_case(&run.repository.name)
+            {
+                run.repository.clone_url.clone()
+            } else {
+                format!("https://github.com/{owner}/{repository}.git")
+            };
             let checkout = materialize_remote_repository_with_shared_access(
                 job_id,
                 step_id,
@@ -7465,7 +7619,24 @@ async fn materialize_action(
                 checkout.join(path)
             };
             ensure_within(&checkout, &directory).await?;
-            Ok(directory)
+            let resolved_sha = git_output(
+                Command::new("git").arg("-C").arg(&checkout).args([
+                    "rev-parse",
+                    "--verify",
+                    "HEAD^{commit}",
+                ]),
+                "resolve action commit",
+            )
+            .await?;
+            validate_remote_commit(&resolved_sha)?;
+            Ok(MaterializedAction {
+                directory,
+                source: ActionRepositorySource {
+                    owner: owner.clone(),
+                    repository: repository.clone(),
+                    git_ref: resolved_sha,
+                },
+            })
         }
     }
 }
@@ -10671,6 +10842,66 @@ mod tests {
         assert!(validate_sha("-012345678901234567890123456789012345678").is_err());
         assert!(validate_sha(&"a".repeat(63)).is_err());
         assert!(validate_sha(&format!("{}z", "a".repeat(63))).is_err());
+    }
+
+    #[test]
+    fn resolves_workflow_and_composite_self_repository_actions_against_their_source() {
+        let source = ActionRepositorySource {
+            owner: "shared".to_owned(),
+            repository: "automation".to_owned(),
+            git_ref: "a".repeat(40),
+        };
+        let mut workflow = parse(
+            r#"
+name: Remote reusable
+on: workflow_call
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: $//.github/actions/direct
+      - parallel:
+          - uses: $/.github/actions/parallel
+          - run: echo ordinary
+"#,
+        )
+        .expect("parse workflow");
+        resolve_workflow_self_repository_actions(&mut workflow, &source)
+            .expect("resolve remote workflow actions");
+        let steps = &workflow.jobs["test"].steps;
+        assert_eq!(
+            steps[0].uses.as_deref().expect("direct action"),
+            format!(
+                "shared/automation/.github/actions/direct@{}",
+                "a".repeat(40)
+            )
+        );
+        assert_eq!(
+            steps[1].parallel.as_ref().expect("parallel steps")[0]
+                .uses
+                .as_deref()
+                .expect("parallel action"),
+            format!(
+                "shared/automation/.github/actions/parallel@{}",
+                "a".repeat(40)
+            )
+        );
+        assert_eq!(
+            resolve_self_repository_action("$/.github/actions/child", &source)
+                .expect("resolve composite action"),
+            format!("shared/automation/.github/actions/child@{}", "a".repeat(40))
+        );
+        assert_eq!(
+            resolve_self_repository_action("./workspace/action", &source)
+                .expect("preserve workspace action"),
+            "./workspace/action"
+        );
+        assert_eq!(
+            local_reusable_reference_path("$//.github/workflows/reusable.yml")
+                .expect("self reference")
+                .expect("valid reusable path"),
+            ".github/workflows/reusable.yml"
+        );
     }
 
     #[test]
@@ -16402,7 +16633,7 @@ jobs:
         )
         .await
         .expect("download action");
-        let definition = load_definition(&action).await.expect("metadata");
+        let definition = load_definition(&action.directory).await.expect("metadata");
         assert!(definition.runs.using.starts_with("node"));
         assert!(definition.runs.main.is_some());
     }
@@ -16448,7 +16679,7 @@ jobs:
         let (_cancel_tx, cancel) = watch::channel(false);
         let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
         let repository_access = local_repository_access(&workflow_commands);
-        let workflow = load_remote_reusable_workflow(
+        let (workflow, _source) = load_remote_reusable_workflow(
             &reference,
             &run_dir,
             &run,
@@ -17244,6 +17475,201 @@ jobs:
             message,
             AgentMessage::LogChunk { data, .. } if data == "sha256-checkout-parity\n"
         )));
+        assert!(events.iter().any(|message| matches!(
+            message,
+            AgentMessage::JobFinished {
+                conclusion: Conclusion::Success,
+                ..
+            }
+        )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn self_repository_actions_follow_the_containing_workflow_and_composite_commit() {
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let source = fixture.path().join("source");
+        let remote = fixture.path().join("remote.git");
+        for directory in [
+            ".github/workflows",
+            ".github/actions/root",
+            ".github/actions/leaf",
+        ] {
+            std::fs::create_dir_all(source.join(directory)).expect("fixture directory");
+        }
+        git(&source, ["init", "--initial-branch=main"]);
+        git(&source, ["config", "user.email", "gitzero@example.test"]);
+        git(&source, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(
+            source.join(".github/workflows/self.yml"),
+            r#"
+name: Self repository parity
+on: pull_request
+jobs:
+  direct:
+    runs-on: macos-latest
+    steps:
+      - uses: $/.github/actions/root
+        with:
+          expected: execution-snapshot
+  workspace-parent:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/root
+        with:
+          expected: execution-snapshot
+  local-reusable:
+    uses: $/.github/workflows/reusable.yml
+    with:
+      expected: execution-snapshot
+  remote-reusable:
+    uses: local/fixture/.github/workflows/reusable.yml@main
+    with:
+      expected: advanced-main
+"#,
+        )
+        .expect("caller workflow");
+        std::fs::write(
+            source.join(".github/workflows/reusable.yml"),
+            r#"
+name: Self repository reusable
+on:
+  workflow_call:
+    inputs:
+      expected:
+        required: true
+        type: string
+jobs:
+  verify:
+    runs-on: macos-latest
+    steps:
+      - uses: $/.github/actions/root
+        with:
+          expected: ${{ inputs.expected }}
+"#,
+        )
+        .expect("reusable workflow");
+        std::fs::write(
+            source.join(".github/actions/root/action.yml"),
+            r#"
+name: Self repository root
+inputs:
+  expected:
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: $/.github/actions/leaf
+      with:
+        expected: ${{ inputs.expected }}
+"#,
+        )
+        .expect("root action");
+        let leaf = |marker: &str| {
+            r#"
+name: Self repository leaf
+inputs:
+  expected:
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        EXPECTED_MARKER: ${{ inputs.expected }}
+      run: |
+        test "$EXPECTED_MARKER" = "__MARKER__"
+        test "$GITHUB_ACTION_REPOSITORY" = "local/fixture"
+        test "${#GITHUB_ACTION_REF}" -eq 40
+        echo self-repository-$EXPECTED_MARKER
+"#
+            .replace("__MARKER__", marker)
+        };
+        std::fs::write(
+            source.join(".github/actions/leaf/action.yml"),
+            leaf("execution-snapshot"),
+        )
+        .expect("leaf action");
+        std::fs::write(source.join("README.md"), "execution snapshot\n").expect("readme");
+        git(&source, ["add", "."]);
+        git(&source, ["commit", "-m", "execution snapshot"]);
+        let execution_sha = git_output(&source, ["rev-parse", "HEAD"]);
+
+        git(
+            fixture.path(),
+            ["init", "--bare", remote.to_str().expect("remote path")],
+        );
+        git(
+            &source,
+            [
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        git(&source, ["push", "origin", "main"]);
+        git(&source, ["push", "origin", "HEAD:refs/pull/1/head"]);
+        git(&source, ["push", "origin", "HEAD:refs/pull/1/merge"]);
+
+        std::fs::write(
+            source.join(".github/actions/leaf/action.yml"),
+            leaf("advanced-main"),
+        )
+        .expect("advanced leaf action");
+        git(&source, ["add", "."]);
+        git(&source, ["commit", "-m", "advance main action"]);
+        git(&source, ["push", "origin", "main"]);
+        git(&remote, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        let executor = Executor::new(ExecutorConfig {
+            work_root: fixture.path().join("runs"),
+            runner_name: "GitZero Self Repository Test".to_owned(),
+            keep_failed_workspaces: false,
+            max_parallelism: 4,
+            cache_max_bytes: 10 * 1024 * 1024,
+            cache_max_entry_bytes: 1024 * 1024,
+            artifact_max_bytes: 10 * 1024 * 1024,
+            artifact_max_entry_bytes: 1024 * 1024,
+        });
+        let run = fixture_run(
+            Uuid::new_v4(),
+            execution_sha.clone(),
+            execution_sha,
+            remote.display().to_string(),
+        );
+        let (outbound, mut incoming) = mpsc::channel(256);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        executor
+            .execute(run, cancel, outbound)
+            .await
+            .expect("execute self-repository workflow");
+        let mut events = Vec::new();
+        while let Ok(message) = incoming.try_recv() {
+            events.push(message);
+        }
+        let logs = events
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::LogChunk { data, .. } => Some(data.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            logs.iter()
+                .filter(|data| **data == "self-repository-execution-snapshot\n")
+                .count(),
+            3,
+            "direct, workspace-relative, and local reusable actions must use the execution snapshot"
+        );
+        assert_eq!(
+            logs.iter()
+                .filter(|data| **data == "self-repository-advanced-main\n")
+                .count(),
+            1,
+            "remote reusable action must use its own pinned main snapshot"
+        );
         assert!(events.iter().any(|message| matches!(
             message,
             AgentMessage::JobFinished {
