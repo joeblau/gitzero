@@ -73,6 +73,8 @@ const MAX_DEPLOYMENT_BRANCH_PATTERN_BYTES: usize = 1_024;
 const MAX_DEPLOYMENT_BRANCH_PATTERN_TOTAL_BYTES: usize = 256 * 1_024;
 const MAX_CHECKOUT_FILTER_BYTES: usize = 1_024;
 const MAX_CHECKOUT_REF_BYTES: usize = 1_024;
+const MAX_CHECKOUT_SSH_KNOWN_HOSTS_BYTES: usize = 256 * 1_024;
+const MAX_CHECKOUT_SSH_USER_BYTES: usize = 64;
 const MAX_SPARSE_CHECKOUT_PATTERNS: usize = 4_096;
 const MAX_SPARSE_CHECKOUT_BYTES: usize = 128 * 1_024;
 // A page can contain 30 values at 48 KiB each. JSON escaping can expand each
@@ -3606,6 +3608,24 @@ impl Drop for AbortTaskOnDrop {
     }
 }
 
+struct SensitiveDirectoryGuard(PathBuf);
+
+impl Drop for SensitiveDirectoryGuard {
+    fn drop(&mut self) {
+        match std::fs::remove_dir_all(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                info!(
+                    path = %self.0.display(),
+                    %error,
+                    "failed to remove checkout credential directory"
+                );
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_job(
     job_id: Uuid,
@@ -3644,6 +3664,8 @@ async fn execute_job(
                 job_temp_directory.display()
             )
         })?;
+    let _checkout_credential_guard =
+        SensitiveDirectoryGuard(job_temp_directory.join("_checkout-credentials"));
     let mut workflow_token = repository_access
         .workflow_token(run, &job.permissions, cancel)
         .await
@@ -4483,6 +4505,10 @@ async fn execute_checkout_step(
         "fetch-tags",
         "github-server-url",
         "lfs",
+        "ssh-key",
+        "ssh-known-hosts",
+        "ssh-strict",
+        "ssh-user",
         "show-progress",
         "sparse-checkout",
         "sparse-checkout-cone-mode",
@@ -4542,15 +4568,19 @@ async fn execute_checkout_step_with_repository(
     repository_access: &RunRepositoryAccess,
     checkout_secret_values: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, String>> {
-    let cross_repository_access = if checkout_repository.same_repository {
-        None
-    } else {
-        Some(select_cross_repository_checkout_access(
-            inputs.get("token").map(String::as_str),
-            builtin_token,
-            checkout_secret_values,
-        )?)
-    };
+    let ssh_credentials = checkout_ssh_credentials(inputs, checkout_secret_values, environment)
+        .await
+        .context("configure actions/checkout SSH credentials")?;
+    let cross_repository_access =
+        if checkout_repository.same_repository || ssh_credentials.is_some() {
+            None
+        } else {
+            Some(select_cross_repository_checkout_access(
+                inputs.get("token").map(String::as_str),
+                builtin_token,
+                checkout_secret_values,
+            )?)
+        };
     let requested_ref = inputs
         .get("ref")
         .map(|git_ref| git_ref.trim())
@@ -4595,6 +4625,10 @@ async fn execute_checkout_step_with_repository(
     if !matches!(submodules.as_str(), "false" | "true" | "recursive") {
         bail!("actions/checkout submodules must be false, true, or recursive");
     }
+    let checkout_remote = ssh_credentials.as_ref().map_or_else(
+        || checkout_repository.clone_url.clone(),
+        |credentials| checkout_repository.ssh_url(&credentials.user),
+    );
 
     let mut managed_checkout_token = None;
     let (expected_sha, immutable_snapshot, output_ref) = if checkout_repository.same_repository {
@@ -4609,24 +4643,52 @@ async fn execute_checkout_step_with_repository(
         )
     } else {
         let git_ref = public_checkout_ref(requested_ref)?;
-        let (commit, snapshot, token) = materialize_cross_repository_checkout_snapshot(
-            job_id,
-            step_id,
-            &checkout_repository,
-            &git_ref,
-            run,
-            repository_access,
-            cross_repository_access.expect("cross-repository access mode"),
-            run_dir,
-            cancel,
-            outbound,
-            sequence,
-        )
-        .await?;
+        let (commit, snapshot, token) = if let Some(credentials) = &ssh_credentials {
+            let snapshot = materialize_remote_repository_with_fetch(
+                job_id,
+                step_id,
+                &checkout_repository.owner,
+                &checkout_repository.name,
+                &git_ref,
+                &checkout_repository.clone_url,
+                &checkout_remote,
+                RemoteRepositoryMaterializationScope::CheckoutSsh,
+                None,
+                Some(&credentials.environment),
+                run_dir,
+                cancel,
+                outbound,
+                sequence,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "checkout repository {}/{}@{git_ref} with an explicit managed SSH key",
+                    checkout_repository.owner, checkout_repository.name
+                )
+            })?;
+            let (commit, snapshot, _) = finish_cross_repository_checkout(snapshot, None).await?;
+            (commit, snapshot, None)
+        } else {
+            materialize_cross_repository_checkout_snapshot(
+                job_id,
+                step_id,
+                &checkout_repository,
+                &git_ref,
+                run,
+                repository_access,
+                cross_repository_access.expect("cross-repository access mode"),
+                run_dir,
+                cancel,
+                outbound,
+                sequence,
+            )
+            .await?
+        };
         managed_checkout_token = token;
         (commit, Some(snapshot), public_checkout_output_ref(&git_ref))
     };
-    let checkout_token = if checkout_repository.same_repository {
+    let checkout_token = if checkout_repository.same_repository || ssh_credentials.is_some() {
         select_checkout_token(
             inputs.get("token").map(String::as_str),
             builtin_token,
@@ -4638,6 +4700,12 @@ async fn execute_checkout_step_with_repository(
 
     let mut checkout_environment = environment.clone();
     configure_checkout_credentials(&mut checkout_environment, checkout_token);
+    configure_checkout_ssh(
+        &mut checkout_environment,
+        ssh_credentials
+            .as_ref()
+            .map(|credentials| credentials.command.as_str()),
+    );
     if lfs {
         checkout_environment.remove("GIT_LFS_SKIP_SMUDGE");
     } else {
@@ -4650,6 +4718,13 @@ async fn execute_checkout_step_with_repository(
         } else {
             ""
         },
+    );
+    configure_checkout_ssh(
+        environment,
+        persist_credentials
+            .then_some(ssh_credentials.as_ref())
+            .flatten()
+            .map(|credentials| credentials.command.as_str()),
     );
 
     let existing_repository = git_repository_exists(&checkout_directory).await?;
@@ -4688,14 +4763,9 @@ async fn execute_checkout_step_with_repository(
         .success();
     let mut remote = Command::new("git");
     if has_origin {
-        remote.args([
-            "remote",
-            "set-url",
-            "origin",
-            &checkout_repository.clone_url,
-        ]);
+        remote.args(["remote", "set-url", "origin", &checkout_remote]);
     } else {
-        remote.args(["remote", "add", "origin", &checkout_repository.clone_url]);
+        remote.args(["remote", "add", "origin", &checkout_remote]);
     }
     remote.current_dir(&checkout_directory);
     run_process(
@@ -4926,12 +4996,141 @@ async fn execute_checkout_step_with_repository(
     ]))
 }
 
+struct CheckoutSshCredentials {
+    user: String,
+    command: String,
+    environment: BTreeMap<String, String>,
+}
+
+async fn checkout_ssh_credentials(
+    inputs: &BTreeMap<String, String>,
+    managed_secret_values: &BTreeSet<String>,
+    environment: &BTreeMap<String, String>,
+) -> Result<Option<CheckoutSshCredentials>> {
+    let strict = checkout_boolean(inputs, "ssh-strict", true)?;
+    let user = inputs
+        .get("ssh-user")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("git");
+    if user.len() > MAX_CHECKOUT_SSH_USER_BYTES
+        || user.starts_with('-')
+        || !user
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("actions/checkout ssh-user is invalid");
+    }
+    let known_hosts = inputs
+        .get("ssh-known-hosts")
+        .map(String::as_str)
+        .unwrap_or("");
+    if known_hosts.len() > MAX_CHECKOUT_SSH_KNOWN_HOSTS_BYTES || known_hosts.contains('\0') {
+        bail!("actions/checkout ssh-known-hosts is invalid or too large");
+    }
+    let Some(key) = select_checkout_ssh_key(
+        inputs.get("ssh-key").map(String::as_str),
+        managed_secret_values,
+    )?
+    else {
+        return Ok(None);
+    };
+    if key.contains('\0') {
+        bail!("actions/checkout ssh-key is invalid");
+    }
+
+    let runner_temp = environment
+        .get("RUNNER_TEMP")
+        .map(PathBuf::from)
+        .context("RUNNER_TEMP is not available for actions/checkout SSH credentials")?;
+    let credential_directory = runner_temp.join("_checkout-credentials");
+    tokio::fs::create_dir_all(&credential_directory)
+        .await
+        .context("create actions/checkout SSH credential directory")?;
+    let nonce = Uuid::new_v4();
+    let key_path = credential_directory.join(format!("{nonce}.key"));
+    let known_hosts_path = credential_directory.join(format!("{nonce}.known_hosts"));
+    write_private_checkout_file(&key_path, format!("{}\n", key.trim()).as_bytes())
+        .context("write actions/checkout SSH key")?;
+    let known_hosts_contents = format!(
+        "{known_hosts}\n# Begin implicitly added github.com\n{GITHUB_SSH_RSA_KNOWN_HOST}\n# End implicitly added github.com\n"
+    );
+    if let Err(error) =
+        write_private_checkout_file(&known_hosts_path, known_hosts_contents.as_bytes())
+            .context("write actions/checkout SSH known hosts")
+    {
+        let _ = std::fs::remove_file(&key_path);
+        return Err(error);
+    }
+
+    let ssh = ["/usr/bin/ssh", "/bin/ssh"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .context("actions/checkout SSH authentication requires the system ssh client")?;
+    let mut command = format!(
+        "{} -i {}",
+        shell_words::quote(ssh),
+        shell_words::quote(&key_path.to_string_lossy())
+    );
+    if strict {
+        command.push_str(" -o StrictHostKeyChecking=yes -o CheckHostIP=no");
+    }
+    command.push_str(&format!(
+        " -o {}",
+        shell_words::quote(&format!(
+            "UserKnownHostsFile={}",
+            known_hosts_path.display()
+        ))
+    ));
+    let ssh_environment = BTreeMap::from([("GIT_SSH_COMMAND".to_owned(), command.clone())]);
+    Ok(Some(CheckoutSshCredentials {
+        user: user.to_owned(),
+        command,
+        environment: ssh_environment,
+    }))
+}
+
+fn select_checkout_ssh_key<'a>(
+    input: Option<&'a str>,
+    managed_secret_values: &BTreeSet<String>,
+) -> Result<Option<&'a str>> {
+    match input {
+        None | Some("") => Ok(None),
+        Some(key) if managed_secret_values.contains(key) => Ok(Some(key)),
+        Some(_) => {
+            bail!("actions/checkout ssh-key must be empty or an exact managed secret value")
+        }
+    }
+}
+
+fn write_private_checkout_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+const GITHUB_SSH_RSA_KNOWN_HOST: &str = "github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CheckoutRepository {
     owner: String,
     name: String,
     clone_url: String,
     same_repository: bool,
+}
+
+impl CheckoutRepository {
+    fn ssh_url(&self, user: &str) -> String {
+        format!("{user}@github.com:{}/{}.git", self.owner, self.name)
+    }
 }
 
 fn checkout_repository(input: Option<&String>, run: &RunSpec) -> Result<CheckoutRepository> {
@@ -5469,6 +5668,7 @@ enum RemoteRepositoryMaterializationScope {
     SharedSource,
     CheckoutAnonymous,
     CheckoutManaged,
+    CheckoutSsh,
 }
 
 impl RemoteRepositoryMaterializationScope {
@@ -5477,6 +5677,7 @@ impl RemoteRepositoryMaterializationScope {
             Self::SharedSource => "shared-source",
             Self::CheckoutAnonymous => "checkout-anonymous",
             Self::CheckoutManaged => "checkout-managed",
+            Self::CheckoutSsh => "checkout-ssh",
         }
     }
 }
@@ -5519,6 +5720,13 @@ fn configure_checkout_credentials(environment: &mut BTreeMap<String, String>, to
         "GIT_CONFIG_VALUE_0".to_owned(),
         format!("AUTHORIZATION: basic {credential}"),
     );
+}
+
+fn configure_checkout_ssh(environment: &mut BTreeMap<String, String>, command: Option<&str>) {
+    environment.remove("GIT_SSH_COMMAND");
+    if let Some(command) = command {
+        environment.insert("GIT_SSH_COMMAND".to_owned(), command.to_owned());
+    }
 }
 
 fn checkout_directory(workspace: &Path, path: &str) -> Result<PathBuf> {
@@ -6355,6 +6563,42 @@ async fn materialize_remote_repository(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
 ) -> Result<PathBuf> {
+    materialize_remote_repository_with_fetch(
+        job_id,
+        step_id,
+        owner,
+        repository,
+        git_ref,
+        remote,
+        "origin",
+        scope,
+        checkout_token,
+        None,
+        run_dir,
+        cancel,
+        outbound,
+        sequence,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn materialize_remote_repository_with_fetch(
+    job_id: Uuid,
+    step_id: &str,
+    owner: &str,
+    repository: &str,
+    git_ref: &str,
+    cache_remote: &str,
+    fetch_remote: &str,
+    scope: RemoteRepositoryMaterializationScope,
+    checkout_token: Option<&str>,
+    checkout_environment: Option<&BTreeMap<String, String>>,
+    run_dir: &Path,
+    cancel: &watch::Receiver<bool>,
+    outbound: &mpsc::Sender<AgentMessage>,
+    sequence: &Arc<AtomicU64>,
+) -> Result<PathBuf> {
     let encoded_ref = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(git_ref);
     let checkout = run_dir
         .join("_actions")
@@ -6382,8 +6626,16 @@ async fn materialize_remote_repository(
         return Ok(checkout);
     }
 
-    ensure_remote_repository_cache(job_id, step_id, &cache, remote, cancel, outbound, sequence)
-        .await?;
+    ensure_remote_repository_cache(
+        job_id,
+        step_id,
+        &cache,
+        cache_remote,
+        cancel,
+        outbound,
+        sequence,
+    )
+    .await?;
     let resolution = run_dir
         .join("_action-resolutions")
         .join(owner)
@@ -6391,13 +6643,26 @@ async fn materialize_remote_repository(
         .join(&encoded_ref);
     let mut commit = read_cached_remote_resolution(&cache, &resolution).await?;
     let resolution_hit = commit.is_some();
-    if resolution_hit && checkout_token.is_none() {
+    if resolution_hit && (checkout_token.is_none() || checkout_environment.is_some()) {
         let mut probe = Command::new("git");
         probe
             .arg("--git-dir")
             .arg(&cache)
-            .args(["ls-remote", "--quiet", "origin", "HEAD"])
+            .args(["ls-remote", "--quiet", fetch_remote, "HEAD"])
             .env("GIT_TERMINAL_PROMPT", "0");
+        if let Some(checkout_environment) = checkout_environment {
+            probe.envs(checkout_environment.iter());
+        }
+        if let Some(checkout_token) = checkout_token {
+            let credential = STANDARD.encode(format!("x-access-token:{checkout_token}"));
+            probe
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+                .env(
+                    "GIT_CONFIG_VALUE_0",
+                    format!("AUTHORIZATION: basic {credential}"),
+                );
+        }
         run_process(
             job_id,
             step_id,
@@ -6409,7 +6674,7 @@ async fn materialize_remote_repository(
         )
         .await
         .map_err(anyhow::Error::from)
-        .with_context(|| format!("verify anonymous access to {owner}/{repository}"))?;
+        .with_context(|| format!("verify selected access to {owner}/{repository}"))?;
     }
     if commit.is_none() {
         let mut fetch = Command::new("git");
@@ -6422,10 +6687,13 @@ async fn materialize_remote_repository(
                 "--no-tags",
                 "--depth=1",
                 "--force",
-                "origin",
+                fetch_remote,
                 git_ref,
             ])
             .env("GIT_TERMINAL_PROMPT", "0");
+        if let Some(checkout_environment) = checkout_environment {
+            fetch.envs(checkout_environment.iter());
+        }
         if let Some(checkout_token) = checkout_token {
             let credential = STANDARD.encode(format!("x-access-token:{checkout_token}"));
             fetch
@@ -9925,8 +10193,132 @@ jobs:
         }));
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn ssh_materialization_uses_the_selected_remote_without_rewriting_the_shared_cache() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("SSH materialization tempdir");
+        let source = fixture.path().join("source");
+        let remote = fixture.path().join("private.git");
+        let work_root = fixture.path().join("runs");
+        let run_dir = work_root.join(Uuid::new_v4().to_string());
+        for directory in [&source, &run_dir] {
+            std::fs::create_dir_all(directory).expect("fixture directory");
+        }
+        git(&source, ["init", "--initial-branch=main"]);
+        git(&source, ["config", "user.email", "gitzero@example.test"]);
+        git(&source, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(source.join("private.txt"), "SSH fixture\n").expect("fixture file");
+        git(&source, ["add", "private.txt"]);
+        git(&source, ["commit", "-m", "private fixture"]);
+        git(
+            fixture.path(),
+            ["init", "--bare", remote.to_str().expect("remote path")],
+        );
+        git(
+            &source,
+            [
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        git(&source, ["push", "origin", "main"]);
+        git(&remote, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        let fake_ssh = fixture.path().join("fake ssh");
+        let ssh_log = fixture.path().join("ssh.log");
+        std::fs::write(
+            &fake_ssh,
+            "#!/bin/sh\nprintf 'invoked\\n' >> \"$GITZERO_TEST_SSH_LOG\"\nexec git-upload-pack \"$GITZERO_TEST_SSH_REMOTE\"\n",
+        )
+        .expect("fake SSH client");
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o700))
+            .expect("fake SSH permissions");
+        let ssh_environment = BTreeMap::from([
+            (
+                "GIT_SSH_COMMAND".to_owned(),
+                shell_words::quote(&fake_ssh.to_string_lossy()).into_owned(),
+            ),
+            ("GIT_SSH_VARIANT".to_owned(), "ssh".to_owned()),
+            (
+                "GITZERO_TEST_SSH_LOG".to_owned(),
+                ssh_log.display().to_string(),
+            ),
+            (
+                "GITZERO_TEST_SSH_REMOTE".to_owned(),
+                remote.display().to_string(),
+            ),
+        ]);
+        let canonical_remote = "https://github.com/acme/private.git";
+        let selected_remote = "deploy-user@github.com:acme/private.git";
+        let (outbound, _incoming) = mpsc::channel(64);
+        let (_cancel_tx, cancel) = watch::channel(false);
+
+        let first = materialize_remote_repository_with_fetch(
+            Uuid::new_v4(),
+            "0/ssh-checkout",
+            "acme",
+            "private",
+            "main",
+            canonical_remote,
+            selected_remote,
+            RemoteRepositoryMaterializationScope::CheckoutSsh,
+            None,
+            Some(&ssh_environment),
+            &run_dir,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .expect("first SSH materialization");
+        assert_eq!(
+            std::fs::read_to_string(first.join("private.txt")).expect("materialized file"),
+            "SSH fixture\n"
+        );
+        let cache = work_root.join("_action-cache/acme/private.git");
+        assert_eq!(
+            git_output(&cache, ["config", "--get", "remote.origin.url"]),
+            canonical_remote
+        );
+
+        let second = materialize_remote_repository_with_fetch(
+            Uuid::new_v4(),
+            "1/ssh-checkout",
+            "acme",
+            "private",
+            "main",
+            canonical_remote,
+            selected_remote,
+            RemoteRepositoryMaterializationScope::CheckoutSsh,
+            None,
+            Some(&ssh_environment),
+            &run_dir,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .expect("second SSH materialization");
+        assert_eq!(
+            std::fs::read_to_string(second.join("private.txt")).expect("rematerialized file"),
+            "SSH fixture\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ssh_log)
+                .expect("fake SSH invocation log")
+                .lines()
+                .count(),
+            2,
+            "a second purpose did not prove SSH access before consuming the pinned ref"
+        );
+    }
+
     #[test]
-    fn checkout_accepts_only_builtin_anonymous_or_exact_managed_secret_tokens() {
+    fn checkout_accepts_only_builtin_anonymous_or_exact_managed_credentials() {
         let managed = BTreeSet::from(["managed-secret".to_owned()]);
         assert_eq!(
             select_checkout_token(None, "builtin", &managed).expect("default token"),
@@ -9955,6 +10347,203 @@ jobs:
             select_checkout_token(Some("managed-secret-suffix"), "builtin", &managed).is_err(),
             "a transformed secret value was accepted"
         );
+        assert_eq!(
+            select_checkout_ssh_key(None, &managed).expect("missing SSH key"),
+            None
+        );
+        assert_eq!(
+            select_checkout_ssh_key(Some(""), &managed).expect("empty SSH key"),
+            None
+        );
+        assert_eq!(
+            select_checkout_ssh_key(Some("managed-secret"), &managed).expect("managed SSH key"),
+            Some("managed-secret")
+        );
+        let error = select_checkout_ssh_key(Some("custom-private-key"), &managed)
+            .expect_err("arbitrary SSH key should fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("exact managed secret value"));
+        assert!(!message.contains("custom-private-key"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn checkout_ssh_credentials_are_private_bounded_and_persist_only_on_request() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fixture = tempfile::tempdir().expect("SSH credential tempdir");
+        let runner_temp = fixture.path().join("runner temp");
+        std::fs::create_dir_all(&runner_temp).expect("runner temp directory");
+        let key =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-key\n-----END OPENSSH PRIVATE KEY-----";
+        let inputs = BTreeMap::from([
+            ("ssh-key".to_owned(), key.to_owned()),
+            (
+                "ssh-known-hosts".to_owned(),
+                "example.test ssh-ed25519 fixture-host-key".to_owned(),
+            ),
+            ("ssh-strict".to_owned(), "true".to_owned()),
+            ("ssh-user".to_owned(), "deploy-user".to_owned()),
+        ]);
+        let managed = BTreeSet::from([key.to_owned()]);
+        let environment =
+            BTreeMap::from([("RUNNER_TEMP".to_owned(), runner_temp.display().to_string())]);
+
+        let credentials = checkout_ssh_credentials(&inputs, &managed, &environment)
+            .await
+            .expect("checkout SSH credentials")
+            .expect("configured SSH credentials");
+        assert_eq!(credentials.user, "deploy-user");
+        assert!(credentials.command.contains("StrictHostKeyChecking=yes"));
+        assert!(credentials.command.contains("CheckHostIP=no"));
+        assert!(!credentials.command.contains("fixture-key"));
+        let credential_directory = runner_temp.join("_checkout-credentials");
+        let paths = std::fs::read_dir(&credential_directory)
+            .expect("credential directory")
+            .map(|entry| entry.expect("credential entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 2);
+        for path in &paths {
+            assert_eq!(
+                std::fs::metadata(path)
+                    .expect("credential metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let key_path = paths
+            .iter()
+            .find(|path| path.extension().is_some_and(|extension| extension == "key"))
+            .expect("private key path");
+        assert_eq!(
+            std::fs::read_to_string(key_path).expect("private key"),
+            format!("{key}\n")
+        );
+        let known_hosts_path = paths
+            .iter()
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "known_hosts")
+            })
+            .expect("known hosts path");
+        let known_hosts = std::fs::read_to_string(known_hosts_path).expect("known hosts");
+        assert!(known_hosts.contains("example.test ssh-ed25519 fixture-host-key"));
+        assert!(known_hosts.contains(GITHUB_SSH_RSA_KNOWN_HOST));
+
+        let mut job_environment = BTreeMap::new();
+        configure_checkout_ssh(&mut job_environment, Some(&credentials.command));
+        assert_eq!(
+            job_environment.get("GIT_SSH_COMMAND"),
+            Some(&credentials.command)
+        );
+        configure_checkout_ssh(&mut job_environment, None);
+        assert!(!job_environment.contains_key("GIT_SSH_COMMAND"));
+
+        {
+            let _guard = SensitiveDirectoryGuard(credential_directory.clone());
+        }
+        assert!(!credential_directory.exists());
+
+        for (name, value) in [
+            ("ssh-user", "-option".to_owned()),
+            (
+                "ssh-known-hosts",
+                "x".repeat(MAX_CHECKOUT_SSH_KNOWN_HOSTS_BYTES + 1),
+            ),
+            ("ssh-strict", "sometimes".to_owned()),
+        ] {
+            let mut invalid = inputs.clone();
+            invalid.insert(name.to_owned(), value);
+            assert!(
+                checkout_ssh_credentials(&invalid, &managed, &environment)
+                    .await
+                    .is_err(),
+                "accepted invalid {name}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn same_repository_checkout_persists_ssh_for_later_steps_and_keeps_exact_snapshot() {
+        let fixture = tempfile::tempdir().expect("SSH checkout tempdir");
+        let source = fixture.path().join("source");
+        let run_dir = fixture.path().join("runs").join(Uuid::new_v4().to_string());
+        let workspace = run_dir.join("workspace");
+        let runner_temp = run_dir.join("_temp/job-ssh");
+        for directory in [&source, &run_dir, &workspace, &runner_temp] {
+            std::fs::create_dir_all(directory).expect("fixture directory");
+        }
+        git(&source, ["init", "--initial-branch=main"]);
+        git(&source, ["config", "user.email", "gitzero@example.test"]);
+        git(&source, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(source.join("README.md"), "exact SSH snapshot\n").expect("fixture file");
+        git(&source, ["add", "README.md"]);
+        git(&source, ["commit", "-m", "SSH fixture"]);
+        let commit = git_output(&source, ["rev-parse", "HEAD"]);
+
+        let mut run = fixture_run(
+            Uuid::new_v4(),
+            commit.clone(),
+            commit.clone(),
+            "https://github.com/local/fixture.git".to_owned(),
+        );
+        run.pull_request.merge_sha = commit.clone();
+        let private_key =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-key\n-----END OPENSSH PRIVATE KEY-----";
+        let inputs = BTreeMap::from([
+            ("ssh-key".to_owned(), private_key.to_owned()),
+            ("ssh-user".to_owned(), "deploy".to_owned()),
+            ("persist-credentials".to_owned(), "true".to_owned()),
+            ("show-progress".to_owned(), "false".to_owned()),
+        ]);
+        let managed = BTreeSet::from([private_key.to_owned()]);
+        let mut environment =
+            BTreeMap::from([("RUNNER_TEMP".to_owned(), runner_temp.display().to_string())]);
+        let repository = checkout_repository(None, &run).expect("same repository");
+        let (outbound, _incoming) = mpsc::channel(64);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let repository_access = local_repository_access(&workflow_commands);
+
+        let outputs = execute_checkout_step_with_repository(
+            run.id,
+            "0/ssh-checkout",
+            &inputs,
+            &run,
+            &source,
+            &workspace,
+            &run_dir,
+            &mut environment,
+            "",
+            repository,
+            None,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+            &repository_access,
+            &managed,
+        )
+        .await
+        .expect("same-repository SSH checkout");
+        assert_eq!(outputs["commit"], commit);
+        assert_eq!(
+            git_output(&workspace, ["config", "--get", "remote.origin.url"]),
+            "deploy@github.com:local/fixture.git"
+        );
+        let command = environment
+            .get("GIT_SSH_COMMAND")
+            .expect("persisted SSH command");
+        assert!(!command.contains("fixture-key"));
+        assert!(runner_temp.join("_checkout-credentials").is_dir());
+
+        let credential_directory = runner_temp.join("_checkout-credentials");
+        {
+            let _guard = SensitiveDirectoryGuard(credential_directory.clone());
+        }
+        assert!(!credential_directory.exists());
     }
 
     #[test]
