@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 7;
+export const PROTOCOL_VERSION = 8;
 
 export const WORKFLOW_TOKEN_PERMISSIONS = [
   "actions",
@@ -137,6 +137,83 @@ const conclusionSchema = z.enum([
   "neutral",
 ]);
 
+const annotationCoordinate = z.number().int().min(1).max(2_147_483_647);
+const utf8Bytes = (value: string): number =>
+  new TextEncoder().encode(value).byteLength;
+export const checkAnnotationSchema = z
+  .object({
+    path: z
+      .string()
+      .min(1)
+      .refine((value) => utf8Bytes(value) <= 4_096)
+      .refine(
+        (value) =>
+          !value.startsWith("/") &&
+          !/^[A-Za-z]:[\\/]/.test(value) &&
+          !value.includes("\0") &&
+          !/[\r\n]/.test(value) &&
+          value
+            .split(/[\\/]/)
+            .every((component) => component !== ".." && component !== ""),
+        { message: "annotation path must be repository relative" },
+      ),
+    start_line: annotationCoordinate,
+    end_line: annotationCoordinate,
+    start_column: annotationCoordinate.nullable(),
+    end_column: annotationCoordinate.nullable(),
+    annotation_level: z.enum(["notice", "warning", "failure"]),
+    message: z
+      .string()
+      .min(1)
+      .refine((value) => utf8Bytes(value) <= 65_536),
+    title: z
+      .string()
+      .refine((value) => utf8Bytes(value) <= 255)
+      .nullable(),
+  })
+  .superRefine((annotation, context) => {
+    if (annotation.end_line < annotation.start_line) {
+      context.addIssue({
+        code: "custom",
+        path: ["end_line"],
+        message: "annotation end line precedes its start line",
+      });
+    }
+    if (
+      (annotation.start_column === null) !==
+      (annotation.end_column === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["start_column"],
+        message: "annotation columns must be both present or both absent",
+      });
+    }
+    if (
+      annotation.start_line !== annotation.end_line &&
+      (annotation.start_column !== null || annotation.end_column !== null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["start_column"],
+        message: "multi-line annotations cannot include columns",
+      });
+    }
+    if (
+      annotation.start_column !== null &&
+      annotation.end_column !== null &&
+      annotation.end_column < annotation.start_column
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["end_column"],
+        message: "annotation end column precedes its start column",
+      });
+    }
+  });
+
+export type CheckAnnotation = z.infer<typeof checkAnnotationSchema>;
+
 const runnerSelectorSchema = z
   .string()
   .trim()
@@ -246,6 +323,7 @@ export const agentMessageSchema = z.discriminatedUnion("type", [
     job_id: uuid,
     conclusion: conclusionSchema,
     summary: z.string().max(65_536),
+    annotations: z.array(checkAnnotationSchema).max(50).default([]),
   }),
 ]);
 

@@ -8,8 +8,9 @@ import {
   fetchActionsVariables,
   fetchActionsVariablesWithToken,
   fetchRepositoryOnboardingEvidence,
+  updateCheckRun,
 } from "../src/github";
-import type { QueuedJob } from "../src/protocol";
+import type { CheckAnnotation, QueuedJob } from "../src/protocol";
 
 const githubEnvironment = { GITHUB_API_VERSION: "2026-03-10" } as const;
 
@@ -623,6 +624,101 @@ describe("GitHub production API contracts", () => {
       status: "queued",
       external_id: "11111111-1111-4111-8111-111111111111",
     });
+  });
+
+  it("reconciles existing annotations before retrying a completed Check update", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const duplicate = {
+      path: "src/lib.rs",
+      start_line: 7,
+      end_line: 7,
+      start_column: 2,
+      end_column: 5,
+      annotation_level: "warning" as const,
+      message: "check this expression",
+      title: "Compiler",
+    };
+    const generic = {
+      path: ".github",
+      start_line: 1,
+      end_line: 1,
+      start_column: null,
+      end_column: null,
+      annotation_level: "failure" as const,
+      message: "tests failed",
+      title: null,
+    };
+    const desired: CheckAnnotation[] = [duplicate, duplicate, generic];
+    let existing: CheckAnnotation[] = [duplicate];
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        if (url.pathname.endsWith("/access_tokens")) {
+          return Response.json({ token: "check-token" });
+        }
+        if (url.pathname.endsWith("/annotations")) {
+          return Response.json(existing);
+        }
+        return Response.json({});
+      }),
+    );
+    const job = fixtureJob();
+    job.check_run_id = 44;
+    const environment = {
+      GITHUB_API_VERSION: "2026-03-10",
+      GITHUB_APP_ID: "1234",
+      GITHUB_APP_PRIVATE_KEY: privateKey,
+    };
+
+    await updateCheckRun(environment, job, {
+      status: "completed",
+      conclusion: "failure",
+      title: "GitZero failed",
+      summary: "lint failed",
+      annotations: desired,
+    });
+
+    expect(requests).toHaveLength(3);
+    expect(requests[1]?.url.pathname).toBe(
+      "/repos/acme/widget/check-runs/44/annotations",
+    );
+    expect(requests[1]?.url.searchParams.get("per_page")).toBe("100");
+    const firstUpdate = JSON.parse(String(requests[2]?.init?.body));
+    expect(firstUpdate.output.annotations).toEqual([
+      {
+        path: "src/lib.rs",
+        start_line: 7,
+        end_line: 7,
+        start_column: 2,
+        end_column: 5,
+        annotation_level: "warning",
+        message: "check this expression",
+        title: "Compiler",
+      },
+      {
+        path: ".github",
+        start_line: 1,
+        end_line: 1,
+        annotation_level: "failure",
+        message: "tests failed",
+      },
+    ]);
+
+    existing = desired;
+    requests.length = 0;
+    await updateCheckRun(environment, job, {
+      status: "completed",
+      conclusion: "failure",
+      title: "GitZero failed",
+      summary: "lint failed",
+      annotations: desired,
+    });
+    expect(requests).toHaveLength(3);
+    const retry = JSON.parse(String(requests[2]?.init?.body));
+    expect(retry.output).not.toHaveProperty("annotations");
   });
 
   it("recovers an exact existing Check before a retry can create a duplicate", async () => {

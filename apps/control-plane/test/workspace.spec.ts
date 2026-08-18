@@ -306,7 +306,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 7,
+          protocol_version: 8,
           agent_id: "mini-1",
           name: "Test Mini",
           version: "0.1.0",
@@ -317,7 +317,7 @@ describe("Workspace Durable Object", () => {
     );
 
     const [welcome, assignment] = await messages;
-    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 7 });
+    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 8 });
     expect(assignment).toMatchObject({
       type: "run_job",
       job: {
@@ -604,7 +604,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 7,
+          protocol_version: 8,
           agent_id: "mini-1",
           name: "duplicate",
           version: "0.1.0",
@@ -781,6 +781,16 @@ describe("Workspace Durable Object", () => {
 
     const markdown =
       "GitZero completed 1 step successfully.\n\n## Tests\n\n| suite | result |\n| --- | --- |\n| unit | ✅ |";
+    const annotation = {
+      path: "src/lib.rs",
+      start_line: 7,
+      end_line: 7,
+      start_column: 2,
+      end_column: 5,
+      annotation_level: "warning",
+      message: "check this expression",
+      title: "Compiler",
+    };
     const finished = collectMessageOfType(observer, "job_finished");
     acknowledgement = collectMessages(agent, 1);
     agent.send(
@@ -790,6 +800,7 @@ describe("Workspace Durable Object", () => {
         job_id: job.id,
         conclusion: "success",
         summary: markdown,
+        annotations: [annotation],
       }),
     );
     await acknowledgement;
@@ -799,6 +810,7 @@ describe("Workspace Durable Object", () => {
         job_id: job.id,
         conclusion: "success",
         summary: markdown,
+        annotation_count: 1,
       },
     });
 
@@ -816,6 +828,19 @@ describe("Workspace Durable Object", () => {
       conclusion: "success",
       summary: markdown,
     });
+    const annotations = await runInDurableObject(
+      workspace,
+      (_instance, state) =>
+        state.storage.sql
+          .exec<{ annotation_json: string }>(
+            `SELECT annotation_json FROM job_annotations
+             WHERE job_id = ? ORDER BY annotation_index`,
+            job.id,
+          )
+          .toArray()
+          .map((row) => JSON.parse(row.annotation_json)),
+    );
+    expect(annotations).toEqual([annotation]);
     agent.close(1000, "test complete");
     observer.close(1000, "test complete");
   });
@@ -1391,7 +1416,7 @@ async function connectAgentWithTargeting(
     JSON.stringify({
       type: "hello",
       hello: {
-        protocol_version: 7,
+        protocol_version: 8,
         agent_id: agentId,
         name: agentId,
         version: "0.1.0",

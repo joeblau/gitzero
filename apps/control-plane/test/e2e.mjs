@@ -261,6 +261,11 @@ try {
     );
     for (const queued of queuedJobs) {
       assertObserverLifecycle(observerEvents, queued.job_id);
+      const completion = observerEvents.find(
+        (event) =>
+          event.type === "job_finished" && event.data?.job_id === queued.job_id,
+      );
+      assert.equal(completion?.data?.annotation_count, 1);
     }
 
     for (const agentId of agentIds) {
@@ -327,6 +332,7 @@ jobs:
           test "$GITHUB_SHA" = "$GITZERO_E2E_HEAD_SHA"
           sleep 2
           printf 'gitzero-e2e-log\\n'
+          printf '::warning file=README.md,line=1,title=GitZero E2E::GitZero local E2E annotation marker\\n'
           printf 'GitZero local E2E summary marker\\n' >> "$GITHUB_STEP_SUMMARY"
 `,
   );

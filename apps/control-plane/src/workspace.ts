@@ -10,11 +10,13 @@ import {
 import {
   PROTOCOL_VERSION,
   agentMessageSchema,
+  checkAnnotationSchema,
   queuedJobSchema,
   runnerRequirementsSchema,
   runSpecSchema,
   type AgentHello,
   type AgentMessage,
+  type CheckAnnotation,
   type Conclusion,
   type ObserverEvent,
   type QueuedJob,
@@ -69,6 +71,10 @@ interface MinimumRow extends Record<string, SqlStorageValue> {
 
 interface ColumnRow extends Record<string, SqlStorageValue> {
   name: string;
+}
+
+interface AnnotationRow extends Record<string, SqlStorageValue> {
+  annotation_json: string;
 }
 
 interface ActiveJobRow extends Record<string, SqlStorageValue> {
@@ -453,6 +459,12 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
         content TEXT NOT NULL,
         PRIMARY KEY (job_id, chunk_index)
       );
+      CREATE TABLE IF NOT EXISTS job_annotations (
+        job_id TEXT NOT NULL,
+        annotation_index INTEGER NOT NULL,
+        annotation_json TEXT NOT NULL,
+        PRIMARY KEY (job_id, annotation_index)
+      );
       CREATE TABLE IF NOT EXISTS concurrency_leases (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         request_id TEXT NOT NULL UNIQUE,
@@ -535,6 +547,9 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
       INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (4);
       INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (5);
       INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (6);
+      CREATE INDEX IF NOT EXISTS job_annotations_job
+        ON job_annotations(job_id, annotation_index);
+      INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (7);
     `);
   }
 
@@ -1314,12 +1329,26 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
             message.job_id,
             agentId,
           );
+          this.ctx.storage.sql.exec(
+            "DELETE FROM job_annotations WHERE job_id = ?",
+            message.job_id,
+          );
+          for (const [index, annotation] of message.annotations.entries()) {
+            this.ctx.storage.sql.exec(
+              `INSERT INTO job_annotations (job_id, annotation_index, annotation_json)
+               VALUES (?, ?, ?)`,
+              message.job_id,
+              index,
+              JSON.stringify(annotation),
+            );
+          }
           const completed = this.jobRow(message.job_id);
           this.broadcast("job_finished", {
             job_id: message.job_id,
             agent_id: agentId,
             conclusion: message.conclusion,
             summary: message.summary,
+            annotation_count: message.annotations.length,
           });
           await this.syncCheck(completed);
           await this.tryDispatch();
@@ -1520,6 +1549,19 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
     return row;
   }
 
+  private jobAnnotations(jobId: string): CheckAnnotation[] {
+    return this.ctx.storage.sql
+      .exec<AnnotationRow>(
+        `SELECT annotation_json FROM job_annotations
+         WHERE job_id = ? ORDER BY annotation_index`,
+        jobId,
+      )
+      .toArray()
+      .map((row) =>
+        checkAnnotationSchema.parse(JSON.parse(row.annotation_json)),
+      );
+  }
+
   private async syncCheck(row: JobRow): Promise<void> {
     const job = parseJob(row.job_json);
     if (!job.report_to_github || job.check_run_id === null) {
@@ -1542,6 +1584,7 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
           conclusion: row.conclusion,
           title: checkTitle(row.conclusion),
           summary: row.summary ?? "GitZero completed the run.",
+          annotations: this.jobAnnotations(row.id),
         });
       } else {
         return;
@@ -1753,6 +1796,12 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
     );
     this.ctx.storage.sql.exec(
       `DELETE FROM job_event_chunks WHERE job_id IN (
+         SELECT id FROM jobs WHERE status = 'completed' AND completed_at < ?
+       )`,
+      cutoff,
+    );
+    this.ctx.storage.sql.exec(
+      `DELETE FROM job_annotations WHERE job_id IN (
          SELECT id FROM jobs WHERE status = 'completed' AND completed_at < ?
        )`,
       cutoff,

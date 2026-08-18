@@ -40,4 +40,66 @@ describe("agent protocol", () => {
       ).toBe(false);
     }
   });
+
+  it("accepts bounded repository-relative Check annotations", () => {
+    expect(
+      agentMessageSchema.parse({
+        type: "job_finished",
+        message_id: baseRequest.message_id,
+        job_id: baseRequest.job_id,
+        conclusion: "failure",
+        summary: "lint failed",
+        annotations: [
+          {
+            path: "src/main.ts",
+            start_line: 4,
+            end_line: 4,
+            start_column: 2,
+            end_column: 8,
+            annotation_level: "failure",
+            message: "invalid syntax",
+            title: "Compiler",
+          },
+        ],
+      }),
+    ).toMatchObject({
+      annotations: [
+        {
+          path: "src/main.ts",
+          annotation_level: "failure",
+        },
+      ],
+    });
+  });
+
+  it("rejects unsafe annotation paths and invalid ranges", () => {
+    const annotation = {
+      path: "src/main.ts",
+      start_line: 4,
+      end_line: 4,
+      start_column: null,
+      end_column: null,
+      annotation_level: "warning",
+      message: "check this",
+      title: null,
+    };
+    for (const invalid of [
+      { ...annotation, path: "../secret" },
+      { ...annotation, end_line: 3 },
+      { ...annotation, start_column: 2 },
+      { ...annotation, end_line: 5, start_column: 2, end_column: 3 },
+      { ...annotation, start_column: 8, end_column: 2 },
+    ]) {
+      expect(
+        agentMessageSchema.safeParse({
+          type: "job_finished",
+          message_id: baseRequest.message_id,
+          job_id: baseRequest.job_id,
+          conclusion: "failure",
+          summary: "lint failed",
+          annotations: [invalid],
+        }).success,
+      ).toBe(false);
+    }
+  });
 });

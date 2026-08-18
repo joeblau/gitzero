@@ -306,6 +306,7 @@ async fn handle_server_message(
                             job_id,
                             conclusion: Conclusion::Failure,
                             summary: format!("Agent execution error: {error:#}"),
+                            annotations: Vec::new(),
                         })
                         .await;
                 }

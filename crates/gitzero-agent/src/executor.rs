@@ -15,7 +15,9 @@ use gitzero_expression::{
     EvaluationContext, ExecutionStatus, ExpressionAnalysis, analyze_expression, analyze_template,
 };
 use gitzero_protocol::{
-    AgentMessage, Conclusion, ConcurrencyQueue, LogStream, MAX_RUNNER_LABELS,
+    AgentMessage, CheckAnnotation, CheckAnnotationLevel, Conclusion, ConcurrencyQueue, LogStream,
+    MAX_CHECK_ANNOTATION_MESSAGE_BYTES, MAX_CHECK_ANNOTATION_PATH_BYTES,
+    MAX_CHECK_ANNOTATION_TITLE_BYTES, MAX_CHECK_ANNOTATIONS, MAX_RUNNER_LABELS,
     MAX_RUNNER_REQUIREMENTS, MAX_RUNNER_SELECTOR_BYTES, RunSpec, RunnerRequirement,
 };
 use gitzero_workflow::{
@@ -56,6 +58,8 @@ const MAX_DYNAMIC_MASKS_PER_JOB: usize = 1_024;
 const MAX_DYNAMIC_MASK_BYTES_PER_JOB: usize = 1_024 * 1_024;
 const MAX_LEGACY_COMMAND_VALUES_PER_STEP: usize = 1_024;
 const MAX_LEGACY_COMMAND_BYTES_PER_STEP: usize = 1_024 * 1_024;
+const MAX_ERROR_ANNOTATIONS_PER_STEP: usize = 10;
+const MAX_WARNING_ANNOTATIONS_PER_STEP: usize = 10;
 const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(360 * 60);
 const ENVIRONMENT_VARIABLE_PAGE_SIZE: usize = 30;
 const MAX_ENVIRONMENT_VARIABLES: usize = 100;
@@ -323,7 +327,7 @@ impl Executor {
         let mut secrets = secret_values(&run);
         secrets.push(runtime_token);
         let workflow_commands = Arc::new(StdMutex::new(
-            WorkflowCommandProcessor::with_global_masks(secrets.clone()),
+            WorkflowCommandProcessor::with_global_masks(secrets.clone(), repository_dir.clone()),
         ));
         let repository_access =
             RunRepositoryAccess::new(repository_access, workflow_commands.clone());
@@ -514,6 +518,7 @@ impl Executor {
                 job_id: run.id,
                 conclusion,
                 summary,
+                annotations: Vec::new(),
             },
         )
         .await;
@@ -7436,12 +7441,28 @@ async fn relay_masked_events(
                     .expect("workflow command processor was poisoned")
                     .finish_step(step_id)?;
             }
-            AgentMessage::JobFinished { summary, .. } => {
+            AgentMessage::JobFinished {
+                summary,
+                annotations,
+                ..
+            } => {
                 mask_text(summary, &secrets);
-                commands
+                let mut commands = commands
                     .lock()
-                    .expect("workflow command processor was poisoned")
-                    .mask_all(summary);
+                    .expect("workflow command processor was poisoned");
+                commands.mask_all(summary);
+                *annotations = commands.take_annotations();
+                for annotation in annotations {
+                    mask_text(&mut annotation.path, &secrets);
+                    mask_text(&mut annotation.message, &secrets);
+                    commands.mask_all(&mut annotation.path);
+                    commands.mask_all(&mut annotation.message);
+                    if let Some(title) = &mut annotation.title {
+                        mask_text(title, &secrets);
+                        commands.mask_all(title);
+                    }
+                    bound_masked_annotation(annotation);
+                }
             }
             AgentMessage::JobRejected { reason, .. } => {
                 mask_text(reason, &secrets);
@@ -7471,8 +7492,17 @@ struct WorkflowCommandProcessor {
     global_masks: Vec<String>,
     scopes: BTreeMap<String, WorkflowCommandScope>,
     legacy_values: BTreeMap<String, LegacyCommandValues>,
+    workspace: Option<PathBuf>,
+    annotations: Vec<CheckAnnotation>,
+    annotation_counts: BTreeMap<(String, CheckAnnotationLevel), usize>,
     partial_commands: BTreeMap<(String, u8), String>,
     fatal_error: Option<String>,
+}
+
+enum WorkflowLineDisposition {
+    Original,
+    Suppress,
+    Replace(String),
 }
 
 #[derive(Default)]
@@ -7491,11 +7521,12 @@ struct LegacyCommandValues {
 }
 
 impl WorkflowCommandProcessor {
-    fn with_global_masks(mut masks: Vec<String>) -> Self {
+    fn with_global_masks(mut masks: Vec<String>, workspace: PathBuf) -> Self {
         masks.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
         masks.dedup();
         Self {
             global_masks: masks,
+            workspace: Some(workspace),
             ..Self::default()
         }
     }
@@ -7556,15 +7587,22 @@ impl WorkflowCommandProcessor {
         let mut visible = String::with_capacity(data.len());
         for segment in data.split_inclusive('\n') {
             let line = segment.trim_end_matches(['\r', '\n']);
-            if !self.process_line(step_id, line)? {
-                visible.push_str(segment);
+            match self.process_line(step_id, line)? {
+                WorkflowLineDisposition::Original => visible.push_str(segment),
+                WorkflowLineDisposition::Suppress => {}
+                WorkflowLineDisposition::Replace(replacement) => {
+                    visible.push_str(&replacement);
+                    if segment.ends_with('\n') {
+                        visible.push('\n');
+                    }
+                }
             }
         }
         *data = visible;
         Ok(())
     }
 
-    fn process_line(&mut self, step_id: &str, line: &str) -> Result<bool> {
+    fn process_line(&mut self, step_id: &str, line: &str) -> Result<WorkflowLineDisposition> {
         let scope_id = workflow_command_scope(step_id);
         if let Some(token) = self
             .scopes
@@ -7573,9 +7611,9 @@ impl WorkflowCommandProcessor {
         {
             if line == format!("::{token}::") {
                 self.scopes.entry(scope_id).or_default().stop_token = None;
-                return Ok(true);
+                return Ok(WorkflowLineDisposition::Suppress);
             }
-            return Ok(false);
+            return Ok(WorkflowLineDisposition::Original);
         }
         if let Some(value) = strip_prefix_ignore_ascii_case(line, "::add-mask::") {
             let value = decode_workflow_command_data(value);
@@ -7583,24 +7621,52 @@ impl WorkflowCommandProcessor {
                 .entry(scope_id)
                 .or_default()
                 .register_mask(&value)?;
-            return Ok(true);
+            return Ok(WorkflowLineDisposition::Suppress);
         }
         if let Some(token) = strip_prefix_ignore_ascii_case(line, "::stop-commands::") {
             let token = decode_workflow_command_data(token);
             if !token.is_empty() {
                 self.scopes.entry(scope_id).or_default().stop_token = Some(token);
             }
-            return Ok(true);
+            return Ok(WorkflowLineDisposition::Suppress);
+        }
+        if let Some(annotation) = parse_workflow_annotation(line, self.workspace.as_deref())? {
+            let visible = annotation_log_line(&annotation);
+            self.record_annotation(step_id, annotation);
+            return Ok(WorkflowLineDisposition::Replace(visible));
         }
         if let Some((name, value)) = parse_named_workflow_command(line, "set-output")? {
             self.record_legacy_value(step_id, name, value, false)?;
-            return Ok(true);
+            return Ok(WorkflowLineDisposition::Suppress);
         }
         if let Some((name, value)) = parse_named_workflow_command(line, "save-state")? {
             self.record_legacy_value(step_id, name, value, true)?;
-            return Ok(true);
+            return Ok(WorkflowLineDisposition::Suppress);
         }
-        Ok(false)
+        Ok(WorkflowLineDisposition::Original)
+    }
+
+    fn record_annotation(&mut self, step_id: &str, annotation: CheckAnnotation) {
+        let per_step_limit = match annotation.annotation_level {
+            CheckAnnotationLevel::Failure => Some(MAX_ERROR_ANNOTATIONS_PER_STEP),
+            CheckAnnotationLevel::Warning => Some(MAX_WARNING_ANNOTATIONS_PER_STEP),
+            CheckAnnotationLevel::Notice => None,
+        };
+        if let Some(limit) = per_step_limit {
+            let key = (step_id.to_owned(), annotation.annotation_level);
+            let count = self.annotation_counts.entry(key).or_default();
+            if *count >= limit {
+                return;
+            }
+            *count += 1;
+        }
+        if self.annotations.len() < MAX_CHECK_ANNOTATIONS {
+            self.annotations.push(annotation);
+        }
+    }
+
+    fn take_annotations(&mut self) -> Vec<CheckAnnotation> {
+        std::mem::take(&mut self.annotations)
     }
 
     fn record_legacy_value(
@@ -7667,6 +7733,7 @@ impl WorkflowCommandProcessor {
                     || strip_prefix_ignore_ascii_case(line, "::stop-commands::").is_some()
                     || strip_prefix_ignore_ascii_case(line, "::set-output ").is_some()
                     || strip_prefix_ignore_ascii_case(line, "::save-state ").is_some()
+                    || is_annotation_workflow_command(line)
             }
         }
     }
@@ -7786,6 +7853,197 @@ fn decode_workflow_command_property(value: &str) -> String {
         .replace("%2C", ",")
         .replace("%2c", ",")
         .replace("%25", "%")
+}
+
+fn is_annotation_workflow_command(line: &str) -> bool {
+    let Some(body) = line.strip_prefix("::") else {
+        return false;
+    };
+    let header = body.split_once("::").map_or(body, |(header, _)| header);
+    let command = header
+        .split_once(' ')
+        .map_or(header, |(command, _)| command);
+    matches!(
+        command.to_ascii_lowercase().as_str(),
+        "notice" | "warning" | "error"
+    )
+}
+
+fn parse_workflow_annotation(
+    line: &str,
+    workspace: Option<&Path>,
+) -> Result<Option<CheckAnnotation>> {
+    if !is_annotation_workflow_command(line) {
+        return Ok(None);
+    }
+    let body = line
+        .strip_prefix("::")
+        .expect("annotation workflow command has a prefix");
+    let (header, data) = body
+        .split_once("::")
+        .context("annotation workflow command is missing its data delimiter")?;
+    let (command, property_text) = header.split_once(' ').unwrap_or((header, ""));
+    let annotation_level = match command.to_ascii_lowercase().as_str() {
+        "notice" => CheckAnnotationLevel::Notice,
+        "warning" => CheckAnnotationLevel::Warning,
+        "error" => CheckAnnotationLevel::Failure,
+        _ => return Ok(None),
+    };
+    let mut properties = BTreeMap::new();
+    for property in property_text
+        .split(',')
+        .filter(|property| !property.is_empty())
+    {
+        let (key, value) = property
+            .split_once('=')
+            .context("annotation workflow command contains a property without a value")?;
+        properties.insert(
+            key.trim().to_ascii_lowercase(),
+            decode_workflow_command_property(value),
+        );
+    }
+
+    let message = decode_workflow_command_data(data);
+    if message.is_empty()
+        || message.len() > MAX_CHECK_ANNOTATION_MESSAGE_BYTES
+        || message.contains('\0')
+    {
+        bail!("annotation workflow command contains an invalid message");
+    }
+    let path = normalize_annotation_path(
+        properties
+            .get("file")
+            .map(String::as_str)
+            .unwrap_or(".github"),
+        workspace,
+    )?;
+    let start_line = annotation_coordinate(&properties, "line")?.unwrap_or(1);
+    let end_line = annotation_coordinate(&properties, "endline")?.unwrap_or(start_line);
+    if end_line < start_line {
+        bail!("annotation workflow command endLine precedes line");
+    }
+    let start_column = annotation_coordinate(&properties, "col")?;
+    let end_column = annotation_coordinate(&properties, "endcolumn")?;
+    let (start_column, end_column) = if start_line == end_line {
+        match (start_column, end_column) {
+            (None, None) => (None, None),
+            (Some(start), None) => (Some(start), Some(start)),
+            (None, Some(end)) => (Some(end), Some(end)),
+            (Some(start), Some(end)) if end >= start => (Some(start), Some(end)),
+            (Some(_), Some(_)) => {
+                bail!("annotation workflow command endColumn precedes col")
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let title = properties
+        .get("title")
+        .filter(|title| !title.is_empty())
+        .cloned();
+    if title
+        .as_ref()
+        .is_some_and(|title| title.len() > MAX_CHECK_ANNOTATION_TITLE_BYTES || title.contains('\0'))
+    {
+        bail!("annotation workflow command contains an invalid title");
+    }
+    Ok(Some(CheckAnnotation {
+        path,
+        start_line,
+        end_line,
+        start_column,
+        end_column,
+        annotation_level,
+        message,
+        title,
+    }))
+}
+
+fn annotation_coordinate(properties: &BTreeMap<String, String>, name: &str) -> Result<Option<u32>> {
+    let Some(value) = properties.get(name) else {
+        return Ok(None);
+    };
+    let coordinate = value.parse::<u32>().with_context(|| {
+        format!("annotation workflow command property '{name}' is not an integer")
+    })?;
+    if coordinate == 0 || coordinate > i32::MAX as u32 {
+        bail!("annotation workflow command property '{name}' is outside GitHub's range");
+    }
+    Ok(Some(coordinate))
+}
+
+fn normalize_annotation_path(value: &str, workspace: Option<&Path>) -> Result<String> {
+    let value = value.replace('\\', "/");
+    let candidate = Path::new(&value);
+    let relative = if candidate.is_absolute() {
+        workspace
+            .and_then(|workspace| candidate.strip_prefix(workspace).ok())
+            .unwrap_or_else(|| Path::new(".github"))
+    } else if value.as_bytes().get(1) == Some(&b':') {
+        Path::new(".github")
+    } else {
+        candidate
+    };
+    let mut normalized = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(component) => normalized.push(
+                component
+                    .to_str()
+                    .context("annotation workflow command path is not UTF-8")?,
+            ),
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                normalized.clear();
+                normalized.push(".github");
+                break;
+            }
+        }
+    }
+    let path = if normalized.is_empty() {
+        ".github".to_owned()
+    } else {
+        normalized.join("/")
+    };
+    if path.len() > MAX_CHECK_ANNOTATION_PATH_BYTES || path.contains(['\0', '\r', '\n']) {
+        bail!("annotation workflow command contains an invalid file path");
+    }
+    Ok(path)
+}
+
+fn annotation_log_line(annotation: &CheckAnnotation) -> String {
+    let level = match annotation.annotation_level {
+        CheckAnnotationLevel::Notice => "notice",
+        CheckAnnotationLevel::Warning => "warning",
+        CheckAnnotationLevel::Failure => "error",
+    };
+    match &annotation.title {
+        Some(title) => format!("{level}: {title}: {}", annotation.message),
+        None => format!("{level}: {}", annotation.message),
+    }
+}
+
+fn bound_masked_annotation(annotation: &mut CheckAnnotation) {
+    if annotation.path.len() > MAX_CHECK_ANNOTATION_PATH_BYTES {
+        annotation.path = ".github".to_owned();
+    }
+    truncate_utf8_bytes(&mut annotation.message, MAX_CHECK_ANNOTATION_MESSAGE_BYTES);
+    if let Some(title) = &mut annotation.title {
+        truncate_utf8_bytes(title, MAX_CHECK_ANNOTATION_TITLE_BYTES);
+    }
+}
+
+fn truncate_utf8_bytes(value: &mut String, maximum: usize) {
+    if value.len() <= maximum {
+        return;
+    }
+    let mut boundary = maximum;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
 }
 
 fn parse_named_workflow_command(line: &str, command: &str) -> Result<Option<(String, String)>> {
@@ -9236,6 +9494,7 @@ jobs:
                 job_id,
                 conclusion: Conclusion::Success,
                 summary: "Mona secret%value paused-secret after-stop-secret".to_owned(),
+                annotations: Vec::new(),
             })
             .await
             .expect("final summary");
@@ -9289,6 +9548,147 @@ jobs:
             AgentMessage::JobFinished { summary, .. }
                 if summary == "*** *** paused-secret ***"
         )));
+    }
+
+    #[tokio::test]
+    async fn workflow_commands_publish_bounded_masked_check_annotations() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        let source = directory.path().join("src/lib.rs");
+        let job_id = Uuid::new_v4();
+        let (input, incoming) = mpsc::channel(64);
+        let (outbound, mut output) = mpsc::channel(64);
+        let commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::with_global_masks(
+            Vec::new(),
+            directory.path().to_path_buf(),
+        )));
+        let relay = tokio::spawn(relay_masked_events(
+            incoming,
+            outbound,
+            vec!["sensitive".to_owned()],
+            commands,
+        ));
+        let log = |sequence: u64, data: String| AgentMessage::LogChunk {
+            message_id: Uuid::new_v4(),
+            job_id,
+            step_id: "0/job-a/annotate".to_owned(),
+            sequence,
+            stream: LogStream::Stdout,
+            data,
+        };
+
+        input
+            .send(log(
+                0,
+                format!(
+                    "::warning file={},line=3,col=2,endColumn=4,title=sensitive%3Atitle::leak sensitive%25value\n",
+                    source.display()
+                ),
+            ))
+            .await
+            .expect("file annotation");
+        input
+            .send(log(1, "::error::generic failure\n".to_owned()))
+            .await
+            .expect("default annotation");
+        input
+            .send(log(
+                2,
+                "::notice file=README.md,line=4,endLine=5,col=9::multiline notice\n".to_owned(),
+            ))
+            .await
+            .expect("multiline annotation");
+        for index in 0..10 {
+            input
+                .send(log(
+                    3 + index,
+                    format!("::warning file=README.md,line=1::warning-{index}\n"),
+                ))
+                .await
+                .expect("bounded warning");
+        }
+        input
+            .send(AgentMessage::JobFinished {
+                message_id: Uuid::new_v4(),
+                job_id,
+                conclusion: Conclusion::Failure,
+                summary: "annotation run".to_owned(),
+                annotations: Vec::new(),
+            })
+            .await
+            .expect("finish annotated job");
+        drop(input);
+        relay.await.expect("join relay").expect("relay annotations");
+
+        let mut events = Vec::new();
+        while let Some(message) = output.recv().await {
+            events.push(message);
+        }
+        assert!(events.iter().any(|message| matches!(
+            message,
+            AgentMessage::LogChunk { data, .. }
+                if data == "warning: ***:title: leak ***%value\n"
+        )));
+        let annotations = events
+            .iter()
+            .find_map(|message| match message {
+                AgentMessage::JobFinished { annotations, .. } => Some(annotations),
+                _ => None,
+            })
+            .expect("annotated completion");
+        assert_eq!(annotations.len(), 12);
+        assert_eq!(annotations[0].path, "src/lib.rs");
+        assert_eq!(annotations[0].start_line, 3);
+        assert_eq!(annotations[0].start_column, Some(2));
+        assert_eq!(annotations[0].end_column, Some(4));
+        assert_eq!(annotations[0].title.as_deref(), Some("***:title"));
+        assert_eq!(annotations[0].message, "leak ***%value");
+        assert_eq!(annotations[1].path, ".github");
+        assert_eq!(annotations[1].start_line, 1);
+        assert_eq!(
+            annotations[1].annotation_level,
+            CheckAnnotationLevel::Failure
+        );
+        assert_eq!(annotations[2].start_column, None);
+        assert_eq!(annotations[2].end_column, None);
+        assert_eq!(
+            annotations
+                .iter()
+                .filter(|annotation| annotation.annotation_level == CheckAnnotationLevel::Warning)
+                .count(),
+            MAX_WARNING_ANNOTATIONS_PER_STEP
+        );
+        assert!(annotations.iter().all(|annotation| {
+            !annotation.path.contains("sensitive")
+                && !annotation.message.contains("sensitive")
+                && annotation
+                    .title
+                    .as_ref()
+                    .is_none_or(|title| !title.contains("sensitive"))
+        }));
+
+        let mut expanded = CheckAnnotation {
+            path: "x".repeat(MAX_CHECK_ANNOTATION_PATH_BYTES),
+            start_line: 1,
+            end_line: 1,
+            start_column: None,
+            end_column: None,
+            annotation_level: CheckAnnotationLevel::Notice,
+            message: "x".repeat(MAX_CHECK_ANNOTATION_MESSAGE_BYTES),
+            title: Some("x".repeat(MAX_CHECK_ANNOTATION_TITLE_BYTES)),
+        };
+        mask_text(&mut expanded.path, &["x".to_owned()]);
+        mask_text(&mut expanded.message, &["x".to_owned()]);
+        mask_text(
+            expanded.title.as_mut().expect("expanded title"),
+            &["x".to_owned()],
+        );
+        bound_masked_annotation(&mut expanded);
+        assert_eq!(expanded.path, ".github");
+        assert_eq!(expanded.message.len(), MAX_CHECK_ANNOTATION_MESSAGE_BYTES);
+        assert_eq!(
+            expanded.title.as_ref().expect("bounded title").len(),
+            MAX_CHECK_ANNOTATION_TITLE_BYTES
+        );
     }
 
     #[test]

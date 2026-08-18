@@ -3,10 +3,14 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const MAX_RUNNER_LABELS: usize = 32;
 pub const MAX_RUNNER_REQUIREMENTS: usize = 512;
 pub const MAX_RUNNER_SELECTOR_BYTES: usize = 256;
+pub const MAX_CHECK_ANNOTATIONS: usize = 50;
+pub const MAX_CHECK_ANNOTATION_PATH_BYTES: usize = 4_096;
+pub const MAX_CHECK_ANNOTATION_MESSAGE_BYTES: usize = 65_536;
+pub const MAX_CHECK_ANNOTATION_TITLE_BYTES: usize = 255;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentHello {
@@ -247,6 +251,7 @@ pub enum AgentMessage {
         job_id: Uuid,
         conclusion: Conclusion,
         summary: String,
+        annotations: Vec<CheckAnnotation>,
     },
 }
 
@@ -266,6 +271,26 @@ pub enum Conclusion {
     Cancelled,
     TimedOut,
     Neutral,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckAnnotationLevel {
+    Notice,
+    Warning,
+    Failure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckAnnotation {
+    pub path: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub start_column: Option<u32>,
+    pub end_column: Option<u32>,
+    pub annotation_level: CheckAnnotationLevel,
+    pub message: String,
+    pub title: Option<String>,
 }
 
 fn default_github_api_version() -> String {
@@ -383,6 +408,29 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AgentMessage>(&json).expect("deserialize workflow token"),
             workflow_request
+        );
+
+        let annotated = AgentMessage::JobFinished {
+            message_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            conclusion: Conclusion::Failure,
+            summary: "lint failed".into(),
+            annotations: vec![CheckAnnotation {
+                path: "src/lib.rs".into(),
+                start_line: 7,
+                end_line: 7,
+                start_column: Some(2),
+                end_column: Some(5),
+                annotation_level: CheckAnnotationLevel::Failure,
+                message: "invalid syntax".into(),
+                title: Some("Compiler".into()),
+            }],
+        };
+        let json = serde_json::to_string(&annotated).expect("serialize annotations");
+        assert!(json.contains(r#""annotation_level":"failure""#));
+        assert_eq!(
+            serde_json::from_str::<AgentMessage>(&json).expect("deserialize annotations"),
+            annotated
         );
     }
 

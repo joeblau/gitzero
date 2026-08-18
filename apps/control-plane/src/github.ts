@@ -3,6 +3,8 @@ import { z } from "zod";
 import {
   WORKFLOW_TOKEN_PERMISSIONS,
   WORKFLOW_WRITE_PERMISSIONS,
+  checkAnnotationSchema,
+  type CheckAnnotation,
   type Conclusion,
   type QueuedJob,
 } from "./protocol";
@@ -55,6 +57,19 @@ const checkRunRecoveryPageSchema = z.object({
     }),
   ),
 });
+
+const checkRunAnnotationsSchema = z.array(
+  z.object({
+    path: z.string(),
+    start_line: z.number().int(),
+    end_line: z.number().int(),
+    start_column: z.number().int().nullable().optional(),
+    end_column: z.number().int().nullable().optional(),
+    annotation_level: z.enum(["notice", "warning", "failure"]),
+    message: z.string(),
+    title: z.string().nullable().optional(),
+  }),
+);
 
 type ActionsVariable = z.infer<
   typeof actionsVariablePageSchema
@@ -149,6 +164,7 @@ export async function updateCheckRun(
         conclusion: Conclusion;
         title: string;
         summary: string;
+        annotations: CheckAnnotation[];
       },
 ): Promise<void> {
   if (job.check_run_id === null) {
@@ -159,6 +175,19 @@ export async function updateCheckRun(
     job.installation_id,
     job.repository.name,
   );
+  const repositoryPath = `/repos/${encodeURIComponent(job.repository.owner)}/${encodeURIComponent(job.repository.name)}`;
+  const annotations =
+    update.status === "completed" && update.annotations.length > 0
+      ? missingCheckAnnotations(
+          update.annotations,
+          await fetchCheckAnnotations(
+            env,
+            token,
+            repositoryPath,
+            job.check_run_id,
+          ),
+        )
+      : [];
   const body =
     update.status === "completed"
       ? {
@@ -168,6 +197,9 @@ export async function updateCheckRun(
           output: {
             title: update.title,
             summary: truncate(update.summary, 65_535),
+            ...(annotations.length > 0
+              ? { annotations: annotations.map(githubCheckAnnotation) }
+              : {}),
           },
         }
       : {
@@ -181,9 +213,81 @@ export async function updateCheckRun(
   await githubRequest(
     env,
     token,
-    `/repos/${encodeURIComponent(job.repository.owner)}/${encodeURIComponent(job.repository.name)}/check-runs/${job.check_run_id}`,
+    `${repositoryPath}/check-runs/${job.check_run_id}`,
     { method: "PATCH", body: JSON.stringify(body) },
   );
+}
+
+async function fetchCheckAnnotations(
+  env: GitHubApiEnvironment,
+  token: string,
+  repositoryPath: string,
+  checkRunId: number,
+): Promise<CheckAnnotation[]> {
+  const response = checkRunAnnotationsSchema.parse(
+    await githubRequest(
+      env,
+      token,
+      `${repositoryPath}/check-runs/${checkRunId}/annotations?per_page=100`,
+      { method: "GET" },
+    ),
+  );
+  return response.map((annotation) =>
+    checkAnnotationSchema.parse({
+      ...annotation,
+      start_column: annotation.start_column ?? null,
+      end_column: annotation.end_column ?? null,
+      title: annotation.title ?? null,
+    }),
+  );
+}
+
+function missingCheckAnnotations(
+  desired: readonly CheckAnnotation[],
+  existing: readonly CheckAnnotation[],
+): CheckAnnotation[] {
+  const existingCounts = new Map<string, number>();
+  for (const annotation of existing) {
+    const key = checkAnnotationKey(annotation);
+    existingCounts.set(key, (existingCounts.get(key) ?? 0) + 1);
+  }
+  return desired.filter((annotation) => {
+    const key = checkAnnotationKey(annotation);
+    const remaining = existingCounts.get(key) ?? 0;
+    if (remaining === 0) return true;
+    existingCounts.set(key, remaining - 1);
+    return false;
+  });
+}
+
+function checkAnnotationKey(annotation: CheckAnnotation): string {
+  return JSON.stringify([
+    annotation.path,
+    annotation.start_line,
+    annotation.end_line,
+    annotation.start_column,
+    annotation.end_column,
+    annotation.annotation_level,
+    annotation.message,
+    annotation.title,
+  ]);
+}
+
+function githubCheckAnnotation(annotation: CheckAnnotation): object {
+  return {
+    path: annotation.path,
+    start_line: annotation.start_line,
+    end_line: annotation.end_line,
+    ...(annotation.start_column === null
+      ? {}
+      : {
+          start_column: annotation.start_column,
+          end_column: annotation.end_column,
+        }),
+    annotation_level: annotation.annotation_level,
+    message: annotation.message,
+    ...(annotation.title === null ? {} : { title: annotation.title }),
+  };
 }
 
 export async function createAgentTokens(
