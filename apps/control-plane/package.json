@@ -1,0 +1,29 @@
+{
+  "name": "@gitzero/control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "check": "wrangler types --env-file .types.vars --check && tsc --noEmit",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "format": "prettier --write src test package.json tsconfig.json wrangler.jsonc vitest.config.ts",
+    "test": "vitest run",
+    "test:e2e": "node test/e2e.mjs",
+    "types": "wrangler types --env-file .types.vars"
+  },
+  "dependencies": {
+    "jose": "6.2.9",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.21.3",
+    "@cloudflare/workers-types": "5.20260817.1",
+    "prettier": "3.6.2",
+    "typescript": "7.0.2",
+    "vitest": "4.1.10",
+    "wrangler": "4.123.0",
+    "ws": "8.21.0"
+  }
+}

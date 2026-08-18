@@ -1,0 +1,15 @@
+name: CI
+
+on:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test
+        run: |
+          npm ci
+          npm test
+          npm run check

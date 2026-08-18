@@ -1,0 +1,9 @@
+/target/
+node_modules/
+/apps/control-plane/dist/
+.wrangler/
+.dev.vars
+.env
+*.pem
+*.key
+.DS_Store

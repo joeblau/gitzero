@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.gitzero.agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/libexec/gitzero-agent</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>GITZERO_CONTROL_PLANE</key>
+    <string>https://gitzero.example.com</string>
+    <key>GITZERO_WORKSPACE_ID</key>
+    <string>configure-me</string>
+    <key>GITZERO_AGENT_TOKEN</key>
+    <string>configure-me</string>
+    <key>GITZERO_AGENT_ID</key>
+    <string>configure-me</string>
+    <key>GITZERO_AGENT_NAME</key>
+    <string>configure-me</string>
+    <key>GITZERO_WORK_ROOT</key>
+    <string>/Library/Application Support/GitZero/work</string>
+    <key>GITZERO_MAX_PARALLELISM</key>
+    <string>1</string>
+    <key>GITZERO_CACHE_MAX_BYTES</key>
+    <string>10737418240</string>
+    <key>GITZERO_CACHE_MAX_ENTRY_BYTES</key>
+    <string>2147483648</string>
+    <key>GITZERO_ARTIFACT_MAX_BYTES</key>
+    <string>10737418240</string>
+    <key>GITZERO_ARTIFACT_MAX_ENTRY_BYTES</key>
+    <string>2147483648</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>RUST_LOG</key>
+    <string>gitzero_agent=info</string>
+  </dict>
+  <key>KeepAlive</key>
+  <true/>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>/Library/Logs/GitZero/agent.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Library/Logs/GitZero/agent-error.log</string>
+</dict>
+</plist>

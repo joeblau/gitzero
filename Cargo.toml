@@ -1,0 +1,47 @@
+[workspace]
+members = [
+  "crates/gitzero-agent",
+  "crates/gitzero-expression",
+  "crates/gitzero-protocol",
+  "crates/gitzero-workflow",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.96"
+
+[workspace.dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+base64 = "0.23.1"
+clap = { version = "4.6.6", features = ["derive", "env"] }
+futures-util = "0.3.34"
+github-actions-expressions = "1.30.0-rc1"
+globset = { version = "0.4.20", default-features = false }
+indexmap = { version = "2.14.0", features = ["serde"] }
+libc = "0.2.189"
+regex = "1.13.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml_ng = "0.10.0"
+sha2 = "0.11.0"
+shell-words = "1.1.1"
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.18", features = ["io"] }
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "json"] }
+uuid = { version = "1.24.1", features = ["serde", "v4"] }
+walkdir = "2.5.0"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = "symbols"

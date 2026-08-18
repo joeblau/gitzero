@@ -1,0 +1,53 @@
+# macOS agent installation
+
+Build the optimized agent on the same architecture as the target Mac:
+
+```sh
+rustup toolchain install 1.96.1
+cargo build --release -p gitzero-agent
+```
+
+Install Git and Node.js 24 on the target. Git 2.28 or newer is required by workflows that use `actions/checkout` sparse patterns. JavaScript actions execute with the machine's `node` binary; the launchd service searches `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, and `/bin`.
+
+Create or choose a dedicated non-administrator macOS user. Then run the installer from the repository checkout:
+
+```sh
+print -rn -- "$GITZERO_AGENT_TOKEN" | sudo packaging/macos/install.sh \
+  --binary target/release/gitzero-agent \
+  --control-plane https://<worker-host> \
+  --workspace <github-installation-id> \
+  --token-stdin \
+  --user <dedicated-user> \
+  --agent-id <unique-mac-id> \
+  --labels xcode-16,signing \
+  --runner-group release-minis \
+  --parallelism 1 \
+  --cache-max-bytes 10737418240 \
+  --cache-max-entry-bytes 2147483648 \
+  --artifact-max-bytes 10737418240 \
+  --artifact-max-entry-bytes 2147483648
+```
+
+The token must be minted for the same installation ID and agent ID using the administrator-authenticated endpoint described in [github-app.md](github-app.md). The Worker's `AGENT_SHARED_TOKEN` signing key must never be copied to an agent.
+
+The installer places the root-owned binary in `/usr/local/libexec`, writes a mode-0600 launchd plist, and creates the work and log directories for the chosen user. Reading the credential from standard input keeps it out of the installer process arguments; the launched process also receives it only through its protected launchd environment.
+
+Verify the service:
+
+```sh
+sudo launchctl print system/com.gitzero.agent
+tail -f /Library/Logs/GitZero/agent.log
+curl -fsS https://<worker-host>/healthz
+```
+
+Use a unique agent ID per Mac. `--parallelism` caps both the PR runs admitted to that machine and the total workflow-job slots shared across those runs, so nested job and matrix parallelism cannot multiply the configured host load. Dependency-ready jobs receive empty isolated workspaces and run concurrently when slots are available; `actions/checkout` populates each workspace independently, and a workflow's matrix `max-parallel` may set a stricter limit. Start with one on machines that run signing, Xcode, or other stateful toolchains.
+
+Every agent automatically advertises GitHub's `self-hosted`, `macOS`, and native `ARM64` or `X64` labels. `--labels` adds a comma-separated custom set and `--runner-group` sets the optional group used by object-form `runs-on`. String, list, expression, and `{group, labels}` selectors are evaluated per job; every requested self-hosted label and the requested group must match case-insensitively. A lone GitHub-hosted `macos-*` label remains compatible so repositories do not need workflow edits. After exact-SHA workflow discovery, an agent evaluates job conditions and selectors whose values are fixed before execution. This includes literal values plus expressions based on the webhook-backed `github` context, repository/organization `vars`, static `matrix` and `strategy` values, and statically bound reusable-workflow `inputs`. If one does not match, the agent returns the complete bounded requirement set, removes its temporary checkout, and the control plane requeues the run without consuming an infrastructure retry. The rejecting Mac remains in a draining state until its next heartbeat confirms the local task has released its slot. The queue then selects the least-loaded matching Mac and continues dispatching compatible jobs behind an otherwise blocked entry. Conditions or selectors involving `needs`, dynamic matrices, status functions, step/job/runner/environment state, secrets, or `hashFiles` remain runtime-only; all Macs eligible for a repository must support their possible values, and a mismatch fails visibly instead of running on the wrong host. Explicit GitHub-hosted Linux or Windows selectors are not negotiated because no Mac can reproduce those platforms; they fail through the executor's existing unsupported-runner path.
+
+Use a different work root for every agent process. The work root contains the shared runner tool cache, a persistent remote-source Git object cache, and `_workflow-cache` for unchanged `actions/cache` and setup-action clients. Action and reusable-workflow refs are refreshed once per PR run while unchanged objects are reused locally. Do not delete or modify `_action-cache` or `_workflow-cache` while the agent is running because active jobs may reference their objects or archives. Remote-source caches never store checkout credentials. Workflow-cache entries are isolated by repository and pull-request ref; their per-run loopback bearer token is masked from logs. They remain local to one Mac, so a job load-balanced to a different Mac receives a normal cache miss.
+
+The installer defaults to a 10 GiB total workflow-cache budget and a 2 GiB per-entry limit. `--cache-max-bytes` and `--cache-max-entry-bytes` write the matching protected launchd environment values; the total must be at least the per-entry limit. Entries idle for seven days expire, and least-recently-used entries are evicted before a new immutable entry is committed.
+
+Current-run artifacts have a separate 10 GiB total budget and 2 GiB per-artifact default. `--artifact-max-bytes` and `--artifact-max-entry-bytes` set those bounds. The agent exposes the current GitHub artifact Twirp and block-blob contracts on IPv4 loopback, so unchanged `actions/upload-artifact@v4+` and `actions/download-artifact@v4+` jobs can transfer archived or direct-file artifacts between jobs in the same assigned run. These artifacts are transient and disappear during normal run cleanup; they are not copied to another Mac, retained after the run, listed in GitHub's artifact UI, or available to cross-run/cross-repository downloads.
+
+GitZero executes repository-controlled shell and action code. A dedicated user protects the rest of the host only partially; it is not a sandbox. Persistent machines should accept trusted branches and pull requests only. Use disposable hosts or a real sandbox for untrusted fork code.

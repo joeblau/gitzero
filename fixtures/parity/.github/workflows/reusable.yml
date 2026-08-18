@@ -1,0 +1,65 @@
+name: Reusable parity
+on:
+  workflow_call:
+    inputs:
+      label:
+        required: true
+        type: string
+      enabled:
+        type: boolean
+        default: true
+    secrets:
+      workflow_token:
+        required: false
+    outputs:
+      result:
+        description: Reusable workflow result
+        value: ${{ jobs.nested.outputs.result }}
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    env:
+      TOKEN_FROM_GITHUB: ${{ github.token }}
+      TOKEN_FROM_SECRETS: ${{ secrets.GITHUB_TOKEN }}
+      TOKEN_FROM_ALIAS: ${{ secrets.workflow_token }}
+    outputs:
+      result: ${{ steps.result.outputs.value }}
+    steps:
+      - id: result
+        run: |
+          test "${{ inputs.enabled }}" = "true"
+          test -n "$TOKEN_FROM_GITHUB"
+          test "$TOKEN_FROM_GITHUB" = "$TOKEN_FROM_SECRETS"
+          if [[ "${{ inputs.label }}" == parity ]]; then
+            test "$TOKEN_FROM_ALIAS" = "$TOKEN_FROM_GITHUB"
+            echo reusable-token-alias-available
+          else
+            test -z "$TOKEN_FROM_ALIAS"
+          fi
+          if [[ "${{ inputs.label }}" == matrix-* ]]; then
+            active="$(dirname "$GITHUB_EVENT_PATH")/_test-barriers/reusable-matrix-active"
+            mkdir "$active"
+            trap 'rmdir "$active"' EXIT
+            sleep 0.2
+          fi
+          echo reusable-input-${{ inputs.label }}-${{ inputs.enabled }}
+          echo reusable-token-available
+          echo "value=reusable-${{ inputs.label }}" >> "$GITHUB_OUTPUT"
+  nested:
+    needs: build
+    uses: ./.github/workflows/reusable-leaf.yml
+    with:
+      value: ${{ needs.build.outputs.result }}
+      enabled: ${{ inputs.enabled }}
+    secrets:
+      leaf_token: ${{ secrets.workflow_token }}
+  verify:
+    needs: [build, nested]
+    runs-on: macos-latest
+    steps:
+      - run: |
+          test "${{ needs.build.outputs.result }}" = "reusable-${{ inputs.label }}"
+          test "${{ needs.nested.outputs.result }}" = "leaf-reusable-${{ inputs.label }}"
+          echo reusable-inner-${{ needs.build.outputs.result }}
+          echo reusable-nested-output-${{ needs.nested.outputs.result }}

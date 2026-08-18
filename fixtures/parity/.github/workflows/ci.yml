@@ -1,0 +1,284 @@
+name: CI
+on:
+  pull_request:
+    paths:
+      - '.github/**'
+jobs:
+  test:
+    name: Test ${{ matrix.flavor }}
+    runs-on:
+      group: parity-minis
+      labels: [self-hosted, macOS, "${{ matrix.arch }}", xcode-16]
+    strategy:
+      max-parallel: 2
+      matrix:
+        arch: [ARM64]
+        flavor: [alpha, beta, gamma]
+    env:
+      MATRIX_VALUE: ${{ matrix.flavor }}
+    outputs:
+      result: ${{ steps.local-composite.outputs.result }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Matrix concurrency barrier
+        run: |
+          barrier="$(dirname "$GITHUB_EVENT_PATH")/_test-barriers/matrix-concurrency"
+          mkdir -p "$barrier"
+          touch "$barrier/${{ matrix.flavor }}"
+          if [[ "${{ matrix.flavor }}" == "gamma" ]]; then
+            test -f "$barrier/alpha-done" || test -f "$barrier/beta-done"
+          else
+            for attempt in {1..400}; do
+              if [[ -f "$barrier/alpha" && -f "$barrier/beta" ]]; then
+                break
+              fi
+              sleep 0.025
+            done
+            test -f "$barrier/alpha"
+            test -f "$barrier/beta"
+          fi
+          echo matrix-parallel-${{ matrix.flavor }}
+      - name: Produce output
+        id: produce
+        run: |
+          test "$(git rev-list --count HEAD)" -ge 2
+          test ! -e isolation.txt
+          touch isolation.txt
+          echo "value=${{ matrix.flavor }}" >> "$GITHUB_OUTPUT"
+          echo "PERSISTED=${{ matrix.flavor }}" >> "$GITHUB_ENV"
+      - name: Consume output
+        run: |
+          test "$MATRIX_VALUE" = "$PERSISTED"
+          test "$PERSISTED" = "${{ steps.produce.outputs.value }}"
+          echo workflow-${{ matrix.flavor }}
+      - name: Hash workspace files
+        env:
+          ALL_JS: ${{ hashFiles('.github/actions/javascript/*.js') }}
+          ROOTED_JS: ${{ hashFiles('/.github/actions/javascript/*.js') }}
+          REINCLUDED_JS: ${{ hashFiles('.github/actions/javascript/*.js', '!.github/actions/javascript/post.js', '.github/actions/javascript/post.js') }}
+          MAIN_JS: ${{ hashFiles('.github/actions/javascript/*.js', '!.github/actions/javascript/post.js') }}
+          MISSING: ${{ hashFiles('.github/actions/javascript/*.missing') }}
+        run: |
+          test "${#ALL_JS}" -eq 64
+          test "$ALL_JS" = "$ROOTED_JS"
+          test "$ALL_JS" = "$REINCLUDED_JS"
+          test "$ALL_JS" != "$MAIN_JS"
+          test -z "$MISSING"
+          echo hashfiles-${{ matrix.flavor }}
+      - name: Local JavaScript action
+        id: local-action
+        uses: ./.github/actions/javascript
+        with:
+          value: ${{ matrix.flavor }}
+          token: ${{ github.token }}
+      - run: |
+          test "${{ steps.local-action.outputs.result }}" = "${{ matrix.flavor }}"
+          test "${{ steps.local-action.outputs.legacy }}" = "legacy-${{ matrix.flavor }}"
+          test -z "${{ steps.local-action.outputs.dynamic-secret }}"
+          test -z "${{ steps.local-action.outputs.legacy-secret }}"
+          test -z "${{ steps.local-action.outputs.token }}"
+          echo legacy-output-${{ matrix.flavor }}
+          echo dynamic-output-rejected-${{ matrix.flavor }}
+          echo action-output-${{ steps.local-action.outputs.result }}
+      - name: Local composite action
+        id: local-composite
+        uses: ./.github/actions/composite
+        with:
+          value: ${{ matrix.flavor }}
+      - run: |
+          test "${{ steps.local-composite.outputs.result }}" = "composite-${{ matrix.flavor }}"
+          echo composite-output-${{ steps.local-composite.outputs.result }}
+      - name: Tolerated failing composite action
+        id: failing-composite
+        continue-on-error: true
+        uses: ./.github/actions/composite
+        with:
+          value: fatal-${{ matrix.flavor }}
+          fatal: true
+      - if: ${{ steps.failing-composite.outcome == 'failure' && steps.failing-composite.conclusion == 'success' }}
+        run: echo composite-failure-propagated-${{ matrix.flavor }}
+      - name: Tolerated failure
+        id: tolerated
+        continue-on-error: true
+        shell: bash
+        run: false | true
+      - if: ${{ steps.tolerated.outcome == 'failure' && steps.tolerated.conclusion == 'success' }}
+        run: echo tolerated-${{ matrix.flavor }}
+      - name: Matrix completion marker
+        run: |
+          touch "$(dirname "$GITHUB_EVENT_PATH")/_test-barriers/matrix-concurrency/${{ matrix.flavor }}-done"
+          echo matrix-finished-${{ matrix.flavor }}
+  allowed-failure:
+    continue-on-error: true
+    runs-on: macos-latest
+    steps:
+      - run: exit 9
+  builtin-token:
+    runs-on: macos-latest
+    env:
+      TOKEN_FROM_GITHUB: ${{ github.token }}
+      TOKEN_FROM_SECRETS: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - run: |
+          test -n "$BASH_VERSION"
+          false | true
+          echo default-bash-no-pipefail
+          test -n "$TOKEN_FROM_GITHUB"
+          test "$TOKEN_FROM_GITHUB" = "$TOKEN_FROM_SECRETS"
+          echo "Shell summary available" >> "$GITHUB_STEP_SUMMARY"
+          echo "summary-token=$TOKEN_FROM_GITHUB" >> "$GITHUB_STEP_SUMMARY"
+          echo builtin-token-available
+          echo token-value="$TOKEN_FROM_GITHUB"
+      - name: Remove summary
+        run: |
+          echo "removed-summary-must-not-appear" > "$GITHUB_STEP_SUMMARY"
+          rm "$GITHUB_STEP_SUMMARY"
+  define-dynamic-matrix:
+    runs-on: macos-latest
+    outputs:
+      colors: ${{ steps.values.outputs.colors }}
+      plan: ${{ steps.values.outputs.plan }}
+      reusable-label: ${{ steps.values.outputs.reusable-label }}
+    steps:
+      - id: values
+        run: |
+          echo 'colors=["red","blue"]' >> "$GITHUB_OUTPUT"
+          echo 'plan={"include":[{"project":"api","config":"debug"},{"project":"app","config":"release"}]}' >> "$GITHUB_OUTPUT"
+          echo 'reusable-label=parity' >> "$GITHUB_OUTPUT"
+  dynamic-dimension:
+    needs: define-dynamic-matrix
+    runs-on: macos-latest
+    strategy:
+      max-parallel: 2
+      matrix:
+        color: ${{ fromJSON(needs.define-dynamic-matrix.outputs.colors) }}
+    steps:
+      - run: echo dynamic-color-${{ matrix.color }}
+  dynamic-object:
+    needs: define-dynamic-matrix
+    runs-on: macos-latest
+    strategy:
+      matrix: ${{ fromJSON(needs.define-dynamic-matrix.outputs.plan) }}
+    steps:
+      - run: echo dynamic-project-${{ matrix.project }}-${{ matrix.config }}
+  dynamic-skipped:
+    needs: define-dynamic-matrix
+    if: ${{ false }}
+    runs-on: macos-latest
+    strategy:
+      matrix: ${{ fromJSON('not-json') }}
+    steps:
+      - run: exit 99
+  parallel-a:
+    runs-on: macos-latest
+    steps:
+      - run: |
+          workflow_barrier="$(dirname "$GITHUB_EVENT_PATH")/_test-barriers/workflow-concurrency"
+          mkdir -p "$workflow_barrier"
+          touch "$workflow_barrier/ci"
+          for attempt in {1..400}; do
+            [[ -f "$workflow_barrier/secondary" ]] && break
+            sleep 0.025
+          done
+          test -f "$workflow_barrier/secondary"
+          echo workflow-parallel-ci
+
+          barrier="$(dirname "$GITHUB_EVENT_PATH")/_test-barriers/job-concurrency"
+          mkdir -p "$barrier"
+          touch "$barrier/a"
+          for attempt in {1..400}; do
+            [[ -f "$barrier/b" ]] && break
+            sleep 0.025
+          done
+          test -f "$barrier/b"
+          echo independent-parallel-a
+  parallel-b:
+    runs-on: macos-latest
+    steps:
+      - run: |
+          barrier="$(dirname "$GITHUB_EVENT_PATH")/_test-barriers/job-concurrency"
+          mkdir -p "$barrier"
+          touch "$barrier/b"
+          for attempt in {1..400}; do
+            [[ -f "$barrier/a" ]] && break
+            sleep 0.025
+          done
+          test -f "$barrier/a"
+          echo independent-parallel-b
+  reusable-call:
+    needs: define-dynamic-matrix
+    if: ${{ needs.define-dynamic-matrix.result == 'success' }}
+    uses: ./.github/workflows/reusable.yml
+    with:
+      label: ${{ needs.define-dynamic-matrix.outputs.reusable-label }}
+    secrets:
+      workflow_token: ${{ secrets.GITHUB_TOKEN }}
+  reusable-matrix:
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        flavor: [alpha, beta]
+    uses: ./.github/workflows/reusable.yml
+    with:
+      label: matrix-${{ matrix.flavor }}
+    secrets: inherit
+  reusable-dynamic-object:
+    needs: define-dynamic-matrix
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.define-dynamic-matrix.outputs.plan) }}
+    uses: ./.github/workflows/reusable.yml
+    with:
+      label: dynamic-${{ matrix.project }}-${{ matrix.config }}
+    secrets: inherit
+  reusable-dynamic-dimension:
+    needs: define-dynamic-matrix
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        color: ${{ fromJSON(needs.define-dynamic-matrix.outputs.colors) }}
+    uses: ./.github/workflows/reusable.yml
+    with:
+      label: dynamic-color-${{ matrix.color }}
+    secrets: inherit
+  reusable-dynamic-skipped:
+    needs: define-dynamic-matrix
+    if: ${{ false }}
+    strategy:
+      matrix: ${{ fromJSON('not-json') }}
+    uses: ./.github/workflows/reusable.yml
+    with:
+      label: dynamic-skipped-${{ matrix.project }}
+  reusable-remote:
+    uses: local/fixture/.github/workflows/reusable.yml@main
+    with:
+      label: remote
+    secrets: inherit
+  verify:
+    needs: [test, allowed-failure, builtin-token, dynamic-dimension, dynamic-object, dynamic-skipped, parallel-a, parallel-b, reusable-call, reusable-matrix, reusable-dynamic-object, reusable-dynamic-dimension, reusable-dynamic-skipped, reusable-remote]
+    if: ${{ always() && needs.test.result == 'success' && needs.allowed-failure.result == 'success' && needs.builtin-token.result == 'success' && needs.dynamic-dimension.result == 'success' && needs.dynamic-object.result == 'success' && needs.dynamic-skipped.result == 'skipped' && needs.parallel-a.result == 'success' && needs.parallel-b.result == 'success' && needs.reusable-call.result == 'success' && needs.reusable-matrix.result == 'success' && needs.reusable-dynamic-object.result == 'success' && needs.reusable-dynamic-dimension.result == 'success' && needs.reusable-dynamic-skipped.result == 'skipped' && needs.reusable-remote.result == 'success' }}
+    runs-on: macos-latest
+    steps:
+      - run: |
+          echo dependent-${{ needs.test.result }}
+          echo needs-output-${{ needs.test.outputs.result }}
+          echo continued-job-${{ needs.allowed-failure.result }}
+          echo builtin-token-${{ needs.builtin-token.result }}
+          echo dynamic-dependencies-${{ needs.dynamic-dimension.result }}-${{ needs.dynamic-object.result }}
+          echo dynamic-skipped-${{ needs.dynamic-skipped.result }}
+          echo parallel-dependencies-${{ needs.parallel-a.result }}-${{ needs.parallel-b.result }}
+          echo reusable-output-${{ needs.reusable-call.outputs.result }}
+          test "${{ needs.reusable-matrix.outputs.result }}" = "leaf-reusable-matrix-beta"
+          echo reusable-matrix-output-${{ needs.reusable-matrix.outputs.result }}
+          test "${{ needs.reusable-dynamic-object.outputs.result }}" = "leaf-reusable-dynamic-app-release"
+          echo reusable-dynamic-object-output-${{ needs.reusable-dynamic-object.outputs.result }}
+          test "${{ needs.reusable-dynamic-dimension.outputs.result }}" = "leaf-reusable-dynamic-color-blue"
+          echo reusable-dynamic-dimension-output-${{ needs.reusable-dynamic-dimension.outputs.result }}
+          echo reusable-dynamic-skipped-${{ needs.reusable-dynamic-skipped.result }}
+          test "${{ needs.reusable-remote.outputs.result }}" = "leaf-reusable-remote"
+          echo reusable-remote-output-${{ needs.reusable-remote.outputs.result }}

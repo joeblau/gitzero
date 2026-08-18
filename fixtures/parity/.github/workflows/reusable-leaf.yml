@@ -1,0 +1,41 @@
+name: Reusable parity leaf
+on:
+  workflow_call:
+    inputs:
+      value:
+        required: true
+        type: string
+      enabled:
+        required: true
+        type: boolean
+    secrets:
+      leaf_token:
+        required: false
+    outputs:
+      result:
+        description: Nested reusable workflow result
+        value: ${{ jobs.leaf.outputs.result }}
+jobs:
+  leaf:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    outputs:
+      result: ${{ steps.result.outputs.value }}
+    steps:
+      - id: result
+        env:
+          TOKEN_FROM_GITHUB: ${{ github.token }}
+          TOKEN_FROM_SECRETS: ${{ secrets.GITHUB_TOKEN }}
+          TOKEN_FROM_ALIAS: ${{ secrets.leaf_token }}
+        run: |
+          test "${{ inputs.enabled }}" = "true"
+          test -n "$TOKEN_FROM_GITHUB"
+          test "$TOKEN_FROM_GITHUB" = "$TOKEN_FROM_SECRETS"
+          if [[ "${{ inputs.value }}" == reusable-parity ]]; then
+            test "$TOKEN_FROM_ALIAS" = "$TOKEN_FROM_GITHUB"
+            echo reusable-leaf-token-alias-available
+          else
+            test -z "$TOKEN_FROM_ALIAS"
+          fi
+          echo reusable-leaf-${{ inputs.value }}
+          echo "value=leaf-${{ inputs.value }}" >> "$GITHUB_OUTPUT"

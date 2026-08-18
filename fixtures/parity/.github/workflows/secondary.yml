@@ -1,0 +1,32 @@
+name: Secondary
+on:
+  pull_request:
+    paths:
+      - '.github/**'
+jobs:
+  cross-workflow:
+    runs-on: macos-latest
+    steps:
+      - name: Cross-workflow concurrency barrier
+        run: |
+          barrier="$(dirname "$GITHUB_EVENT_PATH")/_test-barriers/workflow-concurrency"
+          mkdir -p "$barrier"
+          touch "$barrier/secondary"
+          for attempt in {1..400}; do
+            [[ -f "$barrier/ci" ]] && break
+            sleep 0.025
+          done
+          test -f "$barrier/ci"
+          echo workflow-parallel-secondary
+  configured-vars:
+    if: ${{ vars.ENABLED == 'true' }}
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        shard: ${{ fromJSON(vars.SHARDS) }}
+    env:
+      CHANNEL: ${{ vars.CHANNEL }}
+    steps:
+      - run: |
+          test "$CHANNEL" = stable
+          echo configured-var-${{ matrix.shard }}-$CHANNEL

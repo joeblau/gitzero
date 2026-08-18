@@ -1,0 +1,38 @@
+name: Local Composite
+inputs:
+  value:
+    required: true
+  tolerate:
+    default: true
+  fatal:
+    default: false
+outputs:
+  result:
+    value: ${{ steps.emit.outputs.result }}
+runs:
+  using: composite
+  steps:
+    - name: Emit
+      id: emit
+      shell: bash
+      run: |
+        echo "result=composite-${{ inputs.value }}" >> "$GITHUB_OUTPUT"
+        echo "Composite summary ${{ inputs.value }}" >> "$GITHUB_STEP_SUMMARY"
+        echo composite-${{ inputs.value }}
+    - name: Tolerated failure
+      id: tolerated
+      continue-on-error: ${{ fromJSON(inputs.tolerate) }}
+      shell: bash
+      run: exit 23
+    - name: Verify tolerated failure state
+      if: ${{ steps.tolerated.outcome == 'failure' && steps.tolerated.conclusion == 'success' && github.action_status == 'success' }}
+      shell: bash
+      run: echo composite-tolerated-${{ inputs.value }}
+    - name: Optional fatal failure
+      if: ${{ fromJSON(inputs.fatal) }}
+      shell: bash
+      run: exit 29
+    - name: Verify failing composite status
+      if: ${{ failure() && github.action_status == 'failure' }}
+      shell: bash
+      run: echo composite-failure-status-${{ inputs.value }}
