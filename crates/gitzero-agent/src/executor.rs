@@ -28,8 +28,8 @@ use gitzero_workflow::{
     Workflow, compile_with_reusables, expand_dynamic_reusable_call, expand_matrix_definition,
     matches_pull_request, parse, requires_pull_request_changed_paths,
 };
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use serde_yaml_ng::Value as YamlValue;
 use std::{
@@ -43,7 +43,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader},
     process::Command,
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, watch},
 };
@@ -73,6 +73,7 @@ const MAX_DEPLOYMENT_BRANCH_PATTERN_BYTES: usize = 1_024;
 const MAX_DEPLOYMENT_BRANCH_PATTERN_TOTAL_BYTES: usize = 256 * 1_024;
 const MAX_CHECKOUT_FILTER_BYTES: usize = 1_024;
 const MAX_CHECKOUT_REF_BYTES: usize = 1_024;
+const MAX_GIT_CAPTURE_BYTES: usize = 64 * 1_024;
 const MAX_CHECKOUT_SSH_KNOWN_HOSTS_BYTES: usize = 256 * 1_024;
 const MAX_CHECKOUT_SSH_USER_BYTES: usize = 64;
 const MAX_SPARSE_CHECKOUT_PATTERNS: usize = 4_096;
@@ -4688,13 +4689,20 @@ async fn execute_checkout_step_with_repository(
             )
             .await?
         };
-        managed_checkout_token = token;
-        (
-            commit,
-            Some(snapshot),
-            public_checkout_output_ref(&git_ref),
-            None,
+        let checkout_branch = cross_repository_checkout_branch(
+            &checkout_repository,
+            &git_ref,
+            &commit,
+            &checkout_remote,
+            token.as_deref(),
+            ssh_credentials.as_ref(),
+            run_dir,
+            cancel,
         )
+        .await?;
+        let output_ref = public_checkout_output_ref(&git_ref, checkout_branch.as_deref());
+        managed_checkout_token = token;
+        (commit, Some(snapshot), output_ref, checkout_branch)
     };
     let checkout_token = if checkout_repository.same_repository || ssh_credentials.is_some() {
         select_checkout_token(
@@ -5287,6 +5295,12 @@ struct CheckoutRepository {
     same_repository: bool,
 }
 
+#[derive(Deserialize, Serialize)]
+struct CrossRepositoryCheckoutRefResolution {
+    commit: String,
+    branch: Option<String>,
+}
+
 impl CheckoutRepository {
     fn ssh_url(&self, user: &str) -> String {
         format!("{user}@github.com:{}/{}.git", self.owner, self.name)
@@ -5373,12 +5387,171 @@ fn public_checkout_ref(input: &str) -> Result<String> {
     Ok(git_ref.to_owned())
 }
 
-fn public_checkout_output_ref(git_ref: &str) -> String {
+fn public_checkout_output_ref(git_ref: &str, branch: Option<&str>) -> String {
     if validate_remote_commit(git_ref).is_ok() {
         String::new()
+    } else if git_ref == "HEAD" {
+        branch.map_or_else(
+            || git_ref.to_owned(),
+            |branch| format!("refs/heads/{branch}"),
+        )
     } else {
         git_ref.to_owned()
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cross_repository_checkout_branch(
+    repository: &CheckoutRepository,
+    git_ref: &str,
+    commit: &str,
+    checkout_remote: &str,
+    checkout_token: Option<&str>,
+    ssh_credentials: Option<&CheckoutSshCredentials>,
+    run_dir: &Path,
+    cancel: &watch::Receiver<bool>,
+) -> Result<Option<String>> {
+    if let Some(branch) = git_ref.strip_prefix("refs/heads/") {
+        validate_checkout_branch(branch)?;
+        return Ok(Some(branch.to_owned()));
+    }
+    if git_ref.starts_with("refs/") || validate_remote_commit(git_ref).is_ok() {
+        return Ok(None);
+    }
+
+    let resolution =
+        remote_repository_resolution_path(run_dir, &repository.owner, &repository.name, git_ref)
+            .with_extension("checkout-ref");
+    if let Some(branch) =
+        read_cross_repository_checkout_ref_resolution(&resolution, git_ref, commit).await?
+    {
+        return Ok(branch);
+    }
+    let cache = remote_repository_cache_path(run_dir, &repository.owner, &repository.name)?;
+    let lock = remote_repository_lock(&cache);
+    let _guard = lock.lock().await;
+    if let Some(branch) =
+        read_cross_repository_checkout_ref_resolution(&resolution, git_ref, commit).await?
+    {
+        return Ok(branch);
+    }
+
+    let mut command = Command::new("git");
+    command.arg("ls-remote");
+    if git_ref == "HEAD" {
+        command.args(["--symref", checkout_remote, "HEAD"]);
+    } else {
+        command
+            .args(["--heads", "--tags", checkout_remote])
+            .arg(format!("refs/heads/{git_ref}"))
+            .arg(format!("refs/tags/{git_ref}"));
+    }
+    let mut environment = BTreeMap::new();
+    if let Some(credentials) = ssh_credentials {
+        configure_checkout_ssh(&mut environment, Some(&credentials.command));
+    } else {
+        configure_checkout_credentials(&mut environment, checkout_token.unwrap_or(""), false)?;
+    }
+    command
+        .envs(environment.iter())
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let advertised = run_process_capture_stdout(&mut command, cancel.clone())
+        .await
+        .with_context(|| {
+            format!(
+                "resolve actions/checkout branch identity for {}/{}@{git_ref}",
+                repository.owner, repository.name
+            )
+        })?;
+    let branch = parse_cross_repository_checkout_branch(git_ref, &advertised)?;
+    if git_ref == "HEAD" && branch.is_none() {
+        bail!(
+            "actions/checkout could not resolve the default branch for {}/{}",
+            repository.owner,
+            repository.name
+        );
+    }
+    write_cross_repository_checkout_ref_resolution(&resolution, commit, branch.as_deref()).await?;
+    Ok(branch)
+}
+
+fn parse_cross_repository_checkout_branch(
+    git_ref: &str,
+    advertised: &str,
+) -> Result<Option<String>> {
+    let branch = if git_ref == "HEAD" {
+        advertised.lines().find_map(|line| {
+            let (reference, target) = line.split_once('\t')?;
+            (target == "HEAD")
+                .then(|| reference.strip_prefix("ref: refs/heads/"))
+                .flatten()
+        })
+    } else {
+        let expected = format!("refs/heads/{git_ref}");
+        advertised
+            .lines()
+            .any(|line| {
+                line.split_once('\t')
+                    .is_some_and(|(_, reference)| reference == expected)
+            })
+            .then_some(git_ref)
+    };
+    let Some(branch) = branch else {
+        return Ok(None);
+    };
+    validate_checkout_branch(branch)?;
+    Ok(Some(branch.to_owned()))
+}
+
+async fn read_cross_repository_checkout_ref_resolution(
+    path: &Path,
+    git_ref: &str,
+    commit: &str,
+) -> Result<Option<Option<String>>> {
+    let metadata = match tokio::fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect cached checkout ref resolution"),
+    };
+    if metadata.len() > MAX_CHECKOUT_REF_BYTES as u64 * 2 {
+        return Ok(None);
+    }
+    let source = tokio::fs::read(path)
+        .await
+        .context("read cached checkout ref resolution")?;
+    let Ok(resolution) = serde_json::from_slice::<CrossRepositoryCheckoutRefResolution>(&source)
+    else {
+        return Ok(None);
+    };
+    if !resolution.commit.eq_ignore_ascii_case(commit) {
+        return Ok(None);
+    }
+    if let Some(branch) = resolution.branch.as_deref()
+        && (validate_checkout_branch(branch).is_err() || (git_ref != "HEAD" && branch != git_ref))
+    {
+        return Ok(None);
+    }
+    Ok(Some(resolution.branch))
+}
+
+async fn write_cross_repository_checkout_ref_resolution(
+    path: &Path,
+    commit: &str,
+    branch: Option<&str>,
+) -> Result<()> {
+    let source = serde_json::to_vec(&CrossRepositoryCheckoutRefResolution {
+        commit: commit.to_owned(),
+        branch: branch.map(str::to_owned),
+    })?;
+    let temporary = path.with_extension(format!("checkout-ref-{}", Uuid::new_v4()));
+    tokio::fs::write(&temporary, source)
+        .await
+        .context("write temporary checkout ref resolution")?;
+    if let Err(error) = tokio::fs::rename(&temporary, path).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(error).context("publish checkout ref resolution");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5618,13 +5791,18 @@ fn checkout_local_branch(
     let Some(branch) = branch else {
         return Ok(None);
     };
+    validate_checkout_branch(branch)?;
+    Ok(Some(branch.to_owned()))
+}
+
+fn validate_checkout_branch(branch: &str) -> Result<()> {
     if branch.starts_with('-')
         || branch == "HEAD"
         || !valid_git_ref(&format!("refs/heads/{branch}"))
     {
         bail!("actions/checkout branch ref is invalid");
     }
-    Ok(Some(branch.to_owned()))
+    Ok(())
 }
 
 fn checkout_filter(input: Option<&String>) -> Result<Option<String>> {
@@ -6838,7 +7016,7 @@ async fn materialize_remote_repository_with_fetch(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
 ) -> Result<PathBuf> {
-    let encoded_ref = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(git_ref);
+    let encoded_ref = URL_SAFE_NO_PAD.encode(git_ref);
     let checkout = run_dir
         .join("_actions")
         .join(sanitize_id(
@@ -6852,13 +7030,7 @@ async fn materialize_remote_repository_with_fetch(
         return Ok(checkout);
     }
 
-    let work_root = run_dir
-        .parent()
-        .context("run directory must have a work-root parent")?;
-    let cache = work_root
-        .join("_action-cache")
-        .join(owner)
-        .join(format!("{repository}.git"));
+    let cache = remote_repository_cache_path(run_dir, owner, repository)?;
     let lock = remote_repository_lock(&cache);
     let _guard = lock.lock().await;
     if tokio::fs::try_exists(&checkout).await? {
@@ -6875,11 +7047,7 @@ async fn materialize_remote_repository_with_fetch(
         sequence,
     )
     .await?;
-    let resolution = run_dir
-        .join("_action-resolutions")
-        .join(owner)
-        .join(repository)
-        .join(&encoded_ref);
+    let resolution = remote_repository_resolution_path(run_dir, owner, repository, git_ref);
     let mut commit = read_cached_remote_resolution(&cache, &resolution).await?;
     let resolution_hit = commit.is_some();
     if resolution_hit && (checkout_token.is_none() || checkout_environment.is_some()) {
@@ -7036,6 +7204,28 @@ async fn materialize_remote_repository_with_fetch(
         "materialized remote repository"
     );
     Ok(checkout)
+}
+
+fn remote_repository_resolution_path(
+    run_dir: &Path,
+    owner: &str,
+    repository: &str,
+    git_ref: &str,
+) -> PathBuf {
+    run_dir
+        .join("_action-resolutions")
+        .join(owner)
+        .join(repository)
+        .join(URL_SAFE_NO_PAD.encode(git_ref))
+}
+
+fn remote_repository_cache_path(run_dir: &Path, owner: &str, repository: &str) -> Result<PathBuf> {
+    Ok(run_dir
+        .parent()
+        .context("run directory must have a work-root parent")?
+        .join("_action-cache")
+        .join(owner)
+        .join(format!("{repository}.git")))
 }
 
 fn remote_repository_lock(cache: &Path) -> Arc<Mutex<()>> {
@@ -8053,6 +8243,66 @@ async fn run_process(
         job_id, step_id, command, timeout, cancel, outbound, sequence, None,
     )
     .await
+}
+
+async fn run_process_capture_stdout(
+    command: &mut Command,
+    mut cancel: watch::Receiver<bool>,
+) -> Result<String> {
+    if *cancel.borrow() {
+        return Err(ProcessError::Cancelled.into());
+    }
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().expect("stdout configured");
+    let stderr = child.stderr.take().expect("stderr configured");
+    let stdout_task = tokio::spawn(read_bounded_process_output(stdout));
+    let stderr_task = tokio::spawn(read_bounded_process_output(stderr));
+    let status = tokio::select! {
+        status = child.wait() => status?,
+        changed = cancel.changed() => {
+            if changed.is_ok() && *cancel.borrow() {
+                terminate_process_tree(&mut child).await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(ProcessError::Cancelled.into());
+            }
+            child.wait().await?
+        },
+    };
+    let (stdout, stdout_truncated) = stdout_task.await.context("join captured Git stdout")??;
+    let (_, stderr_truncated) = stderr_task.await.context("join captured Git stderr")??;
+    if !status.success() {
+        return Err(ProcessError::Exit(status.code().unwrap_or(128)).into());
+    }
+    if stdout_truncated || stderr_truncated {
+        bail!("captured Git output exceeded its safe bound");
+    }
+    String::from_utf8(stdout).context("captured Git output was not UTF-8")
+}
+
+async fn read_bounded_process_output<R>(mut reader: R) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut captured = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0_u8; 8 * 1_024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok((captured, truncated));
+        }
+        let remaining = MAX_GIT_CAPTURE_BYTES.saturating_sub(captured.len());
+        let take = read.min(remaining);
+        captured.extend_from_slice(&buffer[..take]);
+        truncated |= take < read;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10239,14 +10489,20 @@ jobs:
         let run_dir = fixture.path().join("runs").join(Uuid::new_v4().to_string());
         let first_workspace = run_dir.join("first-workspace");
         let second_workspace = run_dir.join("second-workspace");
+        let first_default_workspace = run_dir.join("first-default-workspace");
+        let second_default_workspace = run_dir.join("second-default-workspace");
         let managed_workspace = run_dir.join("managed-workspace");
+        let tag_workspace = run_dir.join("tag-workspace");
         let source_repository = run_dir.join("repository");
         for directory in [
             &source,
             &run_dir,
             &first_workspace,
             &second_workspace,
+            &first_default_workspace,
+            &second_default_workspace,
             &managed_workspace,
+            &tag_workspace,
             &source_repository,
         ] {
             std::fs::create_dir_all(directory).expect("fixture directory");
@@ -10258,6 +10514,7 @@ jobs:
         git(&source, ["add", "dependency.txt"]);
         git(&source, ["commit", "-m", "public v1"]);
         let first_commit = git_output(&source, ["rev-parse", "HEAD"]);
+        git(&source, ["tag", "v1"]);
         git(
             fixture.path(),
             ["init", "--bare", remote.to_str().expect("remote path")],
@@ -10272,6 +10529,8 @@ jobs:
             ],
         );
         git(&source, ["push", "origin", "main"]);
+        git(&source, ["push", "origin", "refs/tags/v1"]);
+        git(&remote, ["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         let mut run = fixture_run(
             Uuid::new_v4(),
@@ -10338,9 +10597,75 @@ jobs:
             git_output(&first_workspace, ["rev-parse", "HEAD"]),
             first_commit
         );
+        assert_eq!(
+            git_output(&first_workspace, ["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
+        assert_eq!(
+            git_output(
+                &first_workspace,
+                [
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}"
+                ]
+            ),
+            "origin/main"
+        );
+        assert_eq!(
+            git_output(&first_workspace, ["rev-parse", "refs/remotes/origin/main"]),
+            first_commit
+        );
+        git(&first_workspace, ["push", "--dry-run"]);
         assert!(
             !first_environment.contains_key("GIT_CONFIG_VALUE_0"),
             "the source repository token was persisted into a public checkout"
+        );
+
+        let mut default_inputs = inputs.clone();
+        default_inputs.remove("ref");
+        let mut first_default_environment = BTreeMap::new();
+        let first_default_outputs = execute_checkout_step_with_repository(
+            run.id,
+            "1/default-checkout",
+            &default_inputs,
+            &run,
+            &source_repository,
+            &first_default_workspace,
+            &run_dir,
+            &mut first_default_environment,
+            &run.checkout_token,
+            repository.clone(),
+            None,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+            &repository_access,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("first default-branch checkout");
+        assert_eq!(first_default_outputs["commit"], first_commit);
+        assert_eq!(first_default_outputs["ref"], "refs/heads/main");
+        assert_eq!(
+            git_output(
+                &first_default_workspace,
+                ["symbolic-ref", "--short", "HEAD"]
+            ),
+            "main"
+        );
+        assert_eq!(
+            git_output(
+                &first_default_workspace,
+                [
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}"
+                ]
+            ),
+            "origin/main"
         );
 
         std::fs::write(source.join("dependency.txt"), "public-v2\n")
@@ -10348,6 +10673,8 @@ jobs:
         git(&source, ["add", "dependency.txt"]);
         git(&source, ["commit", "-m", "public v2"]);
         git(&source, ["push", "origin", "main"]);
+        git(&source, ["push", "origin", "main:renamed"]);
+        git(&remote, ["symbolic-ref", "HEAD", "refs/heads/renamed"]);
 
         let mut second_environment = BTreeMap::new();
         let second_outputs = execute_checkout_step_with_repository(
@@ -10377,6 +10704,53 @@ jobs:
             "public-v1\n",
             "a moving public ref changed within one PR run"
         );
+        assert_eq!(
+            git_output(&second_workspace, ["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
+        assert_eq!(
+            git_output(&second_workspace, ["rev-parse", "refs/remotes/origin/main"]),
+            first_commit
+        );
+
+        let mut second_default_environment = BTreeMap::new();
+        let second_default_outputs = execute_checkout_step_with_repository(
+            run.id,
+            "2/default-checkout",
+            &default_inputs,
+            &run,
+            &source_repository,
+            &second_default_workspace,
+            &run_dir,
+            &mut second_default_environment,
+            &run.checkout_token,
+            repository.clone(),
+            None,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+            &repository_access,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("same-run repeated default-branch checkout");
+        assert_eq!(second_default_outputs["commit"], first_commit);
+        assert_eq!(second_default_outputs["ref"], "refs/heads/main");
+        assert_eq!(
+            git_output(
+                &second_default_workspace,
+                ["symbolic-ref", "--short", "HEAD"]
+            ),
+            "main",
+            "the default branch identity changed within one PR run"
+        );
+        assert_eq!(
+            git_output(
+                &second_default_workspace,
+                ["rev-parse", "refs/remotes/origin/main"]
+            ),
+            first_commit
+        );
 
         let managed_token = "managed-cross-repository-token";
         let managed_secret_values = BTreeSet::from([managed_token.to_owned()]);
@@ -10389,7 +10763,7 @@ jobs:
         let mut managed_environment = BTreeMap::new();
         let managed_outputs = execute_checkout_step_with_repository(
             run.id,
-            "2/managed-checkout",
+            "3/managed-checkout",
             &managed_inputs,
             &run,
             &source_repository,
@@ -10397,7 +10771,7 @@ jobs:
             &run_dir,
             &mut managed_environment,
             &run.checkout_token,
-            repository,
+            repository.clone(),
             None,
             &cancel,
             &outbound,
@@ -10413,6 +10787,10 @@ jobs:
                 .expect("managed checked out file"),
             "public-v1\n"
         );
+        assert_eq!(
+            git_output(&managed_workspace, ["symbolic-ref", "--short", "HEAD"]),
+            "main"
+        );
         let credential = STANDARD.encode(format!("x-access-token:{managed_token}"));
         let expected_credential = format!("AUTHORIZATION: basic {credential}");
         assert_eq!(
@@ -10420,6 +10798,45 @@ jobs:
                 .get("GIT_CONFIG_VALUE_0")
                 .map(String::as_str),
             Some(expected_credential.as_str())
+        );
+
+        let mut tag_inputs = inputs.clone();
+        tag_inputs.insert("ref".to_owned(), "v1".to_owned());
+        let mut tag_environment = BTreeMap::new();
+        let tag_outputs = execute_checkout_step_with_repository(
+            run.id,
+            "4/tag-checkout",
+            &tag_inputs,
+            &run,
+            &source_repository,
+            &tag_workspace,
+            &run_dir,
+            &mut tag_environment,
+            &run.checkout_token,
+            repository,
+            None,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+            &repository_access,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect("tag checkout");
+        assert_eq!(tag_outputs["commit"], first_commit);
+        assert_eq!(tag_outputs["ref"], "v1");
+        assert_eq!(
+            git_output(&tag_workspace, ["rev-parse", "HEAD"]),
+            first_commit
+        );
+        assert!(
+            !std::process::Command::new("git")
+                .args(["symbolic-ref", "--quiet", "HEAD"])
+                .current_dir(&tag_workspace)
+                .status()
+                .expect("inspect tag checkout HEAD")
+                .success(),
+            "tag checkout unexpectedly attached to a branch"
         );
 
         drop(outbound);
@@ -10885,10 +11302,39 @@ jobs:
             );
         }
         assert!(public_checkout_ref(&"x".repeat(MAX_CHECKOUT_REF_BYTES + 1)).is_err());
-        assert_eq!(public_checkout_output_ref("main"), "main");
+        assert_eq!(public_checkout_output_ref("main", Some("main")), "main");
         assert_eq!(
-            public_checkout_output_ref("0123456789012345678901234567890123456789"),
+            public_checkout_output_ref("HEAD", Some("trunk")),
+            "refs/heads/trunk"
+        );
+        assert_eq!(
+            public_checkout_output_ref("0123456789012345678901234567890123456789", None),
             ""
+        );
+        assert_eq!(
+            parse_cross_repository_checkout_branch(
+                "HEAD",
+                "ref: refs/heads/trunk\tHEAD\n0123456789012345678901234567890123456789\tHEAD\n"
+            )
+            .expect("default branch advertisement"),
+            Some("trunk".to_owned())
+        );
+        assert_eq!(
+            parse_cross_repository_checkout_branch(
+                "release",
+                "0123456789012345678901234567890123456789\trefs/heads/release\n\
+                 0123456789012345678901234567890123456789\trefs/tags/release\n"
+            )
+            .expect("branch and tag advertisement"),
+            Some("release".to_owned())
+        );
+        assert_eq!(
+            parse_cross_repository_checkout_branch(
+                "v1.2.3",
+                "0123456789012345678901234567890123456789\trefs/tags/v1.2.3\n"
+            )
+            .expect("tag advertisement"),
+            None
         );
     }
 

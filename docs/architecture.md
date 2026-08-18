@@ -101,6 +101,8 @@ The repository-shaped fixture under `fixtures/parity` is executed from an exact 
 
 A dedicated execution-snapshot regression creates distinct head, base, and no-fast-forward test merge commits. It proves that open activity uses the immutable PR merge ref with detached HEAD, merged `closed` activity uses the same exact commit on a local branch tracking the base ref, workflow discovery and explicit activity filters match both cases, and default checkout plus `github.sha`, `GITHUB_SHA`, and workflow SHA/ref values follow that execution context. It also proves that an explicit SHA checkout stays detached while selecting the authenticated event head and excluding base-only content, while an unmatched activity concludes neutrally.
 
+Cross-repository checkout classifies an unqualified ref as a branch before a same-named tag and resolves an omitted ref through the remote's advertised `HEAD`, matching `actions/checkout`. That classification is cached beside the run-wide immutable commit resolution. Branch checkouts synthesize `refs/remotes/origin/<branch>` at the pinned commit, use it as the local branch upstream, and reset it after broad history fetches; a remote move or default-branch rename during the run therefore cannot alter either the checked-out commit or branch identity. Tags, full object IDs, and non-branch refs remain detached. Deterministic fixtures exercise anonymous, managed-token, explicit/default branch, moving-ref, default-rename, plain-push, and tag behavior without a GitHub account.
+
 ## Security boundaries
 
 - GitHub webhook bodies are bounded and authenticated with `X-Hub-Signature-256` before parsing.
