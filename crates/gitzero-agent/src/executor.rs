@@ -33,7 +33,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value as JsonValue, json};
 use serde_yaml_ng::Value as YamlValue;
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -67,6 +67,10 @@ const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(360 * 60);
 const ENVIRONMENT_VARIABLE_PAGE_SIZE: usize = 30;
 const MAX_ENVIRONMENT_VARIABLES: usize = 100;
 const MAX_CONFIGURATION_VARIABLE_BYTES: usize = 48 * 1_024;
+const DEPLOYMENT_BRANCH_POLICY_PAGE_SIZE: usize = 100;
+const MAX_DEPLOYMENT_BRANCH_POLICIES: usize = 1_000;
+const MAX_DEPLOYMENT_BRANCH_PATTERN_BYTES: usize = 1_024;
+const MAX_DEPLOYMENT_BRANCH_PATTERN_TOTAL_BYTES: usize = 256 * 1_024;
 const MAX_CHECKOUT_FILTER_BYTES: usize = 1_024;
 const MAX_CHECKOUT_REF_BYTES: usize = 1_024;
 const MAX_SPARSE_CHECKOUT_PATTERNS: usize = 4_096;
@@ -1108,7 +1112,50 @@ struct GitHubEnvironmentMetadata {
     #[serde(default)]
     protection_rules: Vec<JsonValue>,
     #[serde(default)]
-    deployment_branch_policy: Option<JsonValue>,
+    deployment_branch_policy: Option<GitHubDeploymentBranchPolicySettings>,
+}
+
+#[derive(Deserialize)]
+struct GitHubDeploymentBranchPolicySettings {
+    protected_branches: bool,
+    custom_branch_policies: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeploymentBranchPolicyMode {
+    Unrestricted,
+    ProtectedBranches,
+    Custom,
+}
+
+#[derive(Clone, Copy)]
+struct GitHubEnvironmentRequest<'a> {
+    api_base: &'a str,
+    owner: &'a str,
+    repository: &'a str,
+    environment_name: &'a str,
+    github_ref: &'a str,
+    api_version: &'a str,
+    token: &'a str,
+}
+
+#[derive(Deserialize)]
+struct DeploymentBranchPolicyPage {
+    total_count: usize,
+    branch_policies: Vec<DeploymentBranchPolicy>,
+}
+
+#[derive(Deserialize)]
+struct DeploymentBranchPolicy {
+    name: String,
+    #[serde(rename = "type")]
+    policy_type: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubBranch {
+    name: String,
+    protected: bool,
 }
 
 #[derive(Deserialize)]
@@ -1154,12 +1201,15 @@ async fn environment_variables_for_job(
             format!("issue environment-read token for GitHub environment '{environment_name}'")
         })?;
     let variables = fetch_github_environment_variables_from(
-        "https://api.github.com",
-        &run.repository.owner,
-        &run.repository.name,
-        environment_name,
-        &run.github_api_version,
-        &environment_token,
+        GitHubEnvironmentRequest {
+            api_base: "https://api.github.com",
+            owner: &run.repository.owner,
+            repository: &run.repository.name,
+            environment_name,
+            github_ref: &run.pull_request.execution_ref,
+            api_version: &run.github_api_version,
+            token: &environment_token,
+        },
         cancel,
     )
     .await?;
@@ -1186,12 +1236,7 @@ fn merge_configuration_variables(
 }
 
 async fn fetch_github_environment_variables_from(
-    api_base: &str,
-    owner: &str,
-    repository: &str,
-    environment_name: &str,
-    api_version: &str,
-    token: &str,
+    request: GitHubEnvironmentRequest<'_>,
     cancel: &watch::Receiver<bool>,
 ) -> Result<BTreeMap<String, String>> {
     let client = reqwest::Client::builder()
@@ -1200,27 +1245,28 @@ async fn fetch_github_environment_variables_from(
         .build()
         .context("build GitHub environment API client")?;
     let metadata_endpoint = github_repository_api_url(
-        api_base,
-        owner,
-        repository,
-        &["environments", environment_name],
+        request.api_base,
+        request.owner,
+        request.repository,
+        &["environments", request.environment_name],
     )?;
     let metadata: GitHubEnvironmentMetadata = github_api_get_json(
         &client,
         metadata_endpoint,
-        api_version,
-        token,
+        request.api_version,
+        request.token,
         cancel,
-        &format!("get environment '{environment_name}'"),
+        &format!("get environment '{}'", request.environment_name),
     )
     .await?;
-    validate_environment_metadata(environment_name, &metadata)?;
+    let branch_policy = validate_environment_metadata(request.environment_name, &metadata)?;
+    enforce_environment_branch_policy(&client, request, branch_policy, cancel).await?;
 
     let mut endpoint = github_repository_api_url(
-        api_base,
-        owner,
-        repository,
-        &["environments", environment_name, "variables"],
+        request.api_base,
+        request.owner,
+        request.repository,
+        &["environments", request.environment_name, "variables"],
     )?;
     let maximum_pages = MAX_ENVIRONMENT_VARIABLES.div_ceil(ENVIRONMENT_VARIABLE_PAGE_SIZE);
     let mut selected = BTreeMap::new();
@@ -1234,26 +1280,31 @@ async fn fetch_github_environment_variables_from(
         let response: ActionsVariablePage = github_api_get_json(
             &client,
             endpoint.clone(),
-            api_version,
-            token,
+            request.api_version,
+            request.token,
             cancel,
-            &format!("list environment '{environment_name}' variables page {page}"),
+            &format!(
+                "list environment '{}' variables page {page}",
+                request.environment_name
+            ),
         )
         .await?;
         if response.total_count > MAX_ENVIRONMENT_VARIABLES {
             bail!(
-                "GitHub environment '{environment_name}' reports more than {MAX_ENVIRONMENT_VARIABLES} variables"
+                "GitHub environment '{}' reports more than {MAX_ENVIRONMENT_VARIABLES} variables",
+                request.environment_name
             );
         }
         if response.variables.len() > ENVIRONMENT_VARIABLE_PAGE_SIZE {
             bail!(
-                "GitHub environment '{environment_name}' returned too many variables on page {page}"
+                "GitHub environment '{}' returned too many variables on page {page}",
+                request.environment_name
             );
         }
         let page_len = response.variables.len();
         for variable in response.variables {
             insert_environment_variable(
-                environment_name,
+                request.environment_name,
                 variable,
                 &mut selected,
                 &mut normalized_names,
@@ -1269,7 +1320,7 @@ async fn fetch_github_environment_variables_from(
 fn validate_environment_metadata(
     requested_name: &str,
     metadata: &GitHubEnvironmentMetadata,
-) -> Result<()> {
+) -> Result<DeploymentBranchPolicyMode> {
     if !metadata.name.eq_ignore_ascii_case(requested_name) {
         bail!(
             "GitHub returned environment '{}' while '{}' was requested",
@@ -1277,12 +1328,415 @@ fn validate_environment_metadata(
             requested_name
         );
     }
-    if !metadata.protection_rules.is_empty() || metadata.deployment_branch_policy.is_some() {
+    if !metadata.protection_rules.is_empty() {
         bail!(
-            "GitHub environment '{requested_name}' has deployment protection or branch rules that GitZero cannot safely emulate"
+            "GitHub environment '{requested_name}' has reviewer, wait-timer, or custom deployment protection rules that GitZero cannot safely emulate"
+        );
+    }
+    match &metadata.deployment_branch_policy {
+        None => Ok(DeploymentBranchPolicyMode::Unrestricted),
+        Some(policy) => match (policy.protected_branches, policy.custom_branch_policies) {
+            (true, false) => Ok(DeploymentBranchPolicyMode::ProtectedBranches),
+            (false, true) => Ok(DeploymentBranchPolicyMode::Custom),
+            _ => bail!(
+                "GitHub environment '{requested_name}' returned an invalid deployment branch policy"
+            ),
+        },
+    }
+}
+
+async fn enforce_environment_branch_policy(
+    client: &reqwest::Client,
+    request: GitHubEnvironmentRequest<'_>,
+    policy: DeploymentBranchPolicyMode,
+    cancel: &watch::Receiver<bool>,
+) -> Result<()> {
+    match policy {
+        DeploymentBranchPolicyMode::Unrestricted => Ok(()),
+        DeploymentBranchPolicyMode::ProtectedBranches => {
+            enforce_protected_branch_policy(client, request, cancel).await
+        }
+        DeploymentBranchPolicyMode::Custom => {
+            enforce_custom_branch_policy(client, request, cancel).await
+        }
+    }
+}
+
+async fn enforce_custom_branch_policy(
+    client: &reqwest::Client,
+    request: GitHubEnvironmentRequest<'_>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<()> {
+    let (reference_type, reference_name) = deployment_policy_reference(request.github_ref)?;
+    let mut endpoint = github_repository_api_url(
+        request.api_base,
+        request.owner,
+        request.repository,
+        &[
+            "environments",
+            request.environment_name,
+            "deployment-branch-policies",
+        ],
+    )?;
+    let maximum_pages = MAX_DEPLOYMENT_BRANCH_POLICIES.div_ceil(DEPLOYMENT_BRANCH_POLICY_PAGE_SIZE);
+    let mut received = 0usize;
+    let mut pattern_bytes = 0usize;
+    let mut matched = false;
+    let mut reported_total = None;
+    for page in 1..=maximum_pages {
+        endpoint
+            .query_pairs_mut()
+            .clear()
+            .append_pair("per_page", &DEPLOYMENT_BRANCH_POLICY_PAGE_SIZE.to_string())
+            .append_pair("page", &page.to_string());
+        let response: DeploymentBranchPolicyPage = github_api_get_json(
+            client,
+            endpoint.clone(),
+            request.api_version,
+            request.token,
+            cancel,
+            &format!(
+                "list environment '{}' deployment branch policies page {page}",
+                request.environment_name
+            ),
+        )
+        .await?;
+        if response.total_count > MAX_DEPLOYMENT_BRANCH_POLICIES {
+            bail!(
+                "GitHub environment '{}' reports more than {MAX_DEPLOYMENT_BRANCH_POLICIES} deployment branch policies",
+                request.environment_name
+            );
+        }
+        if reported_total
+            .replace(response.total_count)
+            .is_some_and(|total| total != response.total_count)
+        {
+            bail!(
+                "GitHub environment '{}' changed its deployment branch policy count during pagination",
+                request.environment_name
+            );
+        }
+        if response.branch_policies.len() > DEPLOYMENT_BRANCH_POLICY_PAGE_SIZE {
+            bail!(
+                "GitHub environment '{}' returned too many deployment branch policies on page {page}",
+                request.environment_name
+            );
+        }
+        let page_len = response.branch_policies.len();
+        for branch_policy in response.branch_policies {
+            if branch_policy.name.is_empty()
+                || branch_policy.name.len() > MAX_DEPLOYMENT_BRANCH_PATTERN_BYTES
+                || branch_policy.name.contains(['\0', '\n', '\r'])
+                || !matches!(branch_policy.policy_type.as_str(), "branch" | "tag")
+            {
+                bail!(
+                    "GitHub environment '{}' returned an invalid deployment branch policy",
+                    request.environment_name
+                );
+            }
+            pattern_bytes = pattern_bytes
+                .checked_add(branch_policy.name.len())
+                .context("deployment branch policy size overflow")?;
+            if pattern_bytes > MAX_DEPLOYMENT_BRANCH_PATTERN_TOTAL_BYTES {
+                bail!(
+                    "GitHub environment '{}' deployment branch policies exceed the size limit",
+                    request.environment_name
+                );
+            }
+            matched |= branch_policy.policy_type == reference_type
+                && deployment_pattern_matches(&branch_policy.name, reference_name);
+            received += 1;
+        }
+        if page_len < DEPLOYMENT_BRANCH_POLICY_PAGE_SIZE || received >= response.total_count {
+            break;
+        }
+    }
+    let expected = reported_total.unwrap_or_default();
+    if received != expected {
+        bail!(
+            "GitHub environment '{}' returned {received} of {expected} deployment branch policies",
+            request.environment_name
+        );
+    }
+    if !matched {
+        bail!(
+            "GitHub environment '{}' deployment branch policies do not allow ref '{}'",
+            request.environment_name,
+            request.github_ref
         );
     }
     Ok(())
+}
+
+async fn enforce_protected_branch_policy(
+    client: &reqwest::Client,
+    request: GitHubEnvironmentRequest<'_>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<()> {
+    let mut protected_endpoint = github_repository_api_url(
+        request.api_base,
+        request.owner,
+        request.repository,
+        &["branches"],
+    )?;
+    protected_endpoint
+        .query_pairs_mut()
+        .append_pair("protected", "true")
+        .append_pair("per_page", "1")
+        .append_pair("page", "1");
+    let protected: Vec<GitHubBranch> = github_api_get_json(
+        client,
+        protected_endpoint,
+        request.api_version,
+        request.token,
+        cancel,
+        "list protected repository branches",
+    )
+    .await?;
+    if protected.len() > 1 {
+        bail!("GitHub returned too many protected repository branches");
+    }
+    if protected.iter().any(|branch| !branch.protected) {
+        bail!("GitHub returned an invalid protected repository branch");
+    }
+    if protected.is_empty() {
+        return Ok(());
+    }
+    let Some(branch) = request.github_ref.strip_prefix("refs/heads/") else {
+        bail!(
+            "GitHub environment '{}' allows only protected branches, and ref '{}' is not a repository branch",
+            request.environment_name,
+            request.github_ref
+        );
+    };
+    if branch.is_empty() {
+        bail!("GitHub returned an invalid workflow ref");
+    }
+    let branch_endpoint = github_repository_api_url(
+        request.api_base,
+        request.owner,
+        request.repository,
+        &["branches", branch],
+    )?;
+    let selected: GitHubBranch = github_api_get_json(
+        client,
+        branch_endpoint,
+        request.api_version,
+        request.token,
+        cancel,
+        &format!("get repository branch '{branch}'"),
+    )
+    .await?;
+    if selected.name != branch {
+        bail!(
+            "GitHub returned branch '{}' while '{}' was requested",
+            selected.name,
+            branch
+        );
+    }
+    if !selected.protected {
+        bail!(
+            "GitHub environment '{}' allows only protected branches, and branch '{branch}' is not protected",
+            request.environment_name
+        );
+    }
+    Ok(())
+}
+
+fn deployment_policy_reference(github_ref: &str) -> Result<(&'static str, &str)> {
+    if let Some(branch) = github_ref.strip_prefix("refs/heads/")
+        && !branch.is_empty()
+    {
+        return Ok(("branch", branch));
+    }
+    if let Some(tag) = github_ref.strip_prefix("refs/tags/")
+        && !tag.is_empty()
+    {
+        return Ok(("tag", tag));
+    }
+    if github_ref.starts_with("refs/pull/") {
+        return Ok(("branch", github_ref));
+    }
+    bail!("workflow ref '{github_ref}' cannot be evaluated against deployment branch policies")
+}
+
+fn deployment_pattern_matches(pattern: &str, candidate: &str) -> bool {
+    fn character_class(pattern: &[char], start: usize, value: char) -> Option<(usize, bool)> {
+        let mut index = start + 1;
+        let negated = pattern
+            .get(index)
+            .is_some_and(|character| matches!(character, '!' | '^'));
+        if negated {
+            index += 1;
+        }
+        let mut values = Vec::new();
+        while index < pattern.len() && pattern[index] != ']' {
+            let (character, escaped) = if pattern[index] == '\\' {
+                index += 1;
+                (*pattern.get(index)?, true)
+            } else {
+                (pattern[index], false)
+            };
+            values.push((character, escaped));
+            index += 1;
+        }
+        if index >= pattern.len() || values.is_empty() {
+            return None;
+        }
+        let mut matched = false;
+        let mut value_index = 0;
+        while value_index < values.len() {
+            if value_index + 2 < values.len() && values[value_index + 1] == ('-', false) {
+                let start = values[value_index].0;
+                let end = values[value_index + 2].0;
+                matched |= start <= end && (start..=end).contains(&value);
+                value_index += 3;
+            } else {
+                matched |= values[value_index].0 == value;
+                value_index += 1;
+            }
+        }
+        Some((index + 1, if negated { !matched } else { matched }))
+    }
+
+    fn matches(
+        pattern: &[char],
+        candidate: &[char],
+        pattern_index: usize,
+        candidate_index: usize,
+        memo: &mut HashMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(result) = memo.get(&(pattern_index, candidate_index)) {
+            return *result;
+        }
+        let result = if pattern_index == pattern.len() {
+            candidate_index == candidate.len()
+        } else {
+            let at_segment_start = candidate_index == 0
+                || candidate
+                    .get(candidate_index.wrapping_sub(1))
+                    .is_some_and(|character| *character == '/');
+            match pattern[pattern_index] {
+                '\\' => pattern.get(pattern_index + 1).is_some_and(|literal| {
+                    candidate.get(candidate_index) == Some(literal)
+                        && matches(
+                            pattern,
+                            candidate,
+                            pattern_index + 2,
+                            candidate_index + 1,
+                            memo,
+                        )
+                }),
+                '/' => {
+                    candidate.get(candidate_index) == Some(&'/')
+                        && matches(
+                            pattern,
+                            candidate,
+                            pattern_index + 1,
+                            candidate_index + 1,
+                            memo,
+                        )
+                }
+                '?' => candidate.get(candidate_index).is_some_and(|character| {
+                    *character != '/'
+                        && !(at_segment_start && *character == '.')
+                        && matches(
+                            pattern,
+                            candidate,
+                            pattern_index + 1,
+                            candidate_index + 1,
+                            memo,
+                        )
+                }),
+                '[' => candidate.get(candidate_index).is_some_and(|character| {
+                    *character != '/'
+                        && !(at_segment_start && *character == '.')
+                        && character_class(pattern, pattern_index, *character).is_some_and(
+                            |(next_pattern, class_matches)| {
+                                class_matches
+                                    && matches(
+                                        pattern,
+                                        candidate,
+                                        next_pattern,
+                                        candidate_index + 1,
+                                        memo,
+                                    )
+                            },
+                        )
+                }),
+                '*' => {
+                    let mut after_stars = pattern_index + 1;
+                    while pattern.get(after_stars) == Some(&'*') {
+                        after_stars += 1;
+                    }
+                    let globstar_directory = after_stars >= pattern_index + 2
+                        && pattern.get(after_stars) == Some(&'/')
+                        && (pattern_index == 0 || pattern[pattern_index - 1] == '/');
+                    if globstar_directory {
+                        matches(pattern, candidate, after_stars + 1, candidate_index, memo)
+                            || candidate.get(candidate_index).is_some_and(|first| {
+                                if *first == '.' && at_segment_start {
+                                    return false;
+                                }
+                                let Some(relative_slash) = candidate[candidate_index..]
+                                    .iter()
+                                    .position(|character| *character == '/')
+                                else {
+                                    return false;
+                                };
+                                matches(
+                                    pattern,
+                                    candidate,
+                                    pattern_index,
+                                    candidate_index + relative_slash + 1,
+                                    memo,
+                                )
+                            })
+                    } else if at_segment_start && candidate.get(candidate_index) == Some(&'.') {
+                        false
+                    } else {
+                        matches(pattern, candidate, after_stars, candidate_index, memo)
+                            || candidate.get(candidate_index).is_some_and(|character| {
+                                *character != '/'
+                                    && matches(
+                                        pattern,
+                                        candidate,
+                                        pattern_index,
+                                        candidate_index + 1,
+                                        memo,
+                                    )
+                            })
+                    }
+                }
+                literal => {
+                    candidate.get(candidate_index) == Some(&literal)
+                        && matches(
+                            pattern,
+                            candidate,
+                            pattern_index + 1,
+                            candidate_index + 1,
+                            memo,
+                        )
+                }
+            }
+        };
+        memo.insert((pattern_index, candidate_index), result);
+        result
+    }
+
+    if pattern.is_empty()
+        || pattern.len() > MAX_DEPLOYMENT_BRANCH_PATTERN_BYTES
+        || pattern.contains(['\0', '\n', '\r'])
+    {
+        return false;
+    }
+    matches(
+        &pattern.chars().collect::<Vec<_>>(),
+        &candidate.chars().collect::<Vec<_>>(),
+        0,
+        0,
+        &mut HashMap::new(),
+    )
 }
 
 fn insert_environment_variable(
@@ -10445,7 +10899,7 @@ jobs:
     }
 
     #[test]
-    fn protected_github_environments_fail_closed() {
+    fn environment_metadata_rejects_protection_gates_and_selects_branch_policy_modes() {
         let protected = GitHubEnvironmentMetadata {
             name: "production".to_owned(),
             protection_rules: vec![json!({"type": "required_reviewers"})],
@@ -10458,9 +10912,85 @@ jobs:
         let restricted = GitHubEnvironmentMetadata {
             name: "production".to_owned(),
             protection_rules: Vec::new(),
-            deployment_branch_policy: Some(json!({"protected_branches": true})),
+            deployment_branch_policy: Some(GitHubDeploymentBranchPolicySettings {
+                protected_branches: true,
+                custom_branch_policies: false,
+            }),
         };
-        assert!(validate_environment_metadata("production", &restricted).is_err());
+        assert_eq!(
+            validate_environment_metadata("production", &restricted)
+                .expect("protected branch policy"),
+            DeploymentBranchPolicyMode::ProtectedBranches
+        );
+
+        let custom = GitHubEnvironmentMetadata {
+            name: "production".to_owned(),
+            protection_rules: Vec::new(),
+            deployment_branch_policy: Some(GitHubDeploymentBranchPolicySettings {
+                protected_branches: false,
+                custom_branch_policies: true,
+            }),
+        };
+        assert_eq!(
+            validate_environment_metadata("production", &custom).expect("custom branch policy"),
+            DeploymentBranchPolicyMode::Custom
+        );
+
+        let invalid = GitHubEnvironmentMetadata {
+            name: "production".to_owned(),
+            protection_rules: Vec::new(),
+            deployment_branch_policy: Some(GitHubDeploymentBranchPolicySettings {
+                protected_branches: true,
+                custom_branch_policies: true,
+            }),
+        };
+        assert!(validate_environment_metadata("production", &invalid).is_err());
+    }
+
+    #[test]
+    fn deployment_branch_patterns_follow_githubs_path_aware_fnmatch_rules() {
+        for (pattern, candidate) in [
+            ("releases/*", "releases/v1"),
+            ("release/*/*", "release/2026/v1"),
+            ("refs/pull/*/merge", "refs/pull/42/merge"),
+            ("feature/?", "feature/x"),
+            ("release/[0-9]", "release/7"),
+            ("release/[!a-z]", "release/7"),
+            (r"release/\*", "release/*"),
+            ("**/release", "nested/deep/release"),
+            ("**/.release", "nested/.release"),
+        ] {
+            assert!(
+                deployment_pattern_matches(pattern, candidate),
+                "{pattern:?} did not match {candidate:?}"
+            );
+        }
+        for (pattern, candidate) in [
+            ("releases/*", "releases/2026/v1"),
+            ("refs/pull/*/merge", "refs/pull/nested/42/merge"),
+            ("release/?", "release/xy"),
+            ("release/[!a-z]", "release/x"),
+            ("*", ".hidden"),
+            ("**/*", "nested/.hidden"),
+            ("[abc", "a"),
+        ] {
+            assert!(
+                !deployment_pattern_matches(pattern, candidate),
+                "{pattern:?} unexpectedly matched {candidate:?}"
+            );
+        }
+        assert_eq!(
+            deployment_policy_reference("refs/heads/releases/v1").expect("branch reference"),
+            ("branch", "releases/v1")
+        );
+        assert_eq!(
+            deployment_policy_reference("refs/pull/42/merge").expect("pull request reference"),
+            ("branch", "refs/pull/42/merge")
+        );
+        assert_eq!(
+            deployment_policy_reference("refs/tags/v1").expect("tag reference"),
+            ("tag", "v1")
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -10659,14 +11189,18 @@ jobs:
             }
         });
         let (_cancel_tx, cancel) = watch::channel(false);
+        let api_base = format!("http://{address}");
 
         let variables = fetch_github_environment_variables_from(
-            &format!("http://{address}"),
-            "acme",
-            "widget",
-            "production/us",
-            "2026-03-10",
-            "environment-token",
+            GitHubEnvironmentRequest {
+                api_base: &api_base,
+                owner: "acme",
+                repository: "widget",
+                environment_name: "production/us",
+                github_ref: "refs/pull/7/merge",
+                api_version: "2026-03-10",
+                token: "environment-token",
+            },
             &cancel,
         )
         .await
@@ -10688,6 +11222,195 @@ jobs:
                 .to_ascii_lowercase()
                 .contains("authorization: bearer environment-token")
         }));
+    }
+
+    #[tokio::test]
+    async fn fetches_paginated_custom_environment_branch_policies_before_variables() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let first_page = (0..DEPLOYMENT_BRANCH_POLICY_PAGE_SIZE)
+            .map(|index| {
+                json!({
+                    "name": format!("feature/{index}"),
+                    "type": "branch"
+                })
+            })
+            .collect::<Vec<_>>();
+        let responses = vec![
+            json!({
+                "total_count": 1,
+                "branch_policies": [{"name": "refs/heads/main", "type": "branch"}]
+            }),
+            json!({
+                "name": "production/us",
+                "protection_rules": [],
+                "deployment_branch_policy": {
+                    "protected_branches": false,
+                    "custom_branch_policies": true
+                }
+            }),
+            json!({"total_count": 101, "branch_policies": first_page}),
+            json!({
+                "total_count": 101,
+                "branch_policies": [{"name": "refs/pull/*/merge", "type": "branch"}]
+            }),
+            json!({"total_count": 0, "variables": []}),
+        ];
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests_tx
+                    .send(String::from_utf8(request).expect("HTTP request UTF-8"))
+                    .expect("record request");
+                let body = serde_json::to_vec(&response).expect("response JSON");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .expect("write response headers");
+                stream.write_all(&body).expect("write response body");
+            }
+        });
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("test client");
+        let api_base = format!("http://{address}");
+        let request = GitHubEnvironmentRequest {
+            api_base: &api_base,
+            owner: "acme",
+            repository: "widget",
+            environment_name: "production/us",
+            github_ref: "refs/pull/7/merge",
+            api_version: "2026-03-10",
+            token: "environment-token",
+        };
+
+        let error = enforce_custom_branch_policy(&client, request, &cancel)
+            .await
+            .expect_err("nonmatching deployment branch policy should fail");
+        assert!(format!("{error:#}").contains("do not allow ref"));
+
+        let variables = fetch_github_environment_variables_from(request, &cancel)
+            .await
+            .expect("fetch branch-gated environment variables");
+        server.join().expect("join test server");
+        let requests = requests_rx.iter().collect::<Vec<_>>();
+
+        assert!(variables.is_empty());
+        assert_eq!(requests.len(), 5);
+        assert!(requests[0].starts_with(
+            "GET /repos/acme/widget/environments/production%2Fus/deployment-branch-policies?per_page=100&page=1 HTTP/1.1"
+        ));
+        assert!(requests[2].starts_with(
+            "GET /repos/acme/widget/environments/production%2Fus/deployment-branch-policies?per_page=100&page=1 HTTP/1.1"
+        ));
+        assert!(requests[3].contains("page=2"));
+        assert!(requests[4].starts_with(
+            "GET /repos/acme/widget/environments/production%2Fus/variables?per_page=30&page=1 HTTP/1.1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn protected_environment_branch_policy_handles_pull_and_branch_refs() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let protected_branch = json!({"name": "main", "protected": true});
+        let responses = vec![
+            json!([]),
+            json!([protected_branch.clone()]),
+            json!([protected_branch.clone()]),
+            protected_branch,
+        ];
+        let (requests_tx, requests_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests_tx
+                    .send(String::from_utf8(request).expect("HTTP request UTF-8"))
+                    .expect("record request");
+                let body = serde_json::to_vec(&response).expect("response JSON");
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .expect("write response headers");
+                stream.write_all(&body).expect("write response body");
+            }
+        });
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("test client");
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let api_base = format!("http://{address}");
+        let request = GitHubEnvironmentRequest {
+            api_base: &api_base,
+            owner: "acme",
+            repository: "widget",
+            environment_name: "production",
+            github_ref: "refs/pull/7/merge",
+            api_version: "2026-03-10",
+            token: "environment-token",
+        };
+
+        enforce_protected_branch_policy(&client, request, &cancel)
+            .await
+            .expect("an empty repository protection set allows every ref");
+        let error = enforce_protected_branch_policy(&client, request, &cancel)
+            .await
+            .expect_err("pull request ref should not count as a protected branch");
+        assert!(format!("{error:#}").contains("not a repository branch"));
+        enforce_protected_branch_policy(
+            &client,
+            GitHubEnvironmentRequest {
+                github_ref: "refs/heads/main",
+                ..request
+            },
+            &cancel,
+        )
+        .await
+        .expect("protected branch");
+
+        server.join().expect("join test server");
+        let requests = requests_rx.iter().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[..3].iter().all(|request| request.starts_with(
+            "GET /repos/acme/widget/branches?protected=true&per_page=1&page=1 HTTP/1.1"
+        )));
+        assert!(requests[3].starts_with("GET /repos/acme/widget/branches/main HTTP/1.1"));
     }
 
     #[tokio::test]

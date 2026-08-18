@@ -94,7 +94,11 @@ describe("GitHub Actions variables", () => {
         },
         {
           repositories: ["hello-world"],
-          permissions: { actions: "read", environments: "read" },
+          permissions: {
+            actions: "read",
+            contents: "read",
+            environments: "read",
+          },
         },
       ]),
     );

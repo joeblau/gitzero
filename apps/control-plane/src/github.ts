@@ -365,6 +365,7 @@ export async function createEnvironmentToken(
 ): Promise<InstallationAccessToken> {
   return createInstallationAccessToken(env, installationId, repository, {
     actions: "read",
+    contents: "read",
     environments: "read",
   });
 }

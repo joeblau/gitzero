@@ -1506,7 +1506,7 @@ describe("Workspace Durable Object", () => {
         [
           "environment",
           "environment-token",
-          { actions: "read", environments: "read" },
+          { actions: "read", contents: "read", environments: "read" },
         ],
       ] as const) {
         const internalRequestId = crypto.randomUUID();
