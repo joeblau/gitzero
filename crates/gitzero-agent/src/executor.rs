@@ -3620,7 +3620,7 @@ impl Drop for SensitiveDirectoryGuard {
                 info!(
                     path = %self.0.display(),
                     %error,
-                    "failed to remove checkout credential directory"
+                    "failed to remove sensitive temporary directory"
                 );
             }
         }
@@ -4596,13 +4596,14 @@ async fn execute_checkout_step_with_repository(
         workspace,
         inputs.get("path").map(String::as_str).unwrap_or(""),
     )?;
-    validate_checkout_directory(workspace, &checkout_directory).await?;
+    let safe_checkout_directory =
+        validate_checkout_directory(workspace, &checkout_directory).await?;
     let clean = checkout_boolean(inputs, "clean", true)?;
     let fetch_tags = checkout_boolean(inputs, "fetch-tags", false)?;
     let lfs = checkout_boolean(inputs, "lfs", false)?;
     let show_progress = checkout_boolean(inputs, "show-progress", true)?;
     let persist_credentials = checkout_boolean(inputs, "persist-credentials", true)?;
-    let _set_safe_directory = checkout_boolean(inputs, "set-safe-directory", true)?;
+    let set_safe_directory = checkout_boolean(inputs, "set-safe-directory", true)?;
     let _allow_unsafe_pr_checkout = checkout_boolean(inputs, "allow-unsafe-pr-checkout", false)?;
     let sparse_checkout_cone_mode = checkout_boolean(inputs, "sparse-checkout-cone-mode", true)?;
     let sparse_checkout = checkout_sparse_patterns(inputs.get("sparse-checkout"))?;
@@ -4715,6 +4716,13 @@ async fn execute_checkout_step_with_repository(
     };
 
     let mut checkout_environment = environment.clone();
+    let _safe_directory_guard = configure_checkout_safe_directory(
+        &mut checkout_environment,
+        &safe_checkout_directory,
+        run_dir,
+        set_safe_directory,
+    )
+    .await?;
     let rewrite_ssh_submodule_urls = submodules != "false" && ssh_credentials.is_none();
     configure_checkout_credentials(
         &mut checkout_environment,
@@ -4749,7 +4757,8 @@ async fn execute_checkout_step_with_repository(
             .map(|credentials| credentials.command.as_str()),
     );
 
-    let existing_repository = git_repository_exists(&checkout_directory).await?;
+    let existing_repository =
+        git_repository_exists(&checkout_directory, &checkout_environment).await?;
     if !existing_repository {
         clear_checkout_directory(&checkout_directory).await?;
         tokio::fs::create_dir_all(&checkout_directory)
@@ -4760,7 +4769,8 @@ async fn execute_checkout_step_with_repository(
         let mut command = Command::new("git");
         command
             .args(["init", "--quiet"])
-            .current_dir(&checkout_directory);
+            .current_dir(&checkout_directory)
+            .envs(checkout_environment.iter());
         run_process(
             job_id,
             step_id,
@@ -4778,6 +4788,7 @@ async fn execute_checkout_step_with_repository(
     let has_origin = Command::new("git")
         .args(["remote", "get-url", "origin"])
         .current_dir(&checkout_directory)
+        .envs(checkout_environment.iter())
         .output()
         .await
         .context("inspect checkout origin")?
@@ -4789,7 +4800,9 @@ async fn execute_checkout_step_with_repository(
     } else {
         remote.args(["remote", "add", "origin", &checkout_remote]);
     }
-    remote.current_dir(&checkout_directory);
+    remote
+        .current_dir(&checkout_directory)
+        .envs(checkout_environment.iter());
     run_process(
         job_id,
         step_id,
@@ -4807,6 +4820,7 @@ async fn execute_checkout_step_with_repository(
         let has_head = Command::new("git")
             .args(["rev-parse", "--verify", "HEAD"])
             .current_dir(&checkout_directory)
+            .envs(checkout_environment.iter())
             .output()
             .await
             .context("inspect existing checkout HEAD")?
@@ -5029,6 +5043,7 @@ async fn execute_checkout_step_with_repository(
     let symbolic_head = Command::new("git")
         .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
         .current_dir(&checkout_directory)
+        .envs(checkout_environment.iter())
         .output()
         .await
         .with_context(|| checkout_context.to_owned())?;
@@ -5148,6 +5163,7 @@ async fn execute_checkout_step_with_repository(
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&checkout_directory)
+        .envs(checkout_environment.iter())
         .output()
         .await
         .context("verify actions/checkout HEAD")?;
@@ -6074,6 +6090,7 @@ fn select_cross_repository_checkout_access(
 
 const CHECKOUT_HTTP_EXTRAHEADER: &str = "http.https://github.com/.extraheader";
 const CHECKOUT_SSH_INSTEAD_OF: &str = "url.https://github.com/.insteadOf";
+const CHECKOUT_SAFE_DIRECTORY: &str = "safe.directory";
 const MAX_INLINE_GIT_CONFIG_PARAMETERS: usize = 256;
 
 fn configure_checkout_credentials(
@@ -6146,6 +6163,92 @@ fn configure_checkout_ssh(environment: &mut BTreeMap<String, String>, command: O
     }
 }
 
+async fn configure_checkout_safe_directory(
+    environment: &mut BTreeMap<String, String>,
+    directory: &Path,
+    run_dir: &Path,
+    enabled: bool,
+) -> Result<Option<SensitiveDirectoryGuard>> {
+    if !enabled {
+        return Ok(None);
+    }
+    let runner_temp = environment
+        .get("RUNNER_TEMP")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| run_dir.join("_temp"));
+    tokio::fs::create_dir_all(&runner_temp)
+        .await
+        .context("create actions/checkout temporary directory")?;
+    let temporary_home = runner_temp.join(format!("checkout-global-{}", Uuid::new_v4()));
+    tokio::fs::create_dir(&temporary_home)
+        .await
+        .context("create actions/checkout temporary Git home")?;
+    let guard = SensitiveDirectoryGuard(temporary_home.clone());
+    let temporary_config = temporary_home.join(".gitconfig");
+    let original_config = environment
+        .get("GIT_CONFIG_GLOBAL")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            environment
+                .get("HOME")
+                .filter(|path| !path.is_empty())
+                .map(|home| Path::new(home).join(".gitconfig"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(|home| PathBuf::from(home).join(".gitconfig"))
+        });
+    let copied = if let Some(original_config) = original_config {
+        match tokio::fs::copy(&original_config, &temporary_config).await {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "copy global Git configuration {} for actions/checkout",
+                        original_config.display()
+                    )
+                });
+            }
+        }
+    } else {
+        false
+    };
+    if !copied {
+        write_private_checkout_file(&temporary_config, b"")
+            .context("create actions/checkout temporary global Git configuration")?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&temporary_config, std::fs::Permissions::from_mode(0o600))
+            .context("restrict actions/checkout temporary global Git configuration")?;
+    }
+
+    environment.insert("HOME".to_owned(), temporary_home.display().to_string());
+    environment.insert(
+        "GIT_CONFIG_GLOBAL".to_owned(),
+        temporary_config.display().to_string(),
+    );
+    let output = Command::new("git")
+        .args(["config", "--global", "--add", CHECKOUT_SAFE_DIRECTORY])
+        .arg(directory)
+        .envs(environment.iter())
+        .output()
+        .await
+        .context("run Git while configuring actions/checkout safe.directory")?;
+    if !output.status.success() {
+        bail!(
+            "configure actions/checkout safe.directory: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(Some(guard))
+}
+
 fn checkout_directory(workspace: &Path, path: &str) -> Result<PathBuf> {
     if path.is_empty() || path == "." {
         return Ok(workspace.to_owned());
@@ -6166,10 +6269,11 @@ fn checkout_directory(workspace: &Path, path: &str) -> Result<PathBuf> {
     Ok(workspace.join(relative))
 }
 
-async fn validate_checkout_directory(workspace: &Path, directory: &Path) -> Result<()> {
+async fn validate_checkout_directory(workspace: &Path, directory: &Path) -> Result<PathBuf> {
     let relative = directory
         .strip_prefix(workspace)
         .context("actions/checkout path escapes the job workspace")?;
+    let relative = relative.components().collect::<PathBuf>();
     let workspace = tokio::fs::canonicalize(workspace)
         .await
         .context("canonicalize job workspace")?;
@@ -6185,10 +6289,17 @@ async fn validate_checkout_directory(workspace: &Path, directory: &Path) -> Resu
             Err(error) => return Err(error).context("inspect actions/checkout path"),
         }
     }
-    Ok(())
+    if relative.as_os_str().is_empty() {
+        Ok(workspace)
+    } else {
+        Ok(workspace.join(&relative))
+    }
 }
 
-async fn git_repository_exists(directory: &Path) -> Result<bool> {
+async fn git_repository_exists(
+    directory: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<bool> {
     if !tokio::fs::try_exists(directory).await? {
         return Ok(false);
     }
@@ -6211,6 +6322,7 @@ async fn git_repository_exists(directory: &Path) -> Result<bool> {
     let output = Command::new("git")
         .args(["rev-parse", "--absolute-git-dir"])
         .current_dir(directory)
+        .envs(environment.iter())
         .output()
         .await;
     let Ok(output) = output else {
@@ -10390,6 +10502,18 @@ jobs:
             .expect("outside directory");
         std::os::unix::fs::symlink(&outside, workspace.join("linked")).expect("workspace symlink");
 
+        let nested =
+            checkout_directory(&workspace, "nested/./repository/").expect("nested checkout path");
+        assert_eq!(
+            validate_checkout_directory(&workspace, &nested)
+                .await
+                .expect("canonical nested checkout path"),
+            tokio::fs::canonicalize(&workspace)
+                .await
+                .expect("canonical workspace")
+                .join("nested/repository")
+        );
+
         let directory =
             checkout_directory(&workspace, "linked/repository").expect("lexical checkout path");
         let error = validate_checkout_directory(&workspace, &directory)
@@ -10408,7 +10532,7 @@ jobs:
             .await
             .expect("nested workspace");
         assert!(
-            !git_repository_exists(&workspace)
+            !git_repository_exists(&workspace, &BTreeMap::new())
                 .await
                 .expect("inspect empty nested workspace"),
             "parent repository was mistaken for a job checkout"
@@ -10416,11 +10540,131 @@ jobs:
 
         git(&workspace, ["init"]);
         assert!(
-            git_repository_exists(&workspace)
+            git_repository_exists(&workspace, &BTreeMap::new())
                 .await
                 .expect("inspect direct workspace repository"),
             "direct checkout repository was not recognized"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn checkout_safe_directory_is_ephemeral_and_can_be_disabled() {
+        let fixture = tempfile::tempdir().expect("safe directory tempdir");
+        let source = fixture.path().join("source");
+        let run_dir = fixture.path().join("runs").join(Uuid::new_v4().to_string());
+        let safe_workspace = run_dir.join("safe-workspace");
+        let unsafe_workspace = run_dir.join("unsafe-workspace");
+        for directory in [&source, &run_dir, &safe_workspace, &unsafe_workspace] {
+            std::fs::create_dir_all(directory).expect("fixture directory");
+        }
+        git(&source, ["init", "--initial-branch=main"]);
+        git(&source, ["config", "user.email", "gitzero@example.test"]);
+        git(&source, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(source.join("README.md"), "safe directory fixture\n").expect("fixture file");
+        git(&source, ["add", "README.md"]);
+        git(&source, ["commit", "-m", "safe directory fixture"]);
+        let commit = git_output(&source, ["rev-parse", "HEAD"]);
+        let run = fixture_run(
+            Uuid::new_v4(),
+            commit.clone(),
+            commit,
+            source.display().to_string(),
+        );
+        let repository = checkout_repository(None, &run).expect("same repository");
+        let inputs = BTreeMap::from([("show-progress".to_owned(), "false".to_owned())]);
+        let source_config = fixture.path().join("source-safe.gitconfig");
+        for directory in [
+            source.join(".git"),
+            std::fs::canonicalize(source.join(".git")).expect("canonical source Git directory"),
+        ] {
+            let status = std::process::Command::new("git")
+                .args(["config", "--file"])
+                .arg(&source_config)
+                .args(["--add", CHECKOUT_SAFE_DIRECTORY])
+                .arg(directory)
+                .status()
+                .expect("configure source safe directory");
+            assert!(status.success());
+        }
+        let environment = BTreeMap::from([
+            ("GIT_TEST_ASSUME_DIFFERENT_OWNER".to_owned(), "1".to_owned()),
+            (
+                "GIT_CONFIG_GLOBAL".to_owned(),
+                source_config.display().to_string(),
+            ),
+        ]);
+        let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let repository_access = local_repository_access(&workflow_commands);
+        let (outbound, mut incoming) = mpsc::channel(128);
+        let (_cancel_tx, cancel) = watch::channel(false);
+
+        let mut safe_environment = environment.clone();
+        let safe_result = execute_checkout_step_with_repository(
+            run.id,
+            "0/safe-checkout",
+            &inputs,
+            &run,
+            &source,
+            &safe_workspace,
+            &run_dir,
+            &mut safe_environment,
+            "",
+            repository.clone(),
+            None,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+            &repository_access,
+            &BTreeSet::new(),
+        )
+        .await;
+        if let Err(error) = safe_result {
+            let mut logs = String::new();
+            while let Ok(message) = incoming.try_recv() {
+                if let AgentMessage::LogChunk { data, .. } = message {
+                    logs.push_str(&data);
+                }
+            }
+            panic!("checkout with the default safe directory: {error:#}\n{logs}");
+        }
+        assert_eq!(safe_environment, environment);
+        let status = Command::new("git")
+            .args(["status", "--short"])
+            .current_dir(&safe_workspace)
+            .envs(safe_environment.iter())
+            .output()
+            .await
+            .expect("inspect checkout after the action scope");
+        assert!(!status.status.success());
+        assert!(String::from_utf8_lossy(&status.stderr).contains("dubious ownership"));
+
+        let mut unsafe_inputs = inputs;
+        unsafe_inputs.insert("set-safe-directory".to_owned(), "false".to_owned());
+        let mut unsafe_environment = environment;
+        let error = execute_checkout_step_with_repository(
+            run.id,
+            "1/unsafe-checkout",
+            &unsafe_inputs,
+            &run,
+            &source,
+            &unsafe_workspace,
+            &run_dir,
+            &mut unsafe_environment,
+            "",
+            repository,
+            None,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+            &repository_access,
+            &BTreeSet::new(),
+        )
+        .await
+        .expect_err("checkout without a safe directory should honor Git's ownership rejection");
+        assert!(format!("{error:#}").contains("configure checkout origin"));
+
+        drop(outbound);
     }
 
     #[cfg(target_os = "macos")]
@@ -11361,6 +11605,91 @@ jobs:
         configure_checkout_credentials(&mut job_environment, "", false)
             .expect("remove checkout credentials");
         assert!(!job_environment.contains_key("GIT_CONFIG_VALUE_0"));
+    }
+
+    #[tokio::test]
+    async fn checkout_safe_directory_uses_an_isolated_global_configuration() {
+        let fixture = tempfile::tempdir().expect("safe directory config tempdir");
+        let original_home = fixture.path().join("original-home");
+        let runner_temp = fixture.path().join("runner-temp");
+        let run_dir = fixture.path().join("run");
+        let directory = fixture.path().join("workspace repository");
+        for path in [&original_home, &runner_temp, &run_dir] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        let original_config = original_home.join(".gitconfig");
+        let original_contents = "[core]\n\tquotePath = false\n";
+        std::fs::write(&original_config, original_contents).expect("original global Git config");
+        let job_environment = BTreeMap::from([
+            ("HOME".to_owned(), original_home.display().to_string()),
+            ("RUNNER_TEMP".to_owned(), runner_temp.display().to_string()),
+            ("GIT_CONFIG_COUNT".to_owned(), "1".to_owned()),
+            ("GIT_CONFIG_KEY_0".to_owned(), "core.fileMode".to_owned()),
+            ("GIT_CONFIG_VALUE_0".to_owned(), "false".to_owned()),
+        ]);
+        let mut checkout_environment = job_environment.clone();
+        let guard = configure_checkout_safe_directory(
+            &mut checkout_environment,
+            &directory,
+            &run_dir,
+            true,
+        )
+        .await
+        .expect("configure checkout safe directory")
+        .expect("temporary Git home guard");
+        configure_checkout_credentials(&mut checkout_environment, "built-in-token", true)
+            .expect("compose checkout credentials");
+
+        let temporary_home = PathBuf::from(&checkout_environment["HOME"]);
+        assert_ne!(temporary_home, original_home);
+        assert!(temporary_home.starts_with(&runner_temp));
+        assert_eq!(
+            checkout_environment["GIT_CONFIG_GLOBAL"],
+            temporary_home.join(".gitconfig").display().to_string()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(temporary_home.join(".gitconfig"))
+                    .expect("temporary global Git config metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let global = std::process::Command::new("git")
+            .args(["config", "--global", "--get-regexp", ".*"])
+            .envs(checkout_environment.iter())
+            .output()
+            .expect("inspect temporary global Git config");
+        assert!(global.status.success());
+        let global = String::from_utf8(global.stdout).expect("global Git config UTF-8");
+        assert!(global.contains("core.quotepath false"));
+        assert!(global.contains(&format!("safe.directory {}", directory.display())));
+        assert_eq!(
+            std::fs::read_to_string(&original_config).expect("unchanged original config"),
+            original_contents
+        );
+        assert_eq!(job_environment["HOME"], original_home.display().to_string());
+        assert!(!job_environment.contains_key("GIT_CONFIG_GLOBAL"));
+
+        drop(guard);
+        assert!(!temporary_home.exists());
+        let mut disabled_environment = job_environment.clone();
+        assert!(
+            configure_checkout_safe_directory(
+                &mut disabled_environment,
+                &directory,
+                &run_dir,
+                false,
+            )
+            .await
+            .expect("disable checkout safe directory")
+            .is_none()
+        );
+        assert_eq!(disabled_environment, job_environment);
     }
 
     #[cfg(target_os = "macos")]
