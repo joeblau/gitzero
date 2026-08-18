@@ -5,13 +5,13 @@
   "type": "module",
   "scripts": {
     "build": "wrangler deploy --dry-run --outdir dist",
-    "check": "wrangler types --env-file .types.vars --check && tsc --noEmit",
-    "deploy": "wrangler deploy",
+    "check": "wrangler types --check && tsc --noEmit",
+    "deploy": "node scripts/deploy.mjs",
     "dev": "wrangler dev",
-    "format": "prettier --write src test package.json tsconfig.json wrangler.jsonc vitest.config.ts",
-    "test": "vitest run",
+    "format": "prettier --write src test scripts package.json tsconfig.json wrangler.jsonc vitest.config.ts",
+    "test": "vitest run && node --test scripts/deploy.test.mjs",
     "test:e2e": "node test/e2e.mjs",
-    "types": "wrangler types --env-file .types.vars"
+    "types": "wrangler types"
   },
   "dependencies": {
     "jose": "6.2.9",

@@ -9,6 +9,8 @@ The repository contains two cooperating planes:
 
 The project is intentionally independent of GitHub's hosted runner routing. Repositories onboarded to GitZero disable native GitHub Actions in repository settings, preventing duplicate hosted runs while keeping `.github/workflows/*.yml` unchanged.
 
+Production setup is fail-closed and uses one validated command to upload the Worker configuration and required secrets atomically; see [GitHub App setup](docs/github-app.md).
+
 ## Current compatibility
 
 GitZero executes `pull_request` workflows at the exact webhook head SHA. The implemented surface includes:

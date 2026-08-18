@@ -7,7 +7,7 @@
   "scripts": {
     "build": "npm run build --workspace @gitzero/control-plane && cargo build --workspace",
     "check": "npm run check --workspace @gitzero/control-plane && cargo clippy --workspace --all-targets -- -D warnings",
-    "deploy:control-plane": "npm run deploy --workspace @gitzero/control-plane",
+    "deploy:control-plane": "node apps/control-plane/scripts/deploy.mjs",
     "format": "npm run format --workspace @gitzero/control-plane && cargo fmt --all",
     "test": "npm run test --workspace @gitzero/control-plane && cargo test --workspace",
     "test:e2e": "node apps/control-plane/test/e2e.mjs"

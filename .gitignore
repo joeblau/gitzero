@@ -4,6 +4,7 @@ node_modules/
 .wrangler/
 .dev.vars
 .env
+*.secrets.json
 *.pem
 *.key
 .DS_Store

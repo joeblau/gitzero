@@ -8,6 +8,7 @@ export default defineConfig({
     }),
   ],
   test: {
+    include: ["test/**/*.spec.ts"],
     maxWorkers: 1,
   },
 });

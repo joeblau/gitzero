@@ -7,15 +7,18 @@ Create a GitHub App with:
 - Webhook URL: `https://<control-plane>/webhooks/github`.
 - A high-entropy webhook secret.
 
-Configure Worker secrets interactively; never add their values to this repository:
+Create a JSON secrets file outside the repository with exactly these keys:
 
-```sh
-cd apps/control-plane
-npx wrangler secret put GITHUB_WEBHOOK_SECRET
-npx wrangler secret put GITHUB_APP_PRIVATE_KEY
-npx wrangler secret put AGENT_SHARED_TOKEN
-npx wrangler secret put ADMIN_TOKEN
+```json
+{
+  "GITHUB_WEBHOOK_SECRET": "<at-least-32-byte-random-value>",
+  "GITHUB_APP_PRIVATE_KEY": "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n",
+  "AGENT_SHARED_TOKEN": "<different-at-least-32-byte-random-value>",
+  "ADMIN_TOKEN": "<different-at-least-32-byte-random-value>"
+}
 ```
+
+Use a local editor or secret manager that does not expose the values in shell history. On macOS or Linux, restrict the file with `chmod 600 /absolute/path/gitzero.production.secrets.json`. Never commit it. Git also ignores files ending in `.secrets.json` as a final safeguard.
 
 `AGENT_SHARED_TOKEN` is a high-entropy signing key held only by the Worker. Do not install it on a Mac. After deployment, mint a credential scoped to one installation/workspace and one agent ID:
 
@@ -29,22 +32,44 @@ curl -fsS -X POST \
 
 Use the returned `token` as that Mac's `GITZERO_AGENT_TOKEN`. A credential cannot connect to a different workspace or under a different agent ID. Rotating `AGENT_SHARED_TOKEN` invalidates every issued agent credential.
 
-Set `GITHUB_APP_ID` in `wrangler.jsonc` to the App ID. GitZero uses a signed app JWT to mint one-hour installation tokens only when required. The agent receives a single-repository token with `contents: read` and `pull_requests: read`; this powers same-repository checkout and the built-in `github.token` / `secrets.GITHUB_TOKEN` workflow contexts. A reusable-workflow call may inherit that token or pass it under declared names, but each nested call must pass or inherit the alias again and cannot broaden the token or introduce a repository secret. Public cross-repository checkout is anonymous and never sends this token to the other repository; private cross-repository and custom-token checkout remain unsupported. Separate `checks: write` and `variables: read` tokens remain in the Worker. At authenticated webhook enqueue, the Worker snapshots repository variables and organization variables shared with that repository, applies GitHub's repository precedence and 256 KiB run limit, then sends only the resulting non-sensitive `vars` values with the job.
+Pass the numeric GitHub App ID to the deployment command below. GitZero uses a signed app JWT to mint one-hour installation tokens only when required. The agent receives a single-repository token with `contents: read` and `pull_requests: read`; this powers same-repository checkout and the built-in `github.token` / `secrets.GITHUB_TOKEN` workflow contexts. A reusable-workflow call may inherit that token or pass it under declared names, but each nested call must pass or inherit the alias again and cannot broaden the token or introduce a repository secret. Public cross-repository checkout is anonymous and never sends this token to the other repository; private cross-repository and custom-token checkout remain unsupported. Separate `checks: write` and `variables: read` tokens remain in the Worker. At authenticated webhook enqueue, the Worker snapshots repository variables and organization variables shared with that repository, applies GitHub's repository precedence and 256 KiB run limit, then sends only the resulting non-sensitive `vars` values with the job.
 
 Store the downloaded GitHub App PEM unchanged in `GITHUB_APP_PRIVATE_KEY`, including its header and footer. GitHub downloads PKCS#1 `RSA PRIVATE KEY` files; the Worker wraps that DER key in PKCS#8 in memory for Web Crypto and also accepts an already converted PKCS#8 `PRIVATE KEY`. No local OpenSSL conversion or rewritten secret is required.
 
 When dispatching a GitHub-backed run, the Worker also mints a separate single-repository token with `actions: read` and `environments: read`. The Mac uses it internally to retrieve metadata and up to 100 variables for the exact environment selected by a runnable job. It is redacted from diagnostics and logs, is never inserted into `github.token`, `secrets`, or a workflow process environment, and is discarded when the run ends. Environment responses are cached per run. An environment with reviewer, wait-timer, custom protection, or deployment-branch rules fails closed before any job step starts because GitZero cannot safely bypass or reproduce GitHub's approval gate. Workflow `permissions` declarations cannot broaden either token.
 
-Deploy after the secrets and App ID are configured:
+Install dependencies and validate the repository:
 
 ```sh
 npm ci
 npm test
 npm run check
-npm run deploy:control-plane
 ```
 
-`GET /healthz` is a public, dependency-free liveness check. Before accepting real deliveries, call the authenticated local credential preflight:
+Then validate the production configuration and build locally without changing Cloudflare:
+
+```sh
+npm run deploy:control-plane -- \
+  --account-id <cloudflare-account-id> \
+  --github-app-id <github-app-id> \
+  --secrets-file /absolute/path/gitzero.production.secrets.json
+```
+
+The command verifies the account and App IDs, exact secret set, minimum secret lengths and separation, RSA key material, private file permissions, and that the secret file is not Git-tracked. It then runs a strict Wrangler dry build. Secret values are read from the file and are never placed in process arguments or printed.
+
+After reviewing the dry run, deploy the Worker, Durable Object migration, bindings, variables, and all four secrets together by adding the exact confirmation:
+
+```sh
+npm run deploy:control-plane -- \
+  --account-id <cloudflare-account-id> \
+  --github-app-id <github-app-id> \
+  --secrets-file /absolute/path/gitzero.production.secrets.json \
+  --confirm gitzero-control-plane
+```
+
+On success, the command discovers the `workers.dev` origin and checks both `/healthz` and authenticated `/readyz`. Pass `--url https://<control-plane>` when using a custom hostname. The committed Wrangler configuration declares all four secrets as required, so a raw production deployment fails closed when any secret is absent; use the bootstrap command so configuration and secrets are uploaded atomically.
+
+`GET /healthz` is a public, dependency-free liveness check. The deployment command performs the authenticated local credential preflight automatically. It can also be called directly before accepting real deliveries:
 
 ```sh
 curl -fsS \
