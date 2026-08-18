@@ -14,8 +14,8 @@ const baseRequest = {
 };
 
 describe("agent protocol", () => {
-  it("requires protocol v12 run assignments to carry an exact execution snapshot and credential expiry", () => {
-    expect(PROTOCOL_VERSION).toBe(12);
+  it("requires protocol v13 run assignments to carry an exact execution snapshot and credential expiry", () => {
+    expect(PROTOCOL_VERSION).toBe(13);
     const queued = queuedJobSchema.parse({
       id: "11111111-1111-4111-8111-111111111111",
       workspace_id: "7001",
@@ -144,6 +144,59 @@ describe("agent protocol", () => {
           .success,
       ).toBe(false);
     }
+  });
+
+  it("accepts bounded deployment lifecycle messages and HTTP environment URLs", () => {
+    expect(
+      agentMessageSchema.parse({
+        type: "deployment_started",
+        message_id: baseRequest.message_id,
+        job_id: baseRequest.job_id,
+        unit_id: "deploy / matrix[region=west]",
+        environment: "production-west",
+      }),
+    ).toMatchObject({
+      type: "deployment_started",
+      environment: "production-west",
+    });
+    expect(
+      agentMessageSchema.parse({
+        type: "deployment_finished",
+        message_id: baseRequest.message_id,
+        job_id: baseRequest.job_id,
+        unit_id: "deploy / matrix[region=west]",
+        conclusion: "success",
+        environment_url: "https://west.example.test/releases/42",
+      }),
+    ).toMatchObject({ conclusion: "success" });
+  });
+
+  it("rejects malformed deployment metadata and nonterminal conclusions", () => {
+    const finished = {
+      type: "deployment_finished",
+      message_id: baseRequest.message_id,
+      job_id: baseRequest.job_id,
+      unit_id: "deploy",
+      conclusion: "success",
+      environment_url: "https://example.test",
+    };
+    for (const invalid of [
+      { ...finished, unit_id: "" },
+      { ...finished, unit_id: "deploy\nforged" },
+      { ...finished, conclusion: "neutral" },
+      { ...finished, environment_url: "file:///tmp/deploy" },
+    ]) {
+      expect(agentMessageSchema.safeParse(invalid).success).toBe(false);
+    }
+    expect(
+      agentMessageSchema.safeParse({
+        type: "deployment_started",
+        message_id: baseRequest.message_id,
+        job_id: baseRequest.job_id,
+        unit_id: "deploy",
+        environment: "production\rforged",
+      }).success,
+    ).toBe(false);
   });
 
   it("accepts bounded repository-relative Check annotations", () => {

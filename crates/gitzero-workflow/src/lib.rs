@@ -102,8 +102,14 @@ pub struct JobEnvironmentConfiguration {
     pub name: Scalar,
     #[serde(default)]
     pub url: Option<Scalar>,
+    #[serde(default = "default_environment_deployment")]
+    pub deployment: bool,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+fn default_environment_deployment() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -299,6 +305,7 @@ impl PlannedPermissions {
 pub struct PlannedEnvironment {
     pub name: String,
     pub url: Option<String>,
+    pub deployment: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1888,8 +1895,8 @@ fn planned_environment(
     let Some(environment) = environment else {
         return Ok(None);
     };
-    let (name, url) = match environment {
-        JobEnvironment::Name(name) => (name.as_str(), None),
+    let (name, url, deployment) = match environment {
+        JobEnvironment::Name(name) => (name.as_str(), None, true),
         JobEnvironment::Configuration(configuration) => {
             if let Some(feature) = configuration.extra.keys().next() {
                 return Err(incompatible(
@@ -1901,6 +1908,7 @@ fn planned_environment(
             (
                 configuration.name.as_str(),
                 configuration.url.as_ref().map(Scalar::as_str),
+                configuration.deployment,
             )
         }
     };
@@ -1914,6 +1922,7 @@ fn planned_environment(
     Ok(Some(PlannedEnvironment {
         name: name.to_owned(),
         url: url.map(str::to_owned),
+        deployment,
     }))
 }
 
@@ -2857,6 +2866,13 @@ jobs:
     steps:
       - id: deploy
         run: echo url=https://example.test >> "$GITHUB_OUTPUT"
+  variables-only:
+    runs-on: macos-latest
+    environment:
+      name: test
+      deployment: false
+    steps:
+      - run: echo variables
 "#,
         )
         .expect("parse workflow");
@@ -2868,6 +2884,7 @@ jobs:
             Some(PlannedEnvironment {
                 name: "staging".to_owned(),
                 url: None,
+                deployment: true,
             })
         );
         assert_eq!(
@@ -2875,6 +2892,15 @@ jobs:
             Some(PlannedEnvironment {
                 name: "production-${{ matrix.region }}".to_owned(),
                 url: Some("${{ steps.deploy.outputs.url }}".to_owned()),
+                deployment: true,
+            })
+        );
+        assert_eq!(
+            plan.jobs[2].deployment_environment,
+            Some(PlannedEnvironment {
+                name: "test".to_owned(),
+                url: None,
+                deployment: false,
             })
         );
     }

@@ -3,7 +3,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 pub const MAX_RUNNER_LABELS: usize = 32;
 pub const MAX_RUNNER_REQUIREMENTS: usize = 512;
 pub const MAX_RUNNER_SELECTOR_BYTES: usize = 256;
@@ -233,6 +233,19 @@ pub enum AgentMessage {
         read_permissions: Vec<String>,
         write_permissions: Vec<String>,
     },
+    DeploymentStarted {
+        message_id: Uuid,
+        job_id: Uuid,
+        unit_id: String,
+        environment: String,
+    },
+    DeploymentFinished {
+        message_id: Uuid,
+        job_id: Uuid,
+        unit_id: String,
+        conclusion: Conclusion,
+        environment_url: Option<String>,
+    },
     StepStarted {
         message_id: Uuid,
         job_id: Uuid,
@@ -442,6 +455,34 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ServerMessage>(&json).expect("deserialize workflow grant"),
             workflow_granted
+        );
+
+        let deployment_started = AgentMessage::DeploymentStarted {
+            message_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            unit_id: "deploy / matrix[region=west]".into(),
+            environment: "production-west".into(),
+        };
+        let json = serde_json::to_string(&deployment_started).expect("serialize deployment start");
+        assert!(json.contains(r#""type":"deployment_started""#));
+        assert_eq!(
+            serde_json::from_str::<AgentMessage>(&json).expect("deserialize deployment start"),
+            deployment_started
+        );
+
+        let deployment_finished = AgentMessage::DeploymentFinished {
+            message_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            unit_id: "deploy / matrix[region=west]".into(),
+            conclusion: Conclusion::Success,
+            environment_url: Some("https://west.example.test/releases/42".into()),
+        };
+        let json =
+            serde_json::to_string(&deployment_finished).expect("serialize deployment finish");
+        assert!(json.contains(r#""type":"deployment_finished""#));
+        assert_eq!(
+            serde_json::from_str::<AgentMessage>(&json).expect("deserialize deployment finish"),
+            deployment_finished
         );
 
         let annotated = AgentMessage::JobFinished {

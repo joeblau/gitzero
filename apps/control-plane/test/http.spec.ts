@@ -364,7 +364,7 @@ describe("HTTP entrypoint", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 12,
+          protocol_version: 13,
           agent_id: "readiness-mini",
           name: "readiness-mini",
           version: "0.1.0",

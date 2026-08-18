@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 12;
+export const PROTOCOL_VERSION = 13;
 
 export const repositoryTokenPurposeSchema = z.enum([
   "source",
@@ -117,6 +117,22 @@ const repositoryComponent = z
   .min(1)
   .max(100)
   .regex(/^[A-Za-z0-9._-]+$/);
+const deploymentUnitId = z
+  .string()
+  .trim()
+  .min(1)
+  .max(512)
+  .refine((value) => !value.includes("\0") && !/[\r\n]/.test(value));
+const deploymentEnvironment = z
+  .string()
+  .trim()
+  .min(1)
+  .max(255)
+  .refine((value) => !value.includes("\0") && !/[\r\n]/.test(value));
+const deploymentEnvironmentUrl = z
+  .url()
+  .max(2_048)
+  .refine((value) => ["http:", "https:"].includes(new URL(value).protocol));
 
 export const repositorySchema = z.object({
   owner: z.string().min(1),
@@ -355,6 +371,21 @@ export const agentMessageSchema = z.discriminatedUnion("type", [
     repository: repositoryComponent,
   }),
   workflowTokenRequestSchema,
+  z.object({
+    type: z.literal("deployment_started"),
+    message_id: uuid,
+    job_id: uuid,
+    unit_id: deploymentUnitId,
+    environment: deploymentEnvironment,
+  }),
+  z.object({
+    type: z.literal("deployment_finished"),
+    message_id: uuid,
+    job_id: uuid,
+    unit_id: deploymentUnitId,
+    conclusion: z.enum(["success", "failure", "cancelled", "timed_out"]),
+    environment_url: deploymentEnvironmentUrl.nullable(),
+  }),
   z.object({
     type: z.literal("step_started"),
     message_id: uuid,

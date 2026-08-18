@@ -3248,194 +3248,215 @@ async fn execute_job(
         run_dir,
         workflow_token.as_deref(),
     )?;
-    prepare_workspace(
-        job_id,
-        event_job_id,
-        workflow_name,
-        &rendered_job_name,
-        workspace,
-        outbound,
-    )
-    .await?;
+    let tracked_environment = job
+        .deployment_environment
+        .as_ref()
+        .filter(|deployment| deployment.deployment)
+        .and(selected_environment_name.as_deref());
+    if let Some(environment) = tracked_environment {
+        send(
+            outbound,
+            AgentMessage::DeploymentStarted {
+                message_id: Uuid::new_v4(),
+                job_id,
+                unit_id: event_job_id.to_owned(),
+                environment: environment.to_owned(),
+            },
+        )
+        .await?;
+    }
 
-    let job_timeout =
-        parse_timeout(job.timeout_minutes.as_deref(), &context)?.unwrap_or(DEFAULT_JOB_TIMEOUT);
-    let (effective_cancel, timeout_task) =
-        deadline_cancellation(cancel, Some(job_timeout), job_timed_out.clone());
-    let mut job_summary = JobSummaryBuilder::new(format!("{workflow_name} / {rendered_job_name}"));
-
+    let mut deployment_url = None;
     let execution = async {
-        let cancel = &effective_cancel;
-        let job_timed_out = job_timed_out.as_ref();
-        let mut steps = serde_json::Map::new();
-        let mut posts = Vec::new();
-        let mut status = ExecutionStatus::Success;
-        let mut completed_steps = 0;
-        for step in &job.steps {
-            if *cancel.borrow() {
-                if job_timed_out.load(Ordering::Acquire) {
-                    return Ok(JobExecution {
-                        conclusion: JobConclusion::TimedOut,
-                        completed_steps,
-                        outputs: BTreeMap::new(),
-                    });
-                }
-                bail!("run cancelled");
-            }
-            workflow_token = repository_access
-                .workflow_token(run, &job.permissions, cancel)
-                .await
-                .with_context(|| {
-                    format!(
-                        "refresh scoped workflow token for workflow '{workflow_name}' job '{}'",
-                        job.id
-                    )
-                })?;
-            context = expression_context_with_variables(
-                run,
-                &runtime_variables,
-                job,
-                completed_bases,
-                completed_outputs,
-                &job_environment,
-                &JsonValue::Object(steps.clone()),
-                reusable_inputs,
-                status,
-                workspace,
-                run_dir,
-                workflow_token.as_deref(),
-            )?;
-            let execution = execute_step(
-                job_id,
-                workflow_name,
-                event_job_id,
-                step,
-                run,
-                workspace,
-                run_dir,
-                &mut job_environment,
-                &context,
-                status,
-                &mut posts,
-                cancel,
-                outbound,
-                sequence,
-                job_timed_out,
-                &mut job_summary,
-                workflow_commands,
-                repository_access,
-            )
-            .await?;
-            if execution.ran {
-                completed_steps += 1;
-            }
-            steps.insert(
-                step.id.clone(),
-                json!({
-                    "outputs": execution.outputs,
-                    "outcome": execution.outcome.as_github_result(),
-                    "conclusion": execution.conclusion.as_github_result(),
-                }),
-            );
-            match execution.conclusion {
-                JobConclusion::Failure | JobConclusion::TimedOut => {
-                    status = ExecutionStatus::Failure
-                }
-                JobConclusion::Cancelled => status = ExecutionStatus::Cancelled,
-                JobConclusion::Success | JobConclusion::Skipped => {}
-            }
-            if status == ExecutionStatus::Cancelled || job_timed_out.load(Ordering::Acquire) {
-                break;
-            }
-        }
+        prepare_workspace(
+            job_id,
+            event_job_id,
+            workflow_name,
+            &rendered_job_name,
+            workspace,
+            outbound,
+        )
+        .await?;
 
-        if job_timed_out.load(Ordering::Acquire) {
-            return Ok(JobExecution {
-                conclusion: JobConclusion::TimedOut,
-                completed_steps,
-                outputs: BTreeMap::new(),
-            });
-        }
+        let job_timeout =
+            parse_timeout(job.timeout_minutes.as_deref(), &context)?.unwrap_or(DEFAULT_JOB_TIMEOUT);
+        let (effective_cancel, timeout_task) =
+            deadline_cancellation(cancel, Some(job_timeout), job_timed_out.clone());
+        let mut job_summary =
+            JobSummaryBuilder::new(format!("{workflow_name} / {rendered_job_name}"));
 
-        for mut post in posts.into_iter().rev() {
-            if status == ExecutionStatus::Cancelled {
-                break;
-            }
-            post.context.set_status(status);
-            if !post.context.evaluate_condition(&post.condition)? {
-                continue;
-            }
-            let post_step_id = format!("{}/post", post.step_id);
-            send(
-                outbound,
-                AgentMessage::StepStarted {
-                    message_id: Uuid::new_v4(),
+        let step_execution = async {
+            let cancel = &effective_cancel;
+            let job_timed_out = job_timed_out.as_ref();
+            let mut steps = serde_json::Map::new();
+            let mut posts = Vec::new();
+            let mut status = ExecutionStatus::Success;
+            let mut completed_steps = 0;
+            for step in &job.steps {
+                if *cancel.borrow() {
+                    if job_timed_out.load(Ordering::Acquire) {
+                        return Ok(JobExecution {
+                            conclusion: JobConclusion::TimedOut,
+                            completed_steps,
+                            outputs: BTreeMap::new(),
+                        });
+                    }
+                    bail!("run cancelled");
+                }
+                workflow_token = repository_access
+                    .workflow_token(run, &job.permissions, cancel)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "refresh scoped workflow token for workflow '{workflow_name}' job '{}'",
+                            job.id
+                        )
+                    })?;
+                context = expression_context_with_variables(
+                    run,
+                    &runtime_variables,
+                    job,
+                    completed_bases,
+                    completed_outputs,
+                    &job_environment,
+                    &JsonValue::Object(steps.clone()),
+                    reusable_inputs,
+                    status,
+                    workspace,
+                    run_dir,
+                    workflow_token.as_deref(),
+                )?;
+                let execution = execute_step(
                     job_id,
-                    step_id: post_step_id.clone(),
-                    name: format!("{workflow_name} / Post {}", post.name),
-                },
-            )
-            .await?;
-            let summary_name = format!("{} (post)", post.name);
-            let execution = execute_node_action_phase(
-                job_id,
-                &post_step_id,
-                "post",
-                &post.action_directory,
-                &post.script,
-                None,
-                workspace,
-                run_dir,
-                &mut job_environment,
-                &post.environment,
-                &post.state,
-                cancel,
-                outbound,
-                sequence,
-                job_timed_out,
-                &mut job_summary,
-                &summary_name,
-                workflow_commands,
-            )
-            .await?;
-            let conclusion = match execution.conclusion {
-                JobConclusion::Success => Conclusion::Success,
-                JobConclusion::Failure => Conclusion::Failure,
-                JobConclusion::TimedOut => Conclusion::TimedOut,
-                JobConclusion::Cancelled => Conclusion::Cancelled,
-                JobConclusion::Skipped => Conclusion::Neutral,
-            };
-            send(
-                outbound,
-                AgentMessage::StepFinished {
-                    message_id: Uuid::new_v4(),
-                    job_id,
-                    step_id: post_step_id,
-                    conclusion,
-                    exit_code: execution.exit_code,
-                },
-            )
-            .await?;
-            if matches!(
-                execution.conclusion,
-                JobConclusion::Failure | JobConclusion::TimedOut
-            ) {
-                status = ExecutionStatus::Failure;
+                    workflow_name,
+                    event_job_id,
+                    step,
+                    run,
+                    workspace,
+                    run_dir,
+                    &mut job_environment,
+                    &context,
+                    status,
+                    &mut posts,
+                    cancel,
+                    outbound,
+                    sequence,
+                    job_timed_out,
+                    &mut job_summary,
+                    workflow_commands,
+                    repository_access,
+                )
+                .await?;
+                if execution.ran {
+                    completed_steps += 1;
+                }
+                steps.insert(
+                    step.id.clone(),
+                    json!({
+                        "outputs": execution.outputs,
+                        "outcome": execution.outcome.as_github_result(),
+                        "conclusion": execution.conclusion.as_github_result(),
+                    }),
+                );
+                match execution.conclusion {
+                    JobConclusion::Failure | JobConclusion::TimedOut => {
+                        status = ExecutionStatus::Failure
+                    }
+                    JobConclusion::Cancelled => status = ExecutionStatus::Cancelled,
+                    JobConclusion::Success | JobConclusion::Skipped => {}
+                }
+                if status == ExecutionStatus::Cancelled || job_timed_out.load(Ordering::Acquire) {
+                    break;
+                }
             }
+
             if job_timed_out.load(Ordering::Acquire) {
-                break;
+                return Ok(JobExecution {
+                    conclusion: JobConclusion::TimedOut,
+                    completed_steps,
+                    outputs: BTreeMap::new(),
+                });
             }
-        }
 
-        if job_timed_out.load(Ordering::Acquire) {
-            return Ok(JobExecution {
-                conclusion: JobConclusion::TimedOut,
-                completed_steps,
-                outputs: BTreeMap::new(),
-            });
-        }
+            for mut post in posts.into_iter().rev() {
+                if status == ExecutionStatus::Cancelled {
+                    break;
+                }
+                post.context.set_status(status);
+                if !post.context.evaluate_condition(&post.condition)? {
+                    continue;
+                }
+                let post_step_id = format!("{}/post", post.step_id);
+                send(
+                    outbound,
+                    AgentMessage::StepStarted {
+                        message_id: Uuid::new_v4(),
+                        job_id,
+                        step_id: post_step_id.clone(),
+                        name: format!("{workflow_name} / Post {}", post.name),
+                    },
+                )
+                .await?;
+                let summary_name = format!("{} (post)", post.name);
+                let execution = execute_node_action_phase(
+                    job_id,
+                    &post_step_id,
+                    "post",
+                    &post.action_directory,
+                    &post.script,
+                    None,
+                    workspace,
+                    run_dir,
+                    &mut job_environment,
+                    &post.environment,
+                    &post.state,
+                    cancel,
+                    outbound,
+                    sequence,
+                    job_timed_out,
+                    &mut job_summary,
+                    &summary_name,
+                    workflow_commands,
+                )
+                .await?;
+                let conclusion = match execution.conclusion {
+                    JobConclusion::Success => Conclusion::Success,
+                    JobConclusion::Failure => Conclusion::Failure,
+                    JobConclusion::TimedOut => Conclusion::TimedOut,
+                    JobConclusion::Cancelled => Conclusion::Cancelled,
+                    JobConclusion::Skipped => Conclusion::Neutral,
+                };
+                send(
+                    outbound,
+                    AgentMessage::StepFinished {
+                        message_id: Uuid::new_v4(),
+                        job_id,
+                        step_id: post_step_id,
+                        conclusion,
+                        exit_code: execution.exit_code,
+                    },
+                )
+                .await?;
+                if matches!(
+                    execution.conclusion,
+                    JobConclusion::Failure | JobConclusion::TimedOut
+                ) {
+                    status = ExecutionStatus::Failure;
+                }
+                if job_timed_out.load(Ordering::Acquire) {
+                    break;
+                }
+            }
 
-        workflow_token = repository_access
+            if job_timed_out.load(Ordering::Acquire) {
+                return Ok(JobExecution {
+                    conclusion: JobConclusion::TimedOut,
+                    completed_steps,
+                    outputs: BTreeMap::new(),
+                });
+            }
+
+            workflow_token = repository_access
             .workflow_token(run, &job.permissions, cancel)
             .await
             .with_context(|| {
@@ -3444,84 +3465,111 @@ async fn execute_job(
                     job.id
                 )
             })?;
-        let output_context = expression_context_with_variables(
-            run,
-            &runtime_variables,
-            job,
-            completed_bases,
-            completed_outputs,
-            &job_environment,
-            &JsonValue::Object(steps),
-            reusable_inputs,
-            status,
-            workspace,
-            run_dir,
-            workflow_token.as_deref(),
-        )?;
-        if let (Some(deployment), Some(environment_name)) = (
-            &job.deployment_environment,
-            selected_environment_name.as_deref(),
-        ) && let Some(url) = &deployment.url
-        {
-            let rendered_url = output_context
-                .render(url)
-                .context("render deployment environment URL")?;
-            if !rendered_url.is_empty() {
-                let parsed = reqwest::Url::parse(&rendered_url)
-                    .context("deployment environment URL is invalid")?;
-                if !matches!(parsed.scheme(), "http" | "https") {
-                    bail!("deployment environment URL must use HTTP or HTTPS");
+            let output_context = expression_context_with_variables(
+                run,
+                &runtime_variables,
+                job,
+                completed_bases,
+                completed_outputs,
+                &job_environment,
+                &JsonValue::Object(steps),
+                reusable_inputs,
+                status,
+                workspace,
+                run_dir,
+                workflow_token.as_deref(),
+            )?;
+            if let (Some(deployment), Some(environment_name)) = (
+                &job.deployment_environment,
+                selected_environment_name.as_deref(),
+            ) && let Some(url) = &deployment.url
+            {
+                let rendered_url = output_context
+                    .render(url)
+                    .context("render deployment environment URL")?;
+                if !rendered_url.is_empty() {
+                    if rendered_url.len() > 2_048 || rendered_url.contains(['\0', '\n', '\r']) {
+                        bail!("deployment environment URL exceeds the protocol boundary");
+                    }
+                    let parsed = reqwest::Url::parse(&rendered_url)
+                        .context("deployment environment URL is invalid")?;
+                    if !matches!(parsed.scheme(), "http" | "https") {
+                        bail!("deployment environment URL must use HTTP or HTTPS");
+                    }
+                    deployment_url = Some(parsed.as_str().to_owned());
+                    job_summary.push(
+                        "Deployment environment".to_owned(),
+                        format!(
+                            "Environment: `{}`\n\nURL: {}\n",
+                            environment_name.replace('`', "\\`"),
+                            parsed.as_str()
+                        ),
+                    );
                 }
-                job_summary.push(
-                    "Deployment environment".to_owned(),
-                    format!(
-                        "Environment: `{}`\n\nURL: {}\n",
-                        environment_name.replace('`', "\\`"),
-                        parsed.as_str()
-                    ),
-                );
             }
-        }
-        let outputs = render_environment(&job.outputs, &output_context)?;
-        let outcome = match status {
-            ExecutionStatus::Success => JobConclusion::Success,
-            ExecutionStatus::Failure => JobConclusion::Failure,
-            ExecutionStatus::Cancelled => JobConclusion::Cancelled,
-            ExecutionStatus::Skipped => JobConclusion::Skipped,
-        };
-        let continue_on_error = match job.continue_on_error.as_deref() {
-            Some(condition) => output_context
-                .evaluate_condition(condition)
-                .with_context(|| format!("evaluate job continue-on-error '{condition}'"))?,
-            None => false,
-        };
+            let outputs = render_environment(&job.outputs, &output_context)?;
+            let outcome = match status {
+                ExecutionStatus::Success => JobConclusion::Success,
+                ExecutionStatus::Failure => JobConclusion::Failure,
+                ExecutionStatus::Cancelled => JobConclusion::Cancelled,
+                ExecutionStatus::Skipped => JobConclusion::Skipped,
+            };
+            let continue_on_error = match job.continue_on_error.as_deref() {
+                Some(condition) => output_context
+                    .evaluate_condition(condition)
+                    .with_context(|| format!("evaluate job continue-on-error '{condition}'"))?,
+                None => false,
+            };
 
-        Ok(JobExecution {
-            conclusion: if continue_on_error && outcome == JobConclusion::Failure {
-                JobConclusion::Success
-            } else {
-                outcome
-            },
-            completed_steps,
-            outputs,
-        })
+            Ok(JobExecution {
+                conclusion: if continue_on_error && outcome == JobConclusion::Failure {
+                    JobConclusion::Success
+                } else {
+                    outcome
+                },
+                completed_steps,
+                outputs,
+            })
+        }
+        .await;
+        let timed_out = job_timed_out.load(Ordering::Acquire);
+        if let Some(timeout_task) = timeout_task {
+            timeout_task.abort();
+        }
+        if let Some(summary) = job_summary.finish(sequence.fetch_add(1, Ordering::Relaxed)) {
+            job_summaries.lock().await.push(summary);
+        }
+        match step_execution {
+            Ok(mut execution) if timed_out => {
+                execution.conclusion = JobConclusion::TimedOut;
+                execution.outputs.clear();
+                Ok(execution)
+            }
+            execution => execution,
+        }
     }
     .await;
-    let timed_out = job_timed_out.load(Ordering::Acquire);
-    if let Some(timeout_task) = timeout_task {
-        timeout_task.abort();
+
+    if tracked_environment.is_some() {
+        let conclusion = match &execution {
+            Ok(execution) => protocol_conclusion(execution.conclusion),
+            Err(_) if job_timed_out.load(Ordering::Acquire) => Conclusion::TimedOut,
+            Err(_) if *cancel.borrow() => Conclusion::Cancelled,
+            Err(_) => Conclusion::Failure,
+        };
+        send(
+            outbound,
+            AgentMessage::DeploymentFinished {
+                message_id: Uuid::new_v4(),
+                job_id,
+                unit_id: event_job_id.to_owned(),
+                conclusion,
+                environment_url: deployment_url,
+            },
+        )
+        .await?;
     }
-    if let Some(summary) = job_summary.finish(sequence.fetch_add(1, Ordering::Relaxed)) {
-        job_summaries.lock().await.push(summary);
-    }
-    match execution {
-        Ok(mut execution) if timed_out => {
-            execution.conclusion = JobConclusion::TimedOut;
-            execution.outputs.clear();
-            Ok(execution)
-        }
-        execution => execution,
-    }
+    execution
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7864,6 +7912,8 @@ async fn relay_masked_events(
             | AgentMessage::ConcurrencyRelease { .. }
             | AgentMessage::RepositoryTokenRequest { .. }
             | AgentMessage::WorkflowTokenRequest { .. }
+            | AgentMessage::DeploymentStarted { .. }
+            | AgentMessage::DeploymentFinished { .. }
             | AgentMessage::JobStarted { .. } => {}
         }
         outbound
@@ -10284,6 +10334,19 @@ jobs:
             message,
             AgentMessage::LogChunk { data, .. }
                 if data == "environment-variable-environment\n"
+        )));
+        assert!(events.iter().any(|message| matches!(
+            message,
+            AgentMessage::DeploymentStarted { environment, .. }
+                if environment == "production"
+        )));
+        assert!(events.iter().any(|message| matches!(
+            message,
+            AgentMessage::DeploymentFinished {
+                conclusion: Conclusion::Success,
+                environment_url: Some(environment_url),
+                ..
+            } if environment_url == "https://example.test/production?channel=environment"
         )));
         let summaries = job_summaries.lock().await;
         assert!(

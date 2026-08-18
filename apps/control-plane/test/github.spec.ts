@@ -11,6 +11,7 @@ import {
   fetchActionsVariablesWithToken,
   fetchPullRequestMergeSnapshot,
   fetchRepositoryOnboardingEvidence,
+  syncGitHubDeployment,
   updateCheckRun,
 } from "../src/github";
 import type { CheckAnnotation, QueuedJob } from "../src/protocol";
@@ -389,6 +390,159 @@ describe("pull request merge snapshots", () => {
 });
 
 describe("GitHub production API contracts", () => {
+  it("creates a merge-snapshot deployment and publishes its running status", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        if (url.pathname.endsWith("/access_tokens")) {
+          return Response.json(installationToken("deployment-token"));
+        }
+        if (url.pathname.endsWith("/deployments")) {
+          return Response.json({ id: 91, payload: {} }, { status: 201 });
+        }
+        if (url.pathname.endsWith("/deployments/91/statuses")) {
+          return Response.json({ id: 92 }, { status: 201 });
+        }
+        throw new Error(`unexpected GitHub request: ${url.pathname}`);
+      }),
+    );
+
+    await expect(
+      syncGitHubDeployment(
+        {
+          GITHUB_API_VERSION: "2026-03-10",
+          GITHUB_APP_ID: "1234",
+          GITHUB_APP_PRIVATE_KEY: privateKey,
+        },
+        fixtureJob(),
+        "deploy / matrix[region=west]",
+        "production-west",
+        "in_progress",
+        null,
+        null,
+        false,
+      ),
+    ).resolves.toBe(91);
+
+    expect(requests).toHaveLength(3);
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+      repositories: ["widget"],
+      permissions: { deployments: "write" },
+    });
+    expect(JSON.parse(String(requests[1]?.init?.body))).toEqual({
+      ref: "3".repeat(40),
+      task: "deploy",
+      auto_merge: false,
+      required_contexts: [],
+      environment: "production-west",
+      description: "GitZero workflow deployment.",
+      payload: {
+        gitzero: {
+          job_id: "11111111-1111-4111-8111-111111111111",
+          unit_id: "deploy / matrix[region=west]",
+        },
+      },
+    });
+    expect(JSON.parse(String(requests[2]?.init?.body))).toEqual({
+      state: "in_progress",
+      environment: "production-west",
+      description: "GitZero deployment is running.",
+      auto_inactive: false,
+    });
+    expect(
+      requests
+        .slice(1)
+        .map((request) =>
+          new Headers(request.init?.headers).get("Authorization"),
+        ),
+    ).toEqual(["Bearer deployment-token", "Bearer deployment-token"]);
+  });
+
+  it("recovers ambiguous deployment writes without creating duplicate records or statuses", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        if (url.pathname.endsWith("/access_tokens")) {
+          return Response.json(installationToken("deployment-token"));
+        }
+        if (url.pathname.endsWith("/deployments")) {
+          return Response.json([
+            {
+              id: 90,
+              payload: {
+                gitzero: {
+                  job_id: "another-job",
+                  unit_id: "deploy / matrix[region=west]",
+                },
+              },
+            },
+            {
+              id: 91,
+              payload: {
+                gitzero: {
+                  job_id: "11111111-1111-4111-8111-111111111111",
+                  unit_id: "deploy / matrix[region=west]",
+                },
+              },
+            },
+          ]);
+        }
+        if (url.pathname.endsWith("/deployments/91/statuses")) {
+          return Response.json([
+            {
+              state: "inactive",
+              description: "Superseded elsewhere.",
+              environment: "production-west",
+              environment_url: null,
+            },
+            {
+              state: "success",
+              description: "GitZero deployment completed successfully.",
+              environment: "production-west",
+              environment_url: "https://west.example.test/releases/42",
+            },
+          ]);
+        }
+        throw new Error(`unexpected GitHub request: ${url.pathname}`);
+      }),
+    );
+
+    await expect(
+      syncGitHubDeployment(
+        {
+          GITHUB_API_VERSION: "2026-03-10",
+          GITHUB_APP_ID: "1234",
+          GITHUB_APP_PRIVATE_KEY: privateKey,
+        },
+        fixtureJob(),
+        "deploy / matrix[region=west]",
+        "production-west",
+        "success",
+        "https://west.example.test/releases/42",
+        null,
+        true,
+      ),
+    ).resolves.toBe(91);
+
+    expect(requests).toHaveLength(3);
+    expect(requests[1]?.init?.method).toBe("GET");
+    expect(Object.fromEntries(requests[1]?.url.searchParams ?? [])).toEqual({
+      sha: "3".repeat(40),
+      environment: "production-west",
+      task: "deploy",
+      per_page: "100",
+    });
+    expect(requests[2]?.init?.method).toBe("GET");
+  });
+
   it("mints workflow tokens with only the requested read and write permissions", async () => {
     const privateKey = await testPrivateKeyPem();
     const requests: Array<{ url: URL; init?: RequestInit }> = [];

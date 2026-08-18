@@ -460,7 +460,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 12,
+          protocol_version: 13,
           agent_id: "mini-1",
           name: "Test Mini",
           version: "0.1.0",
@@ -471,7 +471,7 @@ describe("Workspace Durable Object", () => {
     );
 
     const [welcome, assignment] = await messages;
-    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 12 });
+    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 13 });
     expect(assignment).toMatchObject({
       type: "run_job",
       job: {
@@ -758,7 +758,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 12,
+          protocol_version: 13,
           agent_id: "mini-1",
           name: "duplicate",
           version: "0.1.0",
@@ -900,6 +900,239 @@ describe("Workspace Durable Object", () => {
     });
     agent.close(1000, "test complete");
     observer.close(1000, "test complete");
+  });
+
+  it("persists deployment intent and recovers ambiguous GitHub writes from the alarm", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const originalAppId = env.GITHUB_APP_ID;
+    const originalPrivateKey = env.GITHUB_APP_PRIVATE_KEY;
+    Reflect.set(env, "GITHUB_APP_ID", "1234");
+    Reflect.set(env, "GITHUB_APP_PRIVATE_KEY", privateKey);
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    let runningStatusPosts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        if (url.pathname.endsWith("/access_tokens")) {
+          const permissions = JSON.parse(String(init?.body))
+            .permissions as Record<string, string>;
+          if (permissions.variables === "read") {
+            return Response.json(installationToken("variables-token"));
+          }
+          if (permissions.checks === "write") {
+            return Response.json(installationToken("check-token"));
+          }
+          if (permissions.deployments === "write") {
+            return Response.json(installationToken("deployment-token"));
+          }
+          return Response.json(installationToken("checkout-token"));
+        }
+        if (url.pathname.endsWith("/actions/variables")) {
+          return Response.json({ total_count: 0, variables: [] });
+        }
+        if (url.pathname.endsWith("/check-runs")) {
+          return Response.json({ id: 44 }, { status: 201 });
+        }
+        if (url.pathname.endsWith("/deployments")) {
+          if (init?.method === "GET") {
+            return Response.json([
+              {
+                id: 91,
+                payload: {
+                  gitzero: {
+                    job_id: currentJobId,
+                    unit_id: "deploy / matrix[region=west]",
+                  },
+                },
+              },
+            ]);
+          }
+          return Response.json({ id: 91, payload: {} }, { status: 201 });
+        }
+        if (url.pathname.endsWith("/deployments/91/statuses")) {
+          if (init?.method === "GET") {
+            return Response.json([
+              {
+                state: "in_progress",
+                description: "GitZero deployment is running.",
+                environment: "production-west",
+                environment_url: null,
+              },
+            ]);
+          }
+          const body = JSON.parse(String(init?.body)) as {
+            state: string;
+          };
+          if (body.state === "in_progress") {
+            runningStatusPosts += 1;
+            return new Response("response lost", { status: 502 });
+          }
+          return Response.json({ id: 93 }, { status: 201 });
+        }
+        throw new Error(`unexpected GitHub request: ${url.pathname}`);
+      }),
+    );
+
+    let currentJobId = "";
+    try {
+      const workspaceId = crypto.randomUUID();
+      const workspace = env.WORKSPACES.getByName(workspaceId);
+      const agent = await connectAgent(workspace, workspaceId, "mini-1", 1);
+      const assignment = collectMessageOfType(agent, "run_job");
+      const job = fixtureJob(workspaceId);
+      currentJobId = job.id;
+      job.installation_id = 7001;
+      job.requires_github_token = true;
+      job.report_to_github = true;
+      job.event = { repository: { owner: { type: "User" } } };
+      await workspace.enqueue(job, "deployment-lifecycle");
+      await assignment;
+
+      let acknowledgement = collectMessageOfType(agent, "ack");
+      agent.send(
+        JSON.stringify({
+          type: "deployment_started",
+          message_id: crypto.randomUUID(),
+          job_id: job.id,
+          unit_id: "deploy / matrix[region=west]",
+          environment: "production-west",
+        }),
+      );
+      await acknowledgement;
+
+      await vi.waitFor(async () => {
+        const row = await runInDurableObject(workspace, (_instance, state) =>
+          state.storage.sql
+            .exec<{
+              sync_needed: number;
+              sync_attempt_count: number;
+              last_error: string | null;
+            }>(
+              `SELECT sync_needed, sync_attempt_count, last_error
+               FROM deployments WHERE job_id = ?`,
+              job.id,
+            )
+            .one(),
+        );
+        expect(row).toMatchObject({
+          sync_needed: 1,
+          sync_attempt_count: 1,
+        });
+        expect(row.last_error).toContain("502");
+      });
+      await runInDurableObject(workspace, (_instance, state) => {
+        state.storage.sql.exec(
+          "UPDATE deployments SET sync_retry_at = 1 WHERE job_id = ?",
+          job.id,
+        );
+      });
+      await runDurableObjectAlarm(workspace);
+
+      await vi.waitFor(async () => {
+        const snapshot = (await workspace.getSnapshot()) as unknown as {
+          deployments: Array<Record<string, unknown>>;
+        };
+        expect(snapshot.deployments).toEqual([
+          expect.objectContaining({
+            job_id: job.id,
+            unit_id: "deploy / matrix[region=west]",
+            desired_state: "in_progress",
+            synced_state: "in_progress",
+            github_deployment_id: 91,
+            sync_status: "synced",
+            sync_attempt_count: 2,
+          }),
+        ]);
+      });
+
+      acknowledgement = collectMessageOfType(agent, "ack");
+      agent.send(
+        JSON.stringify({
+          type: "deployment_finished",
+          message_id: crypto.randomUUID(),
+          job_id: job.id,
+          unit_id: "deploy / matrix[region=west]",
+          conclusion: "success",
+          environment_url: "https://west.example.test/releases/42",
+        }),
+      );
+      await acknowledgement;
+      await vi.waitFor(async () => {
+        const snapshot = (await workspace.getSnapshot()) as unknown as {
+          deployments: Array<Record<string, unknown>>;
+        };
+        expect(snapshot.deployments[0]).toMatchObject({
+          desired_state: "success",
+          synced_state: "success",
+          synced_environment_url: "https://west.example.test/releases/42",
+          sync_status: "synced",
+        });
+      });
+
+      expect(runningStatusPosts).toBe(1);
+      expect(
+        requests.filter(
+          (request) =>
+            request.url.pathname.endsWith("/deployments") &&
+            request.init?.method === "POST",
+        ),
+      ).toHaveLength(1);
+      const terminalStatus = requests.find((request) => {
+        if (
+          !request.url.pathname.endsWith("/deployments/91/statuses") ||
+          request.init?.method !== "POST"
+        ) {
+          return false;
+        }
+        return (
+          (JSON.parse(String(request.init.body)) as { state: string }).state ===
+          "success"
+        );
+      });
+      expect(JSON.parse(String(terminalStatus?.init?.body))).toEqual({
+        state: "success",
+        environment: "production-west",
+        description: "GitZero deployment completed successfully.",
+        environment_url: "https://west.example.test/releases/42",
+        auto_inactive: true,
+      });
+
+      await runInDurableObject(workspace, (_instance, state) => {
+        state.storage.sql.exec(
+          "UPDATE jobs SET status = 'completed' WHERE id = ?",
+          job.id,
+        );
+      });
+      const rejected = collectMessageOfType(agent, "error");
+      agent.send(
+        JSON.stringify({
+          type: "deployment_started",
+          message_id: crypto.randomUUID(),
+          job_id: job.id,
+          unit_id: "late-deploy",
+          environment: "production-west",
+        }),
+      );
+      await expect(rejected).resolves.toMatchObject({
+        code: "deployment_run_completed",
+      });
+      const lateDeployments = await runInDurableObject(
+        workspace,
+        (_instance, state) =>
+          state.storage.sql
+            .exec<{
+              count: number;
+            }>("SELECT COUNT(*) AS count FROM deployments WHERE job_id = ? AND unit_id = 'late-deploy'", job.id)
+            .one().count,
+      );
+      expect(lateDeployments).toBe(0);
+      agent.close(1000, "test complete");
+    } finally {
+      Reflect.set(env, "GITHUB_APP_ID", originalAppId);
+      Reflect.set(env, "GITHUB_APP_PRIVATE_KEY", originalPrivateKey);
+    }
   });
 
   it("persists and broadcasts the agent's final Markdown summary", async () => {
@@ -1733,7 +1966,7 @@ async function connectAgentWithTargeting(
     JSON.stringify({
       type: "hello",
       hello: {
-        protocol_version: 12,
+        protocol_version: 13,
         agent_id: agentId,
         name: agentId,
         version: "0.1.0",

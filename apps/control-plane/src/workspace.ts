@@ -8,7 +8,9 @@ import {
   createWorkflowToken,
   fetchActionsVariables,
   fetchPullRequestMergeSnapshot,
+  syncGitHubDeployment,
   updateCheckRun,
+  type GitHubDeploymentState,
   type InstallationAccessToken,
 } from "./github";
 import {
@@ -39,6 +41,9 @@ const MAX_INITIALIZATION_ATTEMPTS = 8;
 const INITIALIZATION_LEASE_MILLISECONDS = 2 * 60 * 1_000;
 const INITIALIZATION_RETRY_BASE_MILLISECONDS = 1_000;
 const INITIALIZATION_RETRY_MAX_MILLISECONDS = 5 * 60 * 1_000;
+const DEPLOYMENT_SYNC_LEASE_MILLISECONDS = 2 * 60 * 1_000;
+const DEPLOYMENT_RETRY_BASE_MILLISECONDS = 1_000;
+const DEPLOYMENT_RETRY_MAX_MILLISECONDS = 5 * 60 * 1_000;
 const EVENT_CHUNK_CHARACTERS = 256 * 1024;
 
 type JobStatus = "queued" | "assigned" | "running" | "completed";
@@ -99,6 +104,28 @@ interface ConcurrencyRow extends Record<string, SqlStorageValue> {
   queue_mode: "single" | "max";
   status: ConcurrencyStatus;
   created_at: number;
+}
+
+interface DeploymentRow extends Record<string, SqlStorageValue> {
+  job_id: string;
+  unit_id: string;
+  environment: string;
+  desired_state: GitHubDeploymentState;
+  environment_url: string | null;
+  github_deployment_id: number | null;
+  synced_state: GitHubDeploymentState | null;
+  synced_environment_url: string | null;
+  sync_needed: 0 | 1 | 2;
+  sync_attempt_count: number;
+  sync_retry_at: number | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+interface DeploymentKeyRow extends Record<string, SqlStorageValue> {
+  job_id: string;
+  unit_id: string;
 }
 
 interface AgentCandidate {
@@ -416,6 +443,17 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
     for (const row of unsynced) {
       await this.syncCheck(row);
     }
+    const deploymentSyncs = this.ctx.storage.sql
+      .exec<DeploymentKeyRow>(
+        `SELECT job_id, unit_id FROM deployments
+         WHERE sync_needed != 0 AND sync_retry_at IS NOT NULL AND sync_retry_at <= ?
+         ORDER BY sync_retry_at LIMIT 20`,
+        now,
+      )
+      .toArray();
+    for (const deployment of deploymentSyncs) {
+      await this.syncDeployment(deployment.job_id, deployment.unit_id);
+    }
     this.prune(now);
     await this.tryDispatch();
     await this.scheduleAlarm();
@@ -489,6 +527,29 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
         ON concurrency_leases(repository_key, group_key, status, sequence);
       CREATE INDEX IF NOT EXISTS concurrency_run
         ON concurrency_leases(run_id);
+      CREATE TABLE IF NOT EXISTS deployments (
+        job_id TEXT NOT NULL,
+        unit_id TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        desired_state TEXT NOT NULL
+          CHECK (desired_state IN ('in_progress', 'success', 'failure', 'error')),
+        environment_url TEXT,
+        github_deployment_id INTEGER,
+        synced_state TEXT
+          CHECK (synced_state IS NULL OR synced_state IN ('in_progress', 'success', 'failure', 'error')),
+        synced_environment_url TEXT,
+        sync_needed INTEGER NOT NULL DEFAULT 1
+          CHECK (sync_needed IN (0, 1, 2)),
+        sync_attempt_count INTEGER NOT NULL DEFAULT 0,
+        sync_retry_at INTEGER,
+        last_error TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (job_id, unit_id)
+      );
+      CREATE INDEX IF NOT EXISTS deployments_sync
+        ON deployments(sync_retry_at)
+        WHERE sync_needed != 0;
       CREATE TABLE IF NOT EXISTS _sql_schema_migrations (
         id INTEGER PRIMARY KEY,
         applied_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -554,6 +615,7 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
       CREATE INDEX IF NOT EXISTS job_annotations_job
         ON job_annotations(job_id, annotation_index);
       INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (7);
+      INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (8);
     `);
   }
 
@@ -1461,6 +1523,151 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
         }
         return;
       }
+      case "deployment_started": {
+        const row = this.assignedJob(message.job_id, agentId);
+        if (row.status === "completed") {
+          sendServer(socket, {
+            type: "error",
+            code: "deployment_run_completed",
+            message:
+              "The parent GitZero run is no longer active for deployment updates.",
+          });
+          return;
+        }
+        const job = parseJob(row.job_json);
+        if (!job.requires_github_token || !job.report_to_github) {
+          sendServer(socket, {
+            type: "error",
+            code: "deployment_not_authorized",
+            message:
+              "The parent GitZero run is not authorized to publish GitHub deployments.",
+          });
+          return;
+        }
+        const existing = this.deploymentRow(job.id, message.unit_id);
+        if (
+          existing !== undefined &&
+          existing.environment.toLowerCase() !==
+            message.environment.toLowerCase()
+        ) {
+          sendServer(socket, {
+            type: "error",
+            code: "deployment_environment_mismatch",
+            message:
+              "A workflow job cannot change its deployment environment during a run.",
+          });
+          return;
+        }
+        const now = Date.now();
+        if (existing === undefined) {
+          this.ctx.storage.sql.exec(
+            `INSERT INTO deployments (
+              job_id, unit_id, environment, desired_state, environment_url,
+              github_deployment_id, synced_state, synced_environment_url,
+              sync_needed, sync_attempt_count, sync_retry_at, last_error,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, 'in_progress', NULL, NULL, NULL, NULL, 1, 0, ?, NULL, ?, ?)`,
+            job.id,
+            message.unit_id,
+            message.environment,
+            now,
+            now,
+            now,
+          );
+        } else if (existing.desired_state !== "in_progress") {
+          this.ctx.storage.sql.exec(
+            `UPDATE deployments
+             SET desired_state = 'in_progress', environment_url = NULL,
+               sync_needed = CASE WHEN sync_needed = 2 THEN 2 ELSE 1 END,
+               sync_attempt_count = CASE WHEN sync_needed = 2 THEN sync_attempt_count ELSE 0 END,
+               sync_retry_at = CASE WHEN sync_needed = 2 THEN sync_retry_at ELSE ? END,
+               last_error = NULL, updated_at = ?
+             WHERE job_id = ? AND unit_id = ?`,
+            now,
+            now,
+            job.id,
+            message.unit_id,
+          );
+        }
+        this.broadcast("deployment_started", {
+          job_id: job.id,
+          agent_id: agentId,
+          unit_id: message.unit_id,
+          environment: message.environment,
+        });
+        if (existing?.sync_needed !== 2) {
+          this.ctx.waitUntil(this.syncDeployment(job.id, message.unit_id));
+        }
+        await this.scheduleAlarm();
+        return;
+      }
+      case "deployment_finished": {
+        const row = this.assignedJob(message.job_id, agentId);
+        if (row.status === "completed") {
+          sendServer(socket, {
+            type: "error",
+            code: "deployment_run_completed",
+            message:
+              "The parent GitZero run is no longer active for deployment updates.",
+          });
+          return;
+        }
+        const job = parseJob(row.job_json);
+        if (!job.requires_github_token || !job.report_to_github) {
+          sendServer(socket, {
+            type: "error",
+            code: "deployment_not_authorized",
+            message:
+              "The parent GitZero run is not authorized to publish GitHub deployments.",
+          });
+          return;
+        }
+        const existing = this.deploymentRow(job.id, message.unit_id);
+        if (existing === undefined) {
+          sendServer(socket, {
+            type: "error",
+            code: "deployment_not_started",
+            message:
+              "A workflow job must start its deployment before publishing a terminal state.",
+          });
+          return;
+        }
+        const desiredState = deploymentState(message.conclusion);
+        const now = Date.now();
+        const changed =
+          existing.desired_state !== desiredState ||
+          existing.environment_url !== message.environment_url;
+        if (changed) {
+          this.ctx.storage.sql.exec(
+            `UPDATE deployments
+             SET desired_state = ?, environment_url = ?,
+               sync_needed = CASE WHEN sync_needed = 2 THEN 2 ELSE 1 END,
+               sync_attempt_count = CASE WHEN sync_needed = 2 THEN sync_attempt_count ELSE 0 END,
+               sync_retry_at = CASE WHEN sync_needed = 2 THEN sync_retry_at ELSE ? END,
+               last_error = NULL, updated_at = ?
+             WHERE job_id = ? AND unit_id = ?`,
+            desiredState,
+            message.environment_url,
+            now,
+            now,
+            job.id,
+            message.unit_id,
+          );
+        }
+        this.broadcast("deployment_finished", {
+          job_id: job.id,
+          agent_id: agentId,
+          unit_id: message.unit_id,
+          environment: existing.environment,
+          conclusion: message.conclusion,
+          environment_url: message.environment_url,
+        });
+        if (existing.sync_needed !== 2) {
+          this.ctx.waitUntil(this.syncDeployment(job.id, message.unit_id));
+        }
+        await this.scheduleAlarm();
+        return;
+      }
       case "step_started":
       case "step_finished":
       case "log_chunk": {
@@ -1501,6 +1708,7 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
               JSON.stringify(annotation),
             );
           }
+          this.finishOutstandingDeployments(message.job_id);
           const completed = this.jobRow(message.job_id);
           this.broadcast("job_finished", {
             job_id: message.job_id,
@@ -1711,6 +1919,19 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
     return row;
   }
 
+  private deploymentRow(
+    jobId: string,
+    unitId: string,
+  ): DeploymentRow | undefined {
+    return this.ctx.storage.sql
+      .exec<DeploymentRow>(
+        "SELECT * FROM deployments WHERE job_id = ? AND unit_id = ?",
+        jobId,
+        unitId,
+      )
+      .toArray()[0];
+  }
+
   private jobAnnotations(jobId: string): CheckAnnotation[] {
     return this.ctx.storage.sql
       .exec<AnnotationRow>(
@@ -1768,6 +1989,113 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
     }
   }
 
+  private async syncDeployment(jobId: string, unitId: string): Promise<void> {
+    const now = Date.now();
+    const claim = this.ctx.storage.sql
+      .exec<DeploymentRow>(
+        `UPDATE deployments
+         SET sync_needed = 2,
+           sync_attempt_count = sync_attempt_count + 1,
+           sync_retry_at = ?
+         WHERE job_id = ? AND unit_id = ? AND sync_needed != 0
+           AND sync_retry_at IS NOT NULL AND sync_retry_at <= ?
+         RETURNING *`,
+        now + DEPLOYMENT_SYNC_LEASE_MILLISECONDS,
+        jobId,
+        unitId,
+        now,
+      )
+      .toArray()[0];
+    if (!claim) return;
+
+    try {
+      const job = parseJob(this.jobRow(jobId).job_json);
+      const deploymentId = await syncGitHubDeployment(
+        this.env,
+        job,
+        claim.unit_id,
+        claim.environment,
+        claim.desired_state,
+        claim.environment_url,
+        claim.github_deployment_id,
+        claim.sync_attempt_count > 1,
+      );
+      this.ctx.storage.sql.exec(
+        `UPDATE deployments SET github_deployment_id = ?
+         WHERE job_id = ? AND unit_id = ? AND github_deployment_id IS NULL`,
+        deploymentId,
+        jobId,
+        unitId,
+      );
+      const synced = this.ctx.storage.sql
+        .exec<{ unit_id: string }>(
+          `UPDATE deployments
+           SET synced_state = desired_state,
+             synced_environment_url = environment_url,
+             sync_needed = 0, sync_retry_at = NULL, last_error = NULL,
+             updated_at = ?
+           WHERE job_id = ? AND unit_id = ? AND sync_needed = 2
+             AND desired_state = ? AND environment_url IS ?
+           RETURNING unit_id`,
+          Date.now(),
+          jobId,
+          unitId,
+          claim.desired_state,
+          claim.environment_url,
+        )
+        .toArray();
+      if (synced.length === 0) {
+        this.ctx.storage.sql.exec(
+          `UPDATE deployments
+           SET sync_needed = 1, sync_retry_at = ?, last_error = NULL
+           WHERE job_id = ? AND unit_id = ? AND sync_needed = 2`,
+          Date.now(),
+          jobId,
+          unitId,
+        );
+      } else {
+        this.broadcast("deployment_synced", {
+          job_id: jobId,
+          unit_id: unitId,
+          environment: claim.environment,
+          state: claim.desired_state,
+          environment_url: claim.environment_url,
+          github_deployment_id: deploymentId,
+        });
+      }
+    } catch (error) {
+      const current = this.deploymentRow(jobId, unitId);
+      if (current) {
+        const desiredChanged =
+          current.desired_state !== claim.desired_state ||
+          current.environment_url !== claim.environment_url;
+        const retryAt =
+          Date.now() +
+          (desiredChanged ? 0 : deploymentRetryDelay(claim.sync_attempt_count));
+        this.ctx.storage.sql.exec(
+          `UPDATE deployments
+           SET sync_needed = 1, sync_retry_at = ?, last_error = ?
+           WHERE job_id = ? AND unit_id = ? AND sync_needed = 2`,
+          retryAt,
+          truncateDiagnostic(error),
+          jobId,
+          unitId,
+        );
+      }
+      console.error(
+        JSON.stringify({
+          message: "GitHub deployment sync failed",
+          jobId,
+          unitId,
+          attempt: claim.sync_attempt_count,
+          error: truncateDiagnostic(error),
+        }),
+      );
+    } finally {
+      await this.scheduleAlarm();
+    }
+  }
+
   private async scheduleAlarm(): Promise<void> {
     const lease = this.ctx.storage.sql
       .exec<MinimumRow>(
@@ -1792,7 +2120,19 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
          WHERE status = 'queued' AND initialization_needed != 0`,
       )
       .one().value;
-    const next = [lease, queueDeadline, checkRetry, initializationRetry]
+    const deploymentRetry = this.ctx.storage.sql
+      .exec<MinimumRow>(
+        `SELECT MIN(sync_retry_at) AS value FROM deployments
+         WHERE sync_needed != 0`,
+      )
+      .one().value;
+    const next = [
+      lease,
+      queueDeadline,
+      checkRetry,
+      initializationRetry,
+      deploymentRetry,
+    ]
       .filter((value): value is number => value !== null)
       .sort((a, b) => a - b)[0];
     if (next === undefined) {
@@ -1847,7 +2187,32 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
         status: row.status,
         created_at: new Date(row.created_at).toISOString(),
       }));
-    return { jobs, agents, concurrency };
+    const deployments = this.ctx.storage.sql
+      .exec<DeploymentRow>(
+        "SELECT * FROM deployments ORDER BY updated_at DESC LIMIT 200",
+      )
+      .toArray()
+      .map((row) => ({
+        job_id: row.job_id,
+        unit_id: row.unit_id,
+        environment: row.environment,
+        desired_state: row.desired_state,
+        environment_url: row.environment_url,
+        github_deployment_id: row.github_deployment_id,
+        synced_state: row.synced_state,
+        synced_environment_url: row.synced_environment_url,
+        sync_status:
+          row.sync_needed === 0
+            ? "synced"
+            : row.sync_needed === 1
+              ? "pending"
+              : "running",
+        sync_attempt_count: row.sync_attempt_count,
+        last_error: row.last_error,
+        created_at: new Date(row.created_at).toISOString(),
+        updated_at: new Date(row.updated_at).toISOString(),
+      }));
+    return { jobs, agents, concurrency, deployments };
   }
 
   private agentStatus(socket: WebSocket): Record<string, unknown> {
@@ -1936,12 +2301,29 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
       summary,
       row.id,
     );
+    this.finishOutstandingDeployments(row.id);
     this.broadcast("job_finished", {
       job_id: row.id,
       agent_id: row.agent_id,
       conclusion,
       summary,
     });
+  }
+
+  private finishOutstandingDeployments(jobId: string): void {
+    const now = Date.now();
+    this.ctx.storage.sql.exec(
+      `UPDATE deployments
+       SET desired_state = 'error', environment_url = NULL,
+         sync_needed = CASE WHEN sync_needed = 2 THEN 2 ELSE 1 END,
+         sync_attempt_count = CASE WHEN sync_needed = 2 THEN sync_attempt_count ELSE 0 END,
+         sync_retry_at = CASE WHEN sync_needed = 2 THEN sync_retry_at ELSE ? END,
+         last_error = NULL, updated_at = ?
+       WHERE job_id = ? AND desired_state = 'in_progress'`,
+      now,
+      now,
+      jobId,
+    );
   }
 
   private prune(now: number): void {
@@ -1969,6 +2351,12 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
       cutoff,
     );
     this.ctx.storage.sql.exec(
+      `DELETE FROM deployments WHERE job_id IN (
+         SELECT id FROM jobs WHERE status = 'completed' AND completed_at < ?
+       )`,
+      cutoff,
+    );
+    this.ctx.storage.sql.exec(
       "DELETE FROM jobs WHERE status = 'completed' AND completed_at < ?",
       cutoff,
     );
@@ -1980,6 +2368,30 @@ function initializationRetryDelay(attempt: number): number {
     INITIALIZATION_RETRY_BASE_MILLISECONDS * 2 ** Math.max(0, attempt - 1),
     INITIALIZATION_RETRY_MAX_MILLISECONDS,
   );
+}
+
+function deploymentRetryDelay(attempt: number): number {
+  return Math.min(
+    DEPLOYMENT_RETRY_BASE_MILLISECONDS * 2 ** Math.max(0, attempt - 1),
+    DEPLOYMENT_RETRY_MAX_MILLISECONDS,
+  );
+}
+
+function deploymentState(
+  conclusion: Extract<
+    Conclusion,
+    "success" | "failure" | "cancelled" | "timed_out"
+  >,
+): GitHubDeploymentState {
+  switch (conclusion) {
+    case "success":
+      return "success";
+    case "failure":
+      return "failure";
+    case "cancelled":
+    case "timed_out":
+      return "error";
+  }
 }
 
 function initializationStatus(value: 0 | 1 | 2): string {

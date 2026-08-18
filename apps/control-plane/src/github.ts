@@ -87,6 +87,26 @@ const installationAccessTokenSchema = z.object({
   expires_at: z.iso.datetime({ offset: true }),
 });
 
+const deploymentSchema = z.object({
+  id: z.number().int().positive(),
+  payload: z.unknown().optional(),
+});
+
+const deploymentStatusSchema = z.object({
+  state: z.enum([
+    "error",
+    "failure",
+    "inactive",
+    "in_progress",
+    "queued",
+    "pending",
+    "success",
+  ]),
+  description: z.string().nullable().optional(),
+  environment: z.string(),
+  environment_url: z.string().nullable().optional(),
+});
+
 type ActionsVariable = z.infer<
   typeof actionsVariablePageSchema
 >["variables"][number];
@@ -116,6 +136,12 @@ export interface InstallationAccessToken {
   token: string;
   expiresAtEpochSeconds: number;
 }
+
+export type GitHubDeploymentState =
+  | "in_progress"
+  | "success"
+  | "failure"
+  | "error";
 
 export async function validateGitHubAppCredentials(
   env: GitHubEnvironment,
@@ -341,6 +367,111 @@ export async function createEnvironmentToken(
     actions: "read",
     environments: "read",
   });
+}
+
+export async function syncGitHubDeployment(
+  env: GitHubEnvironment,
+  job: QueuedJob,
+  unitId: string,
+  environment: string,
+  state: GitHubDeploymentState,
+  environmentUrl: string | null,
+  deploymentId: number | null,
+  recoverAmbiguousWrite: boolean,
+): Promise<number> {
+  const token = await createInstallationToken(
+    env,
+    job.installation_id,
+    job.repository.name,
+    { deployments: "write" },
+  );
+  const repositoryPath = `/repos/${encodeURIComponent(job.repository.owner)}/${encodeURIComponent(job.repository.name)}`;
+  let resolvedDeploymentId = deploymentId;
+  if (resolvedDeploymentId === null && recoverAmbiguousWrite) {
+    const query = new URLSearchParams({
+      sha: jobExecutionSha(job),
+      environment,
+      task: "deploy",
+      per_page: "100",
+    });
+    const deployments = z
+      .array(deploymentSchema)
+      .parse(
+        await githubRequest(
+          env,
+          token,
+          `${repositoryPath}/deployments?${query.toString()}`,
+          { method: "GET" },
+        ),
+      );
+    resolvedDeploymentId =
+      deployments.find((deployment) =>
+        isGitZeroDeploymentPayload(deployment.payload, job.id, unitId),
+      )?.id ?? null;
+  }
+  if (resolvedDeploymentId === null) {
+    const deployment = deploymentSchema.parse(
+      await githubRequest(env, token, `${repositoryPath}/deployments`, {
+        method: "POST",
+        body: JSON.stringify({
+          ref: jobExecutionSha(job),
+          task: "deploy",
+          auto_merge: false,
+          required_contexts: [],
+          environment,
+          description: "GitZero workflow deployment.",
+          payload: {
+            gitzero: {
+              job_id: job.id,
+              unit_id: unitId,
+            },
+          },
+        }),
+      }),
+    );
+    resolvedDeploymentId = deployment.id;
+  }
+
+  const description = deploymentStatusDescription(state);
+  if (recoverAmbiguousWrite) {
+    const statuses = z
+      .array(deploymentStatusSchema)
+      .parse(
+        await githubRequest(
+          env,
+          token,
+          `${repositoryPath}/deployments/${resolvedDeploymentId}/statuses?per_page=100`,
+          { method: "GET" },
+        ),
+      );
+    if (
+      statuses.some(
+        (status) =>
+          status.state === state &&
+          status.environment === environment &&
+          (status.environment_url ?? null) === environmentUrl &&
+          (status.description ?? "") === description,
+      )
+    ) {
+      return resolvedDeploymentId;
+    }
+  }
+  await githubRequest(
+    env,
+    token,
+    `${repositoryPath}/deployments/${resolvedDeploymentId}/statuses`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        state,
+        environment,
+        description,
+        ...(environmentUrl === null ? {} : { environment_url: environmentUrl }),
+        auto_inactive: state === "success",
+      }),
+    },
+  );
+  return resolvedDeploymentId;
 }
 
 export async function createWorkflowToken(
@@ -903,6 +1034,34 @@ function jobExecutionSha(job: QueuedJob): string {
     throw new Error("pull request merge snapshot is not initialized");
   }
   return mergeSha;
+}
+
+function isGitZeroDeploymentPayload(
+  payload: unknown,
+  jobId: string,
+  unitId: string,
+): boolean {
+  if (!payload || typeof payload !== "object") return false;
+  const gitzero = Reflect.get(payload, "gitzero");
+  return (
+    gitzero !== null &&
+    typeof gitzero === "object" &&
+    Reflect.get(gitzero, "job_id") === jobId &&
+    Reflect.get(gitzero, "unit_id") === unitId
+  );
+}
+
+function deploymentStatusDescription(state: GitHubDeploymentState): string {
+  switch (state) {
+    case "in_progress":
+      return "GitZero deployment is running.";
+    case "success":
+      return "GitZero deployment completed successfully.";
+    case "failure":
+      return "GitZero deployment failed.";
+    case "error":
+      return "GitZero deployment was cancelled or timed out.";
+  }
 }
 
 function normalizePrivateKeyPem(value: string): string {
