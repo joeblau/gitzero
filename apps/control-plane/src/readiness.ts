@@ -3,6 +3,7 @@ import type {
   RepositoryActionsPermissions,
   RepositoryCheckRun,
 } from "./github";
+import { fullGitObjectIdSchema } from "./git";
 
 const snapshotSchema = z.object({
   agents: z.array(
@@ -17,7 +18,7 @@ const snapshotSchema = z.object({
     z.object({
       id: z.string().min(1),
       repository: z.string().min(1),
-      head_sha: z.string().regex(/^[0-9a-fA-F]{40}$/),
+      head_sha: fullGitObjectIdSchema,
       status: z.enum(["queued", "assigned", "running", "completed"]),
       conclusion: z
         .enum(["success", "failure", "cancelled", "timed_out", "neutral"])

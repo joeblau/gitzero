@@ -7,7 +7,7 @@ rustup toolchain install 1.96.1
 cargo build --release -p gitzero-agent
 ```
 
-Install Git and Node.js 24 on the target. Git 2.28 or newer is required by workflows that use `actions/checkout` sparse patterns. JavaScript actions execute with the machine's `node` binary; the launchd service searches `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, and `/bin`.
+Install Git and Node.js 24 on the target. Git 2.28 or newer is required by workflows that use `actions/checkout` sparse patterns, and Git 2.42 or newer is required for repositories that use the stable SHA-256 object format. JavaScript actions execute with the machine's `node` binary; the launchd service searches `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, and `/bin`.
 
 Create or choose a dedicated non-administrator macOS user. Then run the installer from the repository checkout:
 

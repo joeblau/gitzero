@@ -50,6 +50,26 @@ describe("repository onboarding readiness", () => {
     expect(readiness.next_action).toBe("complete");
   });
 
+  it("verifies SHA-256 repository checks", () => {
+    const value = snapshot();
+    value.jobs[0]!.head_sha = "a".repeat(64);
+    const check = { ...githubCheck(), head_sha: "a".repeat(64) };
+
+    const readiness = buildRepositoryReadiness(
+      7001,
+      "acme",
+      "widget",
+      actionsEnabled,
+      value,
+      check,
+    );
+
+    expect(readiness.successful_check).toMatchObject({
+      verified: true,
+      head_sha: "a".repeat(64),
+    });
+  });
+
   it("does not accept manual jobs or Checks from another repository", () => {
     const value = snapshot();
     value.jobs[0]!.check_run_id = null;

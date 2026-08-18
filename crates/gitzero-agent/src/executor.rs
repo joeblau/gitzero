@@ -392,9 +392,12 @@ impl Executor {
         concurrency: ConcurrencyClient,
         repository_access: RepositoryAccessClient,
     ) -> Result<()> {
-        validate_sha(&run.pull_request.head_sha)?;
-        validate_sha(&run.pull_request.base_sha)?;
-        validate_sha(&run.pull_request.merge_sha)?;
+        let head_object_format = validate_sha(&run.pull_request.head_sha)?;
+        if validate_sha(&run.pull_request.base_sha)? != head_object_format
+            || validate_sha(&run.pull_request.merge_sha)? != head_object_format
+        {
+            bail!("pull request snapshot object IDs must use one Git object format");
+        }
         validate_execution_ref(&run)?;
         validate_checkout_token_metadata(&run)?;
         let run_dir = self.config.work_root.join(run.id.to_string());
@@ -687,13 +690,14 @@ async fn checkout(
     )
     .await?;
 
+    let mut initialize = Command::new("git");
+    initialize.args(["init", "--quiet"]);
+    configure_git_init_object_format(&mut initialize, &run.pull_request.merge_sha)?;
+    initialize.current_dir(repository_dir);
     run_process(
         run.id,
         step_id,
-        Command::new("git")
-            .arg("init")
-            .arg("--quiet")
-            .current_dir(repository_dir),
+        &mut initialize,
         None,
         cancel.clone(),
         outbound.clone(),
@@ -4757,8 +4761,14 @@ async fn execute_checkout_step_with_repository(
             .map(|credentials| credentials.command.as_str()),
     );
 
-    let existing_repository =
+    let mut existing_repository =
         git_repository_exists(&checkout_directory, &checkout_environment).await?;
+    if existing_repository
+        && git_repository_object_format(&checkout_directory, &checkout_environment).await?
+            != GitObjectFormat::from_object_id(&expected_sha)?
+    {
+        existing_repository = false;
+    }
     if !existing_repository {
         clear_checkout_directory(&checkout_directory).await?;
         tokio::fs::create_dir_all(&checkout_directory)
@@ -4767,8 +4777,9 @@ async fn execute_checkout_step_with_repository(
                 format!("create checkout directory {}", checkout_directory.display())
             })?;
         let mut command = Command::new("git");
+        command.args(["init", "--quiet"]);
+        configure_git_init_object_format(&mut command, &expected_sha)?;
         command
-            .args(["init", "--quiet"])
             .current_dir(&checkout_directory)
             .envs(checkout_environment.iter());
         run_process(
@@ -6337,6 +6348,33 @@ async fn git_repository_exists(
         .is_ok_and(|actual| actual == expected))
 }
 
+async fn git_repository_object_format(
+    directory: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<GitObjectFormat> {
+    let output = Command::new("git")
+        .args(["config", "--local", "--get", "extensions.objectFormat"])
+        .current_dir(directory)
+        .envs(environment.iter())
+        .output()
+        .await
+        .context("inspect checkout repository object format")?;
+    if output.status.success() {
+        return match String::from_utf8_lossy(&output.stdout).trim() {
+            "sha1" => Ok(GitObjectFormat::Sha1),
+            "sha256" => Ok(GitObjectFormat::Sha256),
+            _ => bail!("checkout repository uses an unsupported Git object format"),
+        };
+    }
+    if output.status.code() == Some(1) && output.stderr.is_empty() {
+        return Ok(GitObjectFormat::Sha1);
+    }
+    bail!(
+        "inspect checkout repository object format: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
 async fn clear_checkout_directory(directory: &Path) -> Result<()> {
     if !tokio::fs::try_exists(directory).await? {
         return Ok(());
@@ -7154,6 +7192,14 @@ async fn materialize_remote_repository_with_fetch(
         step_id,
         &cache,
         cache_remote,
+        git_ref,
+        if fetch_remote == "origin" {
+            cache_remote
+        } else {
+            fetch_remote
+        },
+        checkout_token,
+        checkout_environment,
         cancel,
         outbound,
         sequence,
@@ -7167,21 +7213,8 @@ async fn materialize_remote_repository_with_fetch(
         probe
             .arg("--git-dir")
             .arg(&cache)
-            .args(["ls-remote", "--quiet", fetch_remote, "HEAD"])
-            .env("GIT_TERMINAL_PROMPT", "0");
-        if let Some(checkout_environment) = checkout_environment {
-            probe.envs(checkout_environment.iter());
-        }
-        if let Some(checkout_token) = checkout_token {
-            let credential = STANDARD.encode(format!("x-access-token:{checkout_token}"));
-            probe
-                .env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-                .env(
-                    "GIT_CONFIG_VALUE_0",
-                    format!("AUTHORIZATION: basic {credential}"),
-                );
-        }
+            .args(["ls-remote", "--quiet", fetch_remote, "HEAD"]);
+        configure_remote_repository_access(&mut probe, checkout_token, checkout_environment);
         run_process(
             job_id,
             step_id,
@@ -7197,32 +7230,16 @@ async fn materialize_remote_repository_with_fetch(
     }
     if commit.is_none() {
         let mut fetch = Command::new("git");
-        fetch
-            .arg("--git-dir")
-            .arg(&cache)
-            .args([
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "--depth=1",
-                "--force",
-                fetch_remote,
-                git_ref,
-            ])
-            .env("GIT_TERMINAL_PROMPT", "0");
-        if let Some(checkout_environment) = checkout_environment {
-            fetch.envs(checkout_environment.iter());
-        }
-        if let Some(checkout_token) = checkout_token {
-            let credential = STANDARD.encode(format!("x-access-token:{checkout_token}"));
-            fetch
-                .env("GIT_CONFIG_COUNT", "1")
-                .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-                .env(
-                    "GIT_CONFIG_VALUE_0",
-                    format!("AUTHORIZATION: basic {credential}"),
-                );
-        }
+        fetch.arg("--git-dir").arg(&cache).args([
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--depth=1",
+            "--force",
+            fetch_remote,
+            git_ref,
+        ]);
+        configure_remote_repository_access(&mut fetch, checkout_token, checkout_environment);
         run_process(
             job_id,
             step_id,
@@ -7351,11 +7368,16 @@ fn remote_repository_lock(cache: &Path) -> Arc<Mutex<()>> {
         .clone()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ensure_remote_repository_cache(
     job_id: Uuid,
     step_id: &str,
     cache: &Path,
     remote: &str,
+    git_ref: &str,
+    object_format_remote: &str,
+    checkout_token: Option<&str>,
+    checkout_environment: Option<&BTreeMap<String, String>>,
     cancel: &watch::Receiver<bool>,
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
@@ -7363,13 +7385,23 @@ async fn ensure_remote_repository_cache(
     if remote_repository_cache_is_valid(cache, remote).await? {
         return Ok(());
     }
+    let object_format = remote_repository_object_format(
+        git_ref,
+        object_format_remote,
+        checkout_token,
+        checkout_environment,
+        cancel,
+    )
+    .await?;
     prepare_directory(cache).await?;
+    let mut initialize = Command::new("git");
+    initialize.args(["init", "--bare", "--quiet"]);
+    object_format.configure_git_init(&mut initialize);
+    initialize.current_dir(cache);
     run_process(
         job_id,
         step_id,
-        Command::new("git")
-            .args(["init", "--bare", "--quiet"])
-            .current_dir(cache),
+        &mut initialize,
         None,
         cancel.clone(),
         outbound.clone(),
@@ -7416,8 +7448,19 @@ async fn remote_repository_cache_is_valid(cache: &Path, remote: &str) -> Result<
         .output()
         .await
         .context("inspect shared remote repository cache remote")?;
-    Ok(configured_remote.status.success()
-        && String::from_utf8_lossy(&configured_remote.stdout).trim() == remote)
+    if !configured_remote.status.success()
+        || String::from_utf8_lossy(&configured_remote.stdout).trim() != remote
+    {
+        return Ok(false);
+    }
+    let has_refs = Command::new("git")
+        .arg("--git-dir")
+        .arg(cache)
+        .args(["show-ref", "--quiet"])
+        .status()
+        .await
+        .context("inspect shared remote repository cache refs")?;
+    Ok(has_refs.success())
 }
 
 async fn read_cached_remote_resolution(cache: &Path, resolution: &Path) -> Result<Option<String>> {
@@ -7439,11 +7482,91 @@ async fn read_cached_remote_resolution(cache: &Path, resolution: &Path) -> Resul
     Ok(exists.success().then_some(commit))
 }
 
-fn validate_remote_commit(commit: &str) -> Result<()> {
-    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("resolved remote commit is not a full Git object ID");
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GitObjectFormat {
+    Sha1,
+    Sha256,
+}
+
+impl GitObjectFormat {
+    fn from_object_id(object_id: &str) -> Result<Self> {
+        if !object_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("Git object ID must contain only hexadecimal characters");
+        }
+        match object_id.len() {
+            40 => Ok(Self::Sha1),
+            64 => Ok(Self::Sha256),
+            _ => bail!("Git object ID must contain exactly 40 or 64 hexadecimal characters"),
+        }
     }
+
+    fn configure_git_init(self, command: &mut Command) {
+        if self == Self::Sha256 {
+            command.arg("--object-format=sha256");
+        }
+    }
+}
+
+fn configure_git_init_object_format(command: &mut Command, object_id: &str) -> Result<()> {
+    GitObjectFormat::from_object_id(object_id)?.configure_git_init(command);
     Ok(())
+}
+
+fn configure_remote_repository_access(
+    command: &mut Command,
+    checkout_token: Option<&str>,
+    checkout_environment: Option<&BTreeMap<String, String>>,
+) {
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    if let Some(checkout_environment) = checkout_environment {
+        command.envs(checkout_environment.iter());
+    }
+    if let Some(checkout_token) = checkout_token {
+        let credential = STANDARD.encode(format!("x-access-token:{checkout_token}"));
+        command
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+            .env(
+                "GIT_CONFIG_VALUE_0",
+                format!("AUTHORIZATION: basic {credential}"),
+            );
+    }
+}
+
+async fn remote_repository_object_format(
+    git_ref: &str,
+    remote: &str,
+    checkout_token: Option<&str>,
+    checkout_environment: Option<&BTreeMap<String, String>>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<GitObjectFormat> {
+    if let Ok(object_format) = GitObjectFormat::from_object_id(git_ref) {
+        return Ok(object_format);
+    }
+    let mut command = Command::new("git");
+    command.args(["ls-remote", "--quiet", remote, "HEAD"]);
+    if git_ref.starts_with("refs/") {
+        command.arg(git_ref);
+    } else {
+        command
+            .arg(format!("refs/heads/{git_ref}"))
+            .arg(format!("refs/tags/{git_ref}"));
+    }
+    configure_remote_repository_access(&mut command, checkout_token, checkout_environment);
+    let output = run_process_capture_stdout(&mut command, cancel.clone())
+        .await
+        .with_context(|| format!("detect Git object format for remote ref {git_ref}"))?;
+    let object_id = output
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(object_id, _)| object_id))
+        .find(|object_id| !object_id.starts_with("ref: "))
+        .context("remote did not advertise HEAD or the selected ref")?;
+    GitObjectFormat::from_object_id(object_id)
+        .context("remote advertised an unsupported Git object format")
+}
+
+fn validate_remote_commit(commit: &str) -> Result<()> {
+    GitObjectFormat::from_object_id(commit).map(|_| ())
 }
 
 async fn git_output(command: &mut Command, operation: &str) -> Result<String> {
@@ -9177,11 +9300,8 @@ fn actions_runtime_token(
     Ok(format!("{header}.{payload}.{signature}"))
 }
 
-fn validate_sha(value: &str) -> Result<()> {
-    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("pull request snapshot SHA must be exactly 40 hexadecimal characters");
-    }
-    Ok(())
+fn validate_sha(value: &str) -> Result<GitObjectFormat> {
+    GitObjectFormat::from_object_id(value).context("invalid pull request snapshot object ID")
 }
 
 fn validate_checkout_token_metadata(run: &RunSpec) -> Result<()> {
@@ -10105,8 +10225,11 @@ mod tests {
     #[test]
     fn only_accepts_full_commit_shas() {
         assert!(validate_sha("0123456789012345678901234567890123456789").is_ok());
+        assert!(validate_sha(&"a".repeat(64)).is_ok());
         assert!(validate_sha("main").is_err());
         assert!(validate_sha("-012345678901234567890123456789012345678").is_err());
+        assert!(validate_sha(&"a".repeat(63)).is_err());
+        assert!(validate_sha(&format!("{}z", "a".repeat(63))).is_err());
     }
 
     #[test]
@@ -11185,6 +11308,14 @@ jobs:
             git_output(&cache, ["config", "--get", "remote.origin.url"]),
             canonical_remote
         );
+        assert_eq!(
+            std::fs::read_to_string(&ssh_log)
+                .expect("fake SSH invocation log")
+                .lines()
+                .count(),
+            2,
+            "first SSH materialization must detect the object format before fetching"
+        );
 
         let second = materialize_remote_repository_with_fetch(
             Uuid::new_v4(),
@@ -11213,7 +11344,7 @@ jobs:
                 .expect("fake SSH invocation log")
                 .lines()
                 .count(),
-            2,
+            3,
             "a second purpose did not prove SSH access before consuming the pinned ref"
         );
     }
@@ -15122,6 +15253,94 @@ jobs:
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    async fn materializes_sha256_remote_repository_objects() {
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let source = fixture.path().join("action-source");
+        let remote = fixture.path().join("action.git");
+        let work_root = fixture.path().join("runs");
+        let run_dir = work_root.join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&source).expect("source directory");
+        std::fs::create_dir_all(&run_dir).expect("run directory");
+        git(
+            &source,
+            ["init", "--object-format=sha256", "--initial-branch=main"],
+        );
+        git(&source, ["config", "user.email", "gitzero@example.test"]);
+        git(&source, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(source.join("action.yml"), "name: SHA-256 action\n")
+            .expect("action metadata");
+        git(&source, ["add", "."]);
+        git(&source, ["commit", "-m", "sha256 action"]);
+        git(
+            fixture.path(),
+            [
+                "init",
+                "--bare",
+                "--object-format=sha256",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        git(
+            &source,
+            [
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        git(&source, ["push", "origin", "main"]);
+        git(&remote, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        let stale_cache = work_root.join("_action-cache/fixture/sha256-action.git");
+        std::fs::create_dir_all(stale_cache.parent().expect("cache parent"))
+            .expect("cache parent directory");
+        git(
+            fixture.path(),
+            ["init", "--bare", stale_cache.to_str().expect("cache path")],
+        );
+        git(
+            &stale_cache,
+            [
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+
+        let (outbound, _incoming) = mpsc::channel(64);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let checkout = materialize_remote_repository(
+            Uuid::new_v4(),
+            "0/sha256-action",
+            "fixture",
+            "sha256-action",
+            "main",
+            remote.to_str().expect("remote path"),
+            RemoteRepositoryMaterializationScope::SharedSource,
+            None,
+            &run_dir,
+            &cancel,
+            &outbound,
+            &Arc::new(AtomicU64::new(0)),
+        )
+        .await
+        .expect("materialize SHA-256 action");
+
+        assert_eq!(
+            git_output(&checkout, ["rev-parse", "--show-object-format"]),
+            "sha256"
+        );
+        assert_eq!(git_output(&checkout, ["rev-parse", "HEAD"]).len(), 64);
+        assert_eq!(
+            git_output(&stale_cache, ["config", "--get", "extensions.objectFormat"],),
+            "sha256"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
     async fn shares_remote_action_objects_and_pins_refs_per_run() {
         let fixture = tempfile::tempdir().expect("fixture tempdir");
         let source = fixture.path().join("action-source");
@@ -16124,6 +16343,107 @@ jobs:
                 summary,
                 ..
             } if summary.contains("No workflows matched this pull_request activity")
+        )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn executes_sha256_pull_request_workflow_with_unchanged_checkout() {
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let source = fixture.path().join("source");
+        let remote = fixture.path().join("remote.git");
+        std::fs::create_dir_all(source.join(".github/workflows")).expect("workflow directory");
+        git(
+            &source,
+            ["init", "--object-format=sha256", "--initial-branch=main"],
+        );
+        git(&source, ["config", "user.email", "gitzero@example.test"]);
+        git(&source, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(
+            source.join(".github/workflows/sha256.yml"),
+            r#"
+name: SHA-256 parity
+on: pull_request
+jobs:
+  verify:
+    runs-on: [self-hosted, macOS]
+    steps:
+      - run: |
+          git init --quiet
+          test "$(git rev-parse --show-object-format)" = sha1
+      - uses: actions/checkout@v4
+      - run: |
+          test "${#GITHUB_SHA}" -eq 64
+          test "$(git rev-parse --show-object-format)" = sha256
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo sha256-checkout-parity
+"#,
+        )
+        .expect("workflow");
+        std::fs::write(source.join("README.md"), "SHA-256 fixture\n").expect("fixture file");
+        git(&source, ["add", "."]);
+        git(&source, ["commit", "-m", "sha256 workflow"]);
+        let commit = git_output(&source, ["rev-parse", "HEAD"]);
+        assert_eq!(commit.len(), 64);
+        git(
+            fixture.path(),
+            [
+                "init",
+                "--bare",
+                "--object-format=sha256",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        git(
+            &source,
+            [
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        git(&source, ["push", "origin", "main"]);
+        git(&source, ["push", "origin", "HEAD:refs/pull/1/head"]);
+        git(&source, ["push", "origin", "HEAD:refs/pull/1/merge"]);
+        git(&remote, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        let executor = Executor::new(ExecutorConfig {
+            work_root: fixture.path().join("runs"),
+            runner_name: "GitZero SHA-256 Test".to_owned(),
+            keep_failed_workspaces: true,
+            max_parallelism: 1,
+            cache_max_bytes: 10 * 1024 * 1024,
+            cache_max_entry_bytes: 1024 * 1024,
+            artifact_max_bytes: 10 * 1024 * 1024,
+            artifact_max_entry_bytes: 1024 * 1024,
+        });
+        let run = fixture_run(
+            Uuid::new_v4(),
+            commit.clone(),
+            commit,
+            remote.display().to_string(),
+        );
+        let (outbound, mut incoming) = mpsc::channel(128);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        executor
+            .execute(run, cancel, outbound)
+            .await
+            .expect("execute SHA-256 workflow");
+        let mut events = Vec::new();
+        while let Ok(message) = incoming.try_recv() {
+            events.push(message);
+        }
+        assert!(events.iter().any(|message| matches!(
+            message,
+            AgentMessage::LogChunk { data, .. } if data == "sha256-checkout-parity\n"
+        )));
+        assert!(events.iter().any(|message| matches!(
+            message,
+            AgentMessage::JobFinished {
+                conclusion: Conclusion::Success,
+                ..
+            }
         )));
     }
 

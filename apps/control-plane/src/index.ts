@@ -12,6 +12,7 @@ import {
   fetchRepositoryOnboardingEvidence,
   validateGitHubAppCredentials,
 } from "./github";
+import { fullGitObjectIdSchema } from "./git";
 import {
   buildRepositoryReadiness,
   findSuccessfulCheckCandidate,
@@ -69,13 +70,15 @@ const webhookSchema = z.object({
     number: z.number().int().positive(),
     draft: z.boolean().nullable(),
     merged: z.boolean(),
-    merge_commit_sha: z
-      .string()
-      .regex(/^[0-9a-fA-F]{40}$/)
-      .nullable()
-      .optional(),
-    head: z.object({ sha: z.string(), ref: z.string().min(1) }),
-    base: z.object({ sha: z.string(), ref: z.string().min(1) }),
+    merge_commit_sha: fullGitObjectIdSchema.nullable().optional(),
+    head: z.object({
+      sha: fullGitObjectIdSchema,
+      ref: z.string().min(1),
+    }),
+    base: z.object({
+      sha: fullGitObjectIdSchema,
+      ref: z.string().min(1),
+    }),
   }),
   sender: z.object({
     id: z.number().int().positive(),
@@ -120,7 +123,7 @@ const readinessQuerySchema = z.object({
 const onboardingBodySchema = readinessQuerySchema.extend({
   expected_job_id: z.uuid(),
   expected_check_run_id: z.number().int().positive(),
-  expected_head_sha: z.string().regex(/^[0-9a-fA-F]{40}$/),
+  expected_head_sha: fullGitObjectIdSchema,
   confirmation: z.literal("disable_native_actions"),
 });
 

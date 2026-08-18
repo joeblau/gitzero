@@ -296,11 +296,11 @@ describe("pull request merge snapshots", () => {
           return Response.json(installationToken("pull-request-token"));
         }
         return Response.json({
-          head: { sha: "A".repeat(40) },
-          base: { sha: "B".repeat(40) },
+          head: { sha: "A".repeat(64) },
+          base: { sha: "B".repeat(64) },
           merged: false,
           mergeable: true,
-          merge_commit_sha: "C".repeat(40),
+          merge_commit_sha: "C".repeat(64),
         });
       }),
     );
@@ -316,10 +316,10 @@ describe("pull request merge snapshots", () => {
         "acme corp",
         "hello world",
         42,
-        "a".repeat(40),
-        "b".repeat(40),
+        "a".repeat(64),
+        "b".repeat(64),
       ),
-    ).resolves.toEqual({ status: "ready", merge_sha: "C".repeat(40) });
+    ).resolves.toEqual({ status: "ready", merge_sha: "C".repeat(64) });
 
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
       repositories: ["hello world"],

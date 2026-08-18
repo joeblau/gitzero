@@ -54,6 +54,44 @@ describe("agent protocol", () => {
     expect(runSpecSchema.parse(run).pull_request.execution_ref).toBe(
       "refs/pull/42/merge",
     );
+    const sha256Run = {
+      ...run,
+      pull_request: {
+        ...run.pull_request,
+        head_sha: "a".repeat(64),
+        base_sha: "b".repeat(64),
+        merge_sha: "c".repeat(64),
+      },
+    };
+    expect(runSpecSchema.parse(sha256Run).pull_request.merge_sha).toBe(
+      "c".repeat(64),
+    );
+    expect(
+      runSpecSchema.safeParse({
+        ...sha256Run,
+        pull_request: {
+          ...sha256Run.pull_request,
+          base_sha: "b".repeat(40),
+        },
+      }).success,
+    ).toBe(false);
+    for (const invalidObjectId of [
+      "a".repeat(39),
+      "a".repeat(41),
+      "a".repeat(63),
+      "a".repeat(65),
+      `${"a".repeat(63)}z`,
+    ]) {
+      expect(
+        runSpecSchema.safeParse({
+          ...sha256Run,
+          pull_request: {
+            ...sha256Run.pull_request,
+            merge_sha: invalidObjectId,
+          },
+        }).success,
+      ).toBe(false);
+    }
     expect(runSpecSchema.safeParse(queued).success).toBe(false);
     expect(
       runSpecSchema.safeParse({

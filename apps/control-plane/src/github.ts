@@ -8,6 +8,7 @@ import {
   type Conclusion,
   type QueuedJob,
 } from "./protocol";
+import { fullGitObjectIdSchema } from "./git";
 
 const VARIABLE_PAGE_SIZE = 30;
 const MAX_REPOSITORY_VARIABLES = 500;
@@ -72,14 +73,11 @@ const checkRunAnnotationsSchema = z.array(
 );
 
 const pullRequestMergeSchema = z.object({
-  head: z.object({ sha: z.string().regex(/^[0-9a-fA-F]{40}$/) }),
-  base: z.object({ sha: z.string().regex(/^[0-9a-fA-F]{40}$/) }),
+  head: z.object({ sha: fullGitObjectIdSchema }),
+  base: z.object({ sha: fullGitObjectIdSchema }),
   merged: z.boolean(),
   mergeable: z.boolean().nullable(),
-  merge_commit_sha: z
-    .string()
-    .regex(/^[0-9a-fA-F]{40}$/)
-    .nullable(),
+  merge_commit_sha: fullGitObjectIdSchema.nullable(),
 });
 
 const installationAccessTokenSchema = z.object({

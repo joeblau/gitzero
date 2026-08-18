@@ -370,7 +370,7 @@ describe("HTTP entrypoint", () => {
 
     const workspaceId = "7201";
     const jobId = crypto.randomUUID();
-    const headSha = "3".repeat(40);
+    const headSha = "3".repeat(64);
     const checkRunId = 8801;
     let actionsEnabled = true;
     let checkConclusion = "success";
@@ -480,7 +480,7 @@ describe("HTTP entrypoint", () => {
             number: 42,
             action: "opened",
             head_sha: headSha,
-            base_sha: "4".repeat(40),
+            base_sha: "4".repeat(64),
             merge_sha: headSha,
             execution_ref: "refs/pull/42/merge",
             head_ref: "feature/readiness",

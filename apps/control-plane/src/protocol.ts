@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { fullGitObjectIdSchema } from "./git";
 
 export const PROTOCOL_VERSION = 14;
 
@@ -78,7 +79,6 @@ const workflowTokenRequestSchema = z
   );
 
 const uuid = z.string().uuid();
-const sha = z.string().regex(/^[0-9a-fA-F]{40}$/);
 const tokenExpiryEpochSeconds = z
   .number()
   .int()
@@ -144,16 +144,31 @@ export const repositorySchema = z.object({
     }),
 });
 
-export const pullRequestSchema = z.object({
+const pullRequestShape = {
   number: z.number().int().positive(),
   action: z.string().min(1),
-  head_sha: sha,
-  base_sha: sha,
-  merge_sha: sha.nullable().default(null),
+  head_sha: fullGitObjectIdSchema,
+  base_sha: fullGitObjectIdSchema,
+  merge_sha: fullGitObjectIdSchema.nullable().default(null),
   execution_ref: gitExecutionRef.nullable().default(null),
   head_ref: z.string().min(1),
   base_ref: z.string().min(1),
-});
+};
+const objectIdsUseOneFormat = (snapshot: {
+  head_sha: string;
+  base_sha: string;
+  merge_sha: string | null;
+}) =>
+  snapshot.base_sha.length === snapshot.head_sha.length &&
+  (snapshot.merge_sha === null ||
+    snapshot.merge_sha.length === snapshot.head_sha.length);
+const objectFormatIssue = {
+  message: "pull request object IDs must use one Git object format",
+};
+
+export const pullRequestSchema = z
+  .object(pullRequestShape)
+  .refine(objectIdsUseOneFormat, objectFormatIssue);
 
 export const queuedJobSchema = z.object({
   id: uuid,
@@ -178,10 +193,13 @@ export const runSpecSchema = queuedJobSchema
     report_to_github: true,
   })
   .extend({
-    pull_request: pullRequestSchema.extend({
-      merge_sha: sha,
-      execution_ref: gitExecutionRef,
-    }),
+    pull_request: z
+      .object({
+        ...pullRequestShape,
+        merge_sha: fullGitObjectIdSchema,
+        execution_ref: gitExecutionRef,
+      })
+      .refine(objectIdsUseOneFormat, objectFormatIssue),
     check_run_id: z.number().int().positive().nullable().optional(),
     checkout_token: z.string(),
     checkout_token_expires_at_epoch_seconds: tokenExpiryEpochSeconds
