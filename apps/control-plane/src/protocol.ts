@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 const uuid = z.string().uuid();
 const sha = z.string().regex(/^[0-9a-fA-F]{40}$/);
@@ -81,6 +81,8 @@ export const runnerRequirementsSchema = z
   .array(runnerRequirementSchema)
   .max(512);
 
+export const concurrencyQueueSchema = z.enum(["single", "max"]);
+
 export const agentMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("hello"),
@@ -110,6 +112,27 @@ export const agentMessageSchema = z.discriminatedUnion("type", [
     job_id: uuid,
     requirements: runnerRequirementsSchema.min(1),
     reason: z.string().min(1).max(4_096),
+  }),
+  z.object({
+    type: z.literal("concurrency_acquire"),
+    message_id: uuid,
+    job_id: uuid,
+    request_id: uuid,
+    unit_id: z.string().trim().min(1).max(512),
+    group: z
+      .string()
+      .trim()
+      .min(1)
+      .max(256)
+      .refine((value) => !value.includes("\0") && !/[\r\n]/.test(value)),
+    cancel_in_progress: z.boolean(),
+    queue: concurrencyQueueSchema,
+  }),
+  z.object({
+    type: z.literal("concurrency_release"),
+    message_id: uuid,
+    job_id: uuid,
+    request_id: uuid,
   }),
   z.object({
     type: z.literal("step_started"),
@@ -156,6 +179,8 @@ export type ServerMessage =
     }
   | { type: "run_job"; job: RunSpec }
   | { type: "cancel_job"; job_id: string; reason: string }
+  | { type: "concurrency_granted"; request_id: string }
+  | { type: "concurrency_cancelled"; request_id: string; reason: string }
   | { type: "ack"; message_id: string }
   | { type: "error"; code: string; message: string };
 

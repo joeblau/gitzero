@@ -3,7 +3,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_RUNNER_LABELS: usize = 32;
 pub const MAX_RUNNER_REQUIREMENTS: usize = 512;
 pub const MAX_RUNNER_SELECTOR_BYTES: usize = 256;
@@ -42,6 +42,14 @@ pub struct PullRequestSpec {
     pub base_sha: String,
     pub head_ref: String,
     pub base_ref: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConcurrencyQueue {
+    #[default]
+    Single,
+    Max,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +119,13 @@ pub enum ServerMessage {
         job_id: Uuid,
         reason: String,
     },
+    ConcurrencyGranted {
+        request_id: Uuid,
+    },
+    ConcurrencyCancelled {
+        request_id: Uuid,
+        reason: String,
+    },
     Ack {
         message_id: Uuid,
     },
@@ -139,6 +154,20 @@ pub enum AgentMessage {
         job_id: Uuid,
         requirements: Vec<RunnerRequirement>,
         reason: String,
+    },
+    ConcurrencyAcquire {
+        message_id: Uuid,
+        job_id: Uuid,
+        request_id: Uuid,
+        unit_id: String,
+        group: String,
+        cancel_in_progress: bool,
+        queue: ConcurrencyQueue,
+    },
+    ConcurrencyRelease {
+        message_id: Uuid,
+        job_id: Uuid,
+        request_id: Uuid,
     },
     StepStarted {
         message_id: Uuid,
@@ -233,6 +262,35 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AgentMessage>(&json).expect("deserialize rejection"),
             rejected
+        );
+
+        let request_id = Uuid::new_v4();
+        let acquire = AgentMessage::ConcurrencyAcquire {
+            message_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            request_id,
+            unit_id: "workflow:build / test".into(),
+            group: "pull-request-17".into(),
+            cancel_in_progress: true,
+            queue: ConcurrencyQueue::Single,
+        };
+        let json = serde_json::to_string(&acquire).expect("serialize concurrency request");
+        assert!(json.contains(r#""type":"concurrency_acquire""#));
+        assert!(json.contains(r#""queue":"single""#));
+        assert_eq!(
+            serde_json::from_str::<AgentMessage>(&json).expect("deserialize concurrency request"),
+            acquire
+        );
+
+        let cancelled = ServerMessage::ConcurrencyCancelled {
+            request_id,
+            reason: "superseded".into(),
+        };
+        let json = serde_json::to_string(&cancelled).expect("serialize concurrency response");
+        assert!(json.contains(r#""type":"concurrency_cancelled""#));
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&json).expect("deserialize concurrency response"),
+            cancelled
         );
     }
 

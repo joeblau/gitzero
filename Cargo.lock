@@ -558,6 +558,7 @@ dependencies = [
 name = "gitzero-workflow"
 version = "0.1.0"
 dependencies = [
+ "gitzero-expression",
  "indexmap",
  "regex",
  "serde",

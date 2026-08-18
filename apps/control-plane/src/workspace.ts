@@ -34,6 +34,7 @@ const INITIALIZATION_RETRY_MAX_MILLISECONDS = 5 * 60 * 1_000;
 const EVENT_CHUNK_CHARACTERS = 256 * 1024;
 
 type JobStatus = "queued" | "assigned" | "running" | "completed";
+type ConcurrencyStatus = "waiting" | "active" | "cancelling";
 
 interface JobRow extends Record<string, SqlStorageValue> {
   id: string;
@@ -72,6 +73,20 @@ interface ActiveJobRow extends Record<string, SqlStorageValue> {
   id: string;
   status: "assigned" | "running";
   lease_expires_at: number;
+}
+
+interface ConcurrencyRow extends Record<string, SqlStorageValue> {
+  sequence: number;
+  request_id: string;
+  run_id: string;
+  agent_id: string;
+  repository_key: string;
+  group_key: string;
+  group_name: string;
+  unit_id: string;
+  queue_mode: "single" | "max";
+  status: ConcurrencyStatus;
+  created_at: number;
 }
 
 interface AgentCandidate {
@@ -436,6 +451,26 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
         content TEXT NOT NULL,
         PRIMARY KEY (job_id, chunk_index)
       );
+      CREATE TABLE IF NOT EXISTS concurrency_leases (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT NOT NULL UNIQUE,
+        run_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        repository_key TEXT NOT NULL,
+        group_key TEXT NOT NULL,
+        group_name TEXT NOT NULL,
+        unit_id TEXT NOT NULL,
+        queue_mode TEXT NOT NULL CHECK (queue_mode IN ('single', 'max')),
+        status TEXT NOT NULL CHECK (status IN ('waiting', 'active', 'cancelling')),
+        created_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS concurrency_active
+        ON concurrency_leases(repository_key, group_key)
+        WHERE status IN ('active', 'cancelling');
+      CREATE INDEX IF NOT EXISTS concurrency_waiting
+        ON concurrency_leases(repository_key, group_key, status, sequence);
+      CREATE INDEX IF NOT EXISTS concurrency_run
+        ON concurrency_leases(run_id);
       CREATE TABLE IF NOT EXISTS _sql_schema_migrations (
         id INTEGER PRIMARY KEY,
         applied_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -497,6 +532,7 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
         WHERE status = 'queued' AND initialization_needed != 0;
       INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (4);
       INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (5);
+      INSERT OR IGNORE INTO _sql_schema_migrations (id) VALUES (6);
     `);
   }
 
@@ -676,6 +712,316 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
     return rows.length === 1;
   }
 
+  private acquireConcurrency(
+    socket: WebSocket,
+    agentId: string,
+    row: JobRow,
+    message: Extract<AgentMessage, { type: "concurrency_acquire" }>,
+  ): void {
+    const existing = this.ctx.storage.sql
+      .exec<ConcurrencyRow>(
+        "SELECT * FROM concurrency_leases WHERE request_id = ?",
+        message.request_id,
+      )
+      .toArray()[0];
+    if (existing) {
+      if (existing.run_id !== row.id || existing.agent_id !== agentId) {
+        sendServer(socket, {
+          type: "concurrency_cancelled",
+          request_id: message.request_id,
+          reason: "Concurrency request ID is already owned by another run.",
+        });
+      } else if (existing.status === "active") {
+        sendServer(socket, {
+          type: "concurrency_granted",
+          request_id: message.request_id,
+        });
+      } else if (existing.status === "cancelling") {
+        sendServer(socket, {
+          type: "concurrency_cancelled",
+          request_id: message.request_id,
+          reason: "Concurrency unit was superseded by a newer request.",
+        });
+      }
+      return;
+    }
+
+    const job = parseJob(row.job_json);
+    const repositoryKey =
+      `${job.repository.owner}/${job.repository.name}`.toLowerCase();
+    const groupName = message.group.trim();
+    const groupKey = groupName.toLowerCase();
+    const cancelledWaiters: ConcurrencyRow[] = [];
+    let activeToCancel: ConcurrencyRow | undefined;
+    let insertedStatus:
+      | Extract<ConcurrencyStatus, "waiting" | "active">
+      | undefined;
+    let rejection: string | undefined;
+
+    this.ctx.storage.transactionSync(() => {
+      if (message.queue === "single") {
+        cancelledWaiters.push(
+          ...this.ctx.storage.sql
+            .exec<ConcurrencyRow>(
+              `SELECT * FROM concurrency_leases
+               WHERE repository_key = ? AND group_key = ? AND status = 'waiting'
+               ORDER BY sequence`,
+              repositoryKey,
+              groupKey,
+            )
+            .toArray(),
+        );
+        this.ctx.storage.sql.exec(
+          `DELETE FROM concurrency_leases
+           WHERE repository_key = ? AND group_key = ? AND status = 'waiting'`,
+          repositoryKey,
+          groupKey,
+        );
+      } else {
+        const waiting = this.ctx.storage.sql
+          .exec<CountRow>(
+            `SELECT COUNT(*) AS count FROM concurrency_leases
+             WHERE repository_key = ? AND group_key = ? AND status = 'waiting'`,
+            repositoryKey,
+            groupKey,
+          )
+          .one().count;
+        if (waiting >= 100) {
+          rejection =
+            "The concurrency group already has GitHub's maximum of 100 pending units.";
+          return;
+        }
+      }
+
+      const active = this.ctx.storage.sql
+        .exec<ConcurrencyRow>(
+          `SELECT * FROM concurrency_leases
+           WHERE repository_key = ? AND group_key = ?
+             AND status IN ('active', 'cancelling')
+           LIMIT 1`,
+          repositoryKey,
+          groupKey,
+        )
+        .toArray()[0];
+      if (active && message.cancel_in_progress) {
+        activeToCancel = active;
+        this.ctx.storage.sql.exec(
+          "UPDATE concurrency_leases SET status = 'cancelling' WHERE request_id = ?",
+          active.request_id,
+        );
+      }
+      insertedStatus = active ? "waiting" : "active";
+      this.ctx.storage.sql.exec(
+        `INSERT INTO concurrency_leases (
+          request_id, run_id, agent_id, repository_key, group_key,
+          group_name, unit_id, queue_mode, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        message.request_id,
+        row.id,
+        agentId,
+        repositoryKey,
+        groupKey,
+        groupName,
+        message.unit_id,
+        message.queue,
+        insertedStatus,
+        Date.now(),
+      );
+    });
+
+    for (const cancelled of cancelledWaiters) {
+      this.sendConcurrencyCancellation(
+        cancelled,
+        "A newer concurrency request replaced this pending unit.",
+      );
+    }
+    if (rejection) {
+      sendServer(socket, {
+        type: "concurrency_cancelled",
+        request_id: message.request_id,
+        reason: rejection,
+      });
+      return;
+    }
+    if (activeToCancel) {
+      this.sendConcurrencyCancellation(
+        activeToCancel,
+        `A newer unit in concurrency group '${groupName}' requested cancel-in-progress.`,
+      );
+    }
+    if (insertedStatus === "active") {
+      sendServer(socket, {
+        type: "concurrency_granted",
+        request_id: message.request_id,
+      });
+      this.broadcast("concurrency_started", {
+        request_id: message.request_id,
+        run_id: row.id,
+        agent_id: agentId,
+        unit_id: message.unit_id,
+        group: groupName,
+      });
+    } else {
+      this.broadcast("concurrency_waiting", {
+        request_id: message.request_id,
+        run_id: row.id,
+        agent_id: agentId,
+        unit_id: message.unit_id,
+        group: groupName,
+        queue: message.queue,
+      });
+    }
+  }
+
+  private releaseConcurrency(
+    requestId: string,
+    runId: string,
+    agentId: string,
+    reason: string,
+  ): void {
+    const row = this.ctx.storage.sql
+      .exec<ConcurrencyRow>(
+        `DELETE FROM concurrency_leases
+         WHERE request_id = ? AND run_id = ? AND agent_id = ?
+         RETURNING *`,
+        requestId,
+        runId,
+        agentId,
+      )
+      .toArray()[0];
+    if (!row) return;
+    this.broadcast("concurrency_released", {
+      request_id: row.request_id,
+      run_id: row.run_id,
+      agent_id: row.agent_id,
+      unit_id: row.unit_id,
+      group: row.group_name,
+      reason,
+    });
+    if (row.status !== "waiting") {
+      this.promoteConcurrency(row.repository_key, row.group_key);
+    }
+  }
+
+  private releaseConcurrencyForRun(runId: string, reason: string): void {
+    const rows = this.ctx.storage.sql
+      .exec<ConcurrencyRow>(
+        "DELETE FROM concurrency_leases WHERE run_id = ? RETURNING *",
+        runId,
+      )
+      .toArray();
+    const groups = new Map<string, [string, string]>();
+    for (const row of rows) {
+      this.sendConcurrencyCancellation(row, reason);
+      this.broadcast("concurrency_released", {
+        request_id: row.request_id,
+        run_id: row.run_id,
+        agent_id: row.agent_id,
+        unit_id: row.unit_id,
+        group: row.group_name,
+        reason,
+      });
+      if (row.status !== "waiting") {
+        groups.set(`${row.repository_key}\0${row.group_key}`, [
+          row.repository_key,
+          row.group_key,
+        ]);
+      }
+    }
+    for (const [repositoryKey, groupKey] of groups.values()) {
+      this.promoteConcurrency(repositoryKey, groupKey);
+    }
+  }
+
+  private promoteConcurrency(repositoryKey: string, groupKey: string): void {
+    while (true) {
+      const next = this.ctx.storage.transactionSync(() => {
+        const active = this.ctx.storage.sql
+          .exec<CountRow>(
+            `SELECT COUNT(*) AS count FROM concurrency_leases
+             WHERE repository_key = ? AND group_key = ?
+               AND status IN ('active', 'cancelling')`,
+            repositoryKey,
+            groupKey,
+          )
+          .one().count;
+        if (active > 0) return undefined;
+        const candidate = this.ctx.storage.sql
+          .exec<ConcurrencyRow>(
+            `SELECT concurrency_leases.* FROM concurrency_leases
+             JOIN jobs ON jobs.id = concurrency_leases.run_id
+             WHERE concurrency_leases.repository_key = ?
+               AND concurrency_leases.group_key = ?
+               AND concurrency_leases.status = 'waiting'
+               AND jobs.status IN ('assigned', 'running')
+               AND jobs.agent_id = concurrency_leases.agent_id
+             ORDER BY concurrency_leases.sequence
+             LIMIT 1`,
+            repositoryKey,
+            groupKey,
+          )
+          .toArray()[0];
+        if (!candidate) return undefined;
+        return this.ctx.storage.sql
+          .exec<ConcurrencyRow>(
+            `UPDATE concurrency_leases SET status = 'active'
+             WHERE request_id = ? AND status = 'waiting'
+             RETURNING *`,
+            candidate.request_id,
+          )
+          .toArray()[0];
+      });
+      if (!next) return;
+      if (
+        this.sendToAgent(next.agent_id, {
+          type: "concurrency_granted",
+          request_id: next.request_id,
+        })
+      ) {
+        this.broadcast("concurrency_started", {
+          request_id: next.request_id,
+          run_id: next.run_id,
+          agent_id: next.agent_id,
+          unit_id: next.unit_id,
+          group: next.group_name,
+        });
+        return;
+      }
+      this.ctx.storage.sql.exec(
+        "DELETE FROM concurrency_leases WHERE request_id = ?",
+        next.request_id,
+      );
+    }
+  }
+
+  private sendConcurrencyCancellation(
+    row: ConcurrencyRow,
+    reason: string,
+  ): void {
+    this.sendToAgent(row.agent_id, {
+      type: "concurrency_cancelled",
+      request_id: row.request_id,
+      reason,
+    });
+    this.broadcast("concurrency_cancelled", {
+      request_id: row.request_id,
+      run_id: row.run_id,
+      agent_id: row.agent_id,
+      unit_id: row.unit_id,
+      group: row.group_name,
+      reason,
+    });
+  }
+
+  private sendToAgent(agentId: string, message: ServerMessage): boolean {
+    for (const socket of this.ctx.getWebSockets(`agent:${agentId}`)) {
+      if (socket.readyState !== WebSocket.OPEN) continue;
+      sendServer(socket, message);
+      return true;
+    }
+    return false;
+  }
+
   private async handleAgentEvent(
     socket: WebSocket,
     agentId: string,
@@ -782,6 +1128,29 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
         await this.scheduleAlarm();
         return;
       }
+      case "concurrency_acquire": {
+        const row = this.assignedJob(message.job_id, agentId);
+        if (message.queue === "max" && message.cancel_in_progress) {
+          sendServer(socket, {
+            type: "concurrency_cancelled",
+            request_id: message.request_id,
+            reason:
+              "GitHub Actions does not allow queue: max with cancel-in-progress: true.",
+          });
+          return;
+        }
+        this.acquireConcurrency(socket, agentId, row, message);
+        return;
+      }
+      case "concurrency_release": {
+        this.releaseConcurrency(
+          message.request_id,
+          message.job_id,
+          agentId,
+          "Concurrency unit completed.",
+        );
+        return;
+      }
       case "step_started":
       case "step_finished":
       case "log_chunk": {
@@ -795,6 +1164,10 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
       case "job_finished": {
         const row = this.assignedJob(message.job_id, agentId);
         if (row.status !== "completed") {
+          this.releaseConcurrencyForRun(
+            row.id,
+            "The parent GitZero run completed.",
+          );
           this.ctx.storage.sql.exec(
             `UPDATE jobs SET status = 'completed', completed_at = ?, conclusion = ?, summary = ?,
               lease_expires_at = NULL, check_sync_needed = 1
@@ -852,6 +1225,10 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
     if (!["assigned", "running"].includes(row.status)) {
       return null;
     }
+    this.releaseConcurrencyForRun(
+      row.id,
+      `The parent GitZero run was requeued: ${reason}`,
+    );
     if (row.attempt_count >= MAX_ASSIGNMENT_ATTEMPTS) {
       this.completeInfrastructureJob(
         row,
@@ -1114,7 +1491,22 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
       .getWebSockets("role:agent")
       .filter((socket) => readAttachment(socket).hello !== undefined)
       .map((socket) => this.agentStatus(socket));
-    return { jobs, agents };
+    const concurrency = this.ctx.storage.sql
+      .exec<ConcurrencyRow>(
+        "SELECT * FROM concurrency_leases ORDER BY sequence LIMIT 200",
+      )
+      .toArray()
+      .map((row) => ({
+        request_id: row.request_id,
+        run_id: row.run_id,
+        agent_id: row.agent_id,
+        unit_id: row.unit_id,
+        group: row.group_name,
+        queue: row.queue_mode,
+        status: row.status,
+        created_at: new Date(row.created_at).toISOString(),
+      }));
+    return { jobs, agents, concurrency };
   }
 
   private agentStatus(socket: WebSocket): Record<string, unknown> {

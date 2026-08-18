@@ -1,10 +1,12 @@
 mod action;
 mod artifact;
 mod cache;
+mod concurrency;
 mod executor;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use concurrency::ConcurrencyClient;
 use executor::{Executor, ExecutorConfig, default_runner_labels};
 use futures_util::{SinkExt, StreamExt};
 use gitzero_protocol::{
@@ -184,6 +186,7 @@ async fn run_connection(
     info!(workspace_id = %args.workspace_id, agent_id = %args.agent_id, "connected");
     let (mut writer, mut reader) = socket.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<AgentMessage>(512);
+    let concurrency = ConcurrencyClient::remote(outbound_tx.clone());
 
     let hello = AgentMessage::Hello {
         hello: AgentHello {
@@ -201,44 +204,50 @@ async fn run_connection(
     let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    loop {
-        tokio::select! {
-            outbound = outbound_rx.recv() => {
-                let Some(outbound) = outbound else {
-                    bail!("outbound event channel closed");
-                };
-                send_wire_message(&mut writer, &outbound).await?;
-            }
-            incoming = reader.next() => {
-                let incoming = incoming.context("control plane disconnected")??;
-                match incoming {
-                    Message::Text(text) => {
-                        let message: ServerMessage = serde_json::from_str(text.as_ref())
-                            .context("decode control plane message")?;
-                        handle_server_message(
-                            message,
-                            executor.clone(),
-                            semaphore.clone(),
-                            running.clone(),
-                            outbound_tx.clone(),
-                        ).await?;
-                    }
-                    Message::Close(_) => return Ok(()),
-                    Message::Ping(data) => writer.send(Message::Pong(data)).await?,
-                    Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+    let result = async {
+        loop {
+            tokio::select! {
+                outbound = outbound_rx.recv() => {
+                    let Some(outbound) = outbound else {
+                        bail!("outbound event channel closed");
+                    };
+                    send_wire_message(&mut writer, &outbound).await?;
                 }
-            }
-            _ = heartbeat.tick() => {
-                reap_finished(&running).await;
-                let job_ids = running.lock().await.keys().copied().collect();
-                let heartbeat = AgentMessage::Heartbeat {
-                    message_id: Uuid::new_v4(),
-                    running_job_ids: job_ids,
-                };
-                send_wire_message(&mut writer, &heartbeat).await?;
+                incoming = reader.next() => {
+                    let incoming = incoming.context("control plane disconnected")??;
+                    match incoming {
+                        Message::Text(text) => {
+                            let message: ServerMessage = serde_json::from_str(text.as_ref())
+                                .context("decode control plane message")?;
+                            handle_server_message(
+                                message,
+                                executor.clone(),
+                                semaphore.clone(),
+                                running.clone(),
+                                outbound_tx.clone(),
+                                concurrency.clone(),
+                            ).await?;
+                        }
+                        Message::Close(_) => return Ok(()),
+                        Message::Ping(data) => writer.send(Message::Pong(data)).await?,
+                        Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    reap_finished(&running).await;
+                    let job_ids = running.lock().await.keys().copied().collect();
+                    let heartbeat = AgentMessage::Heartbeat {
+                        message_id: Uuid::new_v4(),
+                        running_job_ids: job_ids,
+                    };
+                    send_wire_message(&mut writer, &heartbeat).await?;
+                }
             }
         }
     }
+    .await;
+    concurrency.cancel_all().await;
+    result
 }
 
 async fn handle_server_message(
@@ -247,6 +256,7 @@ async fn handle_server_message(
     semaphore: Arc<Semaphore>,
     running: RunningJobs,
     outbound: mpsc::Sender<AgentMessage>,
+    concurrency: ConcurrencyClient,
 ) -> Result<()> {
     match message {
         ServerMessage::Welcome {
@@ -273,7 +283,10 @@ async fn handle_server_message(
             let job_id = job.id;
             let task = tokio::spawn(async move {
                 let _permit = permit;
-                if let Err(error) = executor.execute(job, cancel_rx, outbound.clone()).await {
+                if let Err(error) = executor
+                    .execute_with_concurrency(job, cancel_rx, outbound.clone(), concurrency)
+                    .await
+                {
                     error!(job_id = %job_id, error = %error, "job execution crashed");
                     let _ = outbound
                         .send(AgentMessage::JobFinished {
@@ -298,6 +311,12 @@ async fn handle_server_message(
             if let Some(job) = running.lock().await.get(&job_id) {
                 let _ = job.cancel.send(true);
             }
+        }
+        ServerMessage::ConcurrencyGranted { request_id } => {
+            concurrency.handle_granted(request_id).await;
+        }
+        ServerMessage::ConcurrencyCancelled { request_id, reason } => {
+            concurrency.handle_cancelled(request_id, reason).await;
         }
         ServerMessage::Ack { .. } => {}
         ServerMessage::Error { code, message } => {

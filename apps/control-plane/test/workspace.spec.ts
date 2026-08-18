@@ -306,7 +306,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 3,
+          protocol_version: 4,
           agent_id: "mini-1",
           name: "Test Mini",
           version: "0.1.0",
@@ -317,7 +317,7 @@ describe("Workspace Durable Object", () => {
     );
 
     const [welcome, assignment] = await messages;
-    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 3 });
+    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 4 });
     expect(assignment).toMatchObject({
       type: "run_job",
       job: {
@@ -604,7 +604,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 3,
+          protocol_version: 4,
           agent_id: "mini-1",
           name: "duplicate",
           version: "0.1.0",
@@ -863,6 +863,239 @@ describe("Workspace Durable Object", () => {
     socket.close(1000, "test complete");
   });
 
+  it("serializes case-insensitive concurrency groups and cancels superseded units", async () => {
+    const workspaceId = crypto.randomUUID();
+    const workspace = env.WORKSPACES.getByName(workspaceId);
+    const first = await connectAgent(workspace, workspaceId, "mini-1", 1);
+    const second = await connectAgent(workspace, workspaceId, "mini-2", 1);
+    const third = await connectAgent(workspace, workspaceId, "mini-3", 1);
+    const firstJob = fixtureJob(workspaceId);
+    const secondJob = fixtureJob(workspaceId);
+    const thirdJob = fixtureJob(workspaceId);
+    const firstAssignment = collectMessageOfType(first, "run_job");
+    const secondAssignment = collectMessageOfType(second, "run_job");
+    const thirdAssignment = collectMessageOfType(third, "run_job");
+    await workspace.enqueue(firstJob, "concurrency-first");
+    await workspace.enqueue(secondJob, "concurrency-second");
+    await workspace.enqueue(thirdJob, "concurrency-third");
+    await expect(firstAssignment).resolves.toMatchObject({
+      job: { id: firstJob.id },
+    });
+    await expect(secondAssignment).resolves.toMatchObject({
+      job: { id: secondJob.id },
+    });
+    await expect(thirdAssignment).resolves.toMatchObject({
+      job: { id: thirdJob.id },
+    });
+
+    const firstRequest = crypto.randomUUID();
+    const firstGranted = collectMessageOfType(first, "concurrency_granted");
+    sendConcurrencyAcquire(first, firstJob.id, firstRequest, "Deploy", false);
+    await expect(firstGranted).resolves.toMatchObject({
+      request_id: firstRequest,
+    });
+
+    const secondRequest = crypto.randomUUID();
+    const secondAcknowledged = collectMessageOfType(second, "ack");
+    sendConcurrencyAcquire(
+      second,
+      secondJob.id,
+      secondRequest,
+      "deploy",
+      false,
+    );
+    await secondAcknowledged;
+
+    const thirdRequest = crypto.randomUUID();
+    const secondCancelled = collectMessageOfType(
+      second,
+      "concurrency_cancelled",
+    );
+    const thirdAcknowledged = collectMessageOfType(third, "ack");
+    sendConcurrencyAcquire(third, thirdJob.id, thirdRequest, "DEPLOY", false);
+    await expect(secondCancelled).resolves.toMatchObject({
+      request_id: secondRequest,
+    });
+    await thirdAcknowledged;
+
+    const thirdGranted = collectMessageOfType(third, "concurrency_granted");
+    sendConcurrencyRelease(first, firstJob.id, firstRequest);
+    await expect(thirdGranted).resolves.toMatchObject({
+      request_id: thirdRequest,
+    });
+
+    const replacementRequest = crypto.randomUUID();
+    const thirdCancelled = collectMessageOfType(third, "concurrency_cancelled");
+    sendConcurrencyAcquire(
+      second,
+      secondJob.id,
+      replacementRequest,
+      "deploy",
+      true,
+    );
+    await expect(thirdCancelled).resolves.toMatchObject({
+      request_id: thirdRequest,
+    });
+    const replacementGranted = collectMessageOfType(
+      second,
+      "concurrency_granted",
+    );
+    sendConcurrencyRelease(third, thirdJob.id, thirdRequest);
+    await expect(replacementGranted).resolves.toMatchObject({
+      request_id: replacementRequest,
+    });
+
+    const snapshot = (await workspace.getSnapshot()) as unknown as {
+      concurrency: Array<Record<string, unknown>>;
+    };
+    expect(snapshot.concurrency).toEqual([
+      expect.objectContaining({
+        request_id: replacementRequest,
+        status: "active",
+        group: "deploy",
+      }),
+    ]);
+    first.close(1000, "test complete");
+    second.close(1000, "test complete");
+    third.close(1000, "test complete");
+  });
+
+  it("promotes queue max concurrency waiters in FIFO order", async () => {
+    const workspaceId = crypto.randomUUID();
+    const workspace = env.WORKSPACES.getByName(workspaceId);
+    const agents = await Promise.all([
+      connectAgent(workspace, workspaceId, "mini-a", 1),
+      connectAgent(workspace, workspaceId, "mini-b", 1),
+      connectAgent(workspace, workspaceId, "mini-c", 1),
+    ]);
+    const jobs = [
+      fixtureJob(workspaceId),
+      fixtureJob(workspaceId),
+      fixtureJob(workspaceId),
+    ];
+    const assignments = agents.map((agent) =>
+      collectMessageOfType(agent, "run_job"),
+    );
+    for (const [index, job] of jobs.entries()) {
+      await workspace.enqueue(job, `fifo-${index}`);
+    }
+    const assignmentMessages = await Promise.all(assignments);
+    const agentByJob = new Map(
+      assignmentMessages.map((assignment, index) => [
+        (assignment.job as { id: string }).id,
+        agents[index] as WebSocket,
+      ]),
+    );
+    const assignedAgents = jobs.map(
+      (job) => agentByJob.get(job.id) as WebSocket,
+    );
+
+    const requests = jobs.map(() => crypto.randomUUID());
+    const firstGranted = collectMessageOfType(
+      assignedAgents[0] as WebSocket,
+      "concurrency_granted",
+    );
+    for (const [index, agent] of assignedAgents.entries()) {
+      sendConcurrencyAcquire(
+        agent,
+        (jobs[index] as QueuedJob).id,
+        requests[index] as string,
+        "release",
+        false,
+        "max",
+      );
+    }
+    await expect(firstGranted).resolves.toMatchObject({
+      request_id: requests[0],
+    });
+
+    const secondGranted = collectMessageOfType(
+      assignedAgents[1] as WebSocket,
+      "concurrency_granted",
+    );
+    sendConcurrencyRelease(
+      assignedAgents[0] as WebSocket,
+      (jobs[0] as QueuedJob).id,
+      requests[0] as string,
+    );
+    await expect(secondGranted).resolves.toMatchObject({
+      request_id: requests[1],
+    });
+    const thirdGranted = collectMessageOfType(
+      assignedAgents[2] as WebSocket,
+      "concurrency_granted",
+    );
+    sendConcurrencyRelease(
+      assignedAgents[1] as WebSocket,
+      (jobs[1] as QueuedJob).id,
+      requests[1] as string,
+    );
+    await expect(thirdGranted).resolves.toMatchObject({
+      request_id: requests[2],
+    });
+    for (const agent of agents) agent.close(1000, "test complete");
+  });
+
+  it("isolates identical concurrency groups between repositories", async () => {
+    const workspaceId = crypto.randomUUID();
+    const workspace = env.WORKSPACES.getByName(workspaceId);
+    const first = await connectAgent(workspace, workspaceId, "mini-a", 1);
+    const second = await connectAgent(workspace, workspaceId, "mini-b", 1);
+    const firstJob = fixtureJob(workspaceId);
+    const secondJob = fixtureJob(workspaceId);
+    secondJob.repository.name = "another-repository";
+    const firstAssignment = collectMessageOfType(first, "run_job");
+    const secondAssignment = collectMessageOfType(second, "run_job");
+    await workspace.enqueue(firstJob, "repository-concurrency-first");
+    await workspace.enqueue(secondJob, "repository-concurrency-second");
+    const assignmentMessages = await Promise.all([
+      firstAssignment,
+      secondAssignment,
+    ]);
+    const agentByJob = new Map([
+      [(assignmentMessages[0]?.job as { id: string }).id, first],
+      [(assignmentMessages[1]?.job as { id: string }).id, second],
+    ]);
+    const firstOwner = agentByJob.get(firstJob.id) as WebSocket;
+    const secondOwner = agentByJob.get(secondJob.id) as WebSocket;
+
+    const firstRequest = crypto.randomUUID();
+    const secondRequest = crypto.randomUUID();
+    const firstGranted = collectMessageOfType(
+      firstOwner,
+      "concurrency_granted",
+    );
+    const secondGranted = collectMessageOfType(
+      secondOwner,
+      "concurrency_granted",
+    );
+    sendConcurrencyAcquire(
+      firstOwner,
+      firstJob.id,
+      firstRequest,
+      "deploy",
+      false,
+    );
+    sendConcurrencyAcquire(
+      secondOwner,
+      secondJob.id,
+      secondRequest,
+      "DEPLOY",
+      false,
+    );
+    await expect(firstGranted).resolves.toMatchObject({
+      request_id: firstRequest,
+    });
+    await expect(secondGranted).resolves.toMatchObject({
+      request_id: secondRequest,
+    });
+
+    sendConcurrencyRelease(firstOwner, firstJob.id, firstRequest);
+    sendConcurrencyRelease(secondOwner, secondJob.id, secondRequest);
+    first.close(1000, "test complete");
+    second.close(1000, "test complete");
+  });
+
   it("times out queued work that never receives a compatible agent", async () => {
     const workspaceId = crypto.randomUUID();
     const workspace = env.WORKSPACES.getByName(workspaceId);
@@ -938,7 +1171,7 @@ async function connectAgentWithTargeting(
     JSON.stringify({
       type: "hello",
       hello: {
-        protocol_version: 3,
+        protocol_version: 4,
         agent_id: agentId,
         name: agentId,
         version: "0.1.0",
@@ -994,6 +1227,43 @@ function collectMessageOfType(
       reject(new Error("WebSocket failed")),
     );
   });
+}
+
+function sendConcurrencyAcquire(
+  socket: WebSocket,
+  jobId: string,
+  requestId: string,
+  group: string,
+  cancelInProgress: boolean,
+  queue: "single" | "max" = "single",
+): void {
+  socket.send(
+    JSON.stringify({
+      type: "concurrency_acquire",
+      message_id: crypto.randomUUID(),
+      job_id: jobId,
+      request_id: requestId,
+      unit_id: `unit-${requestId}`,
+      group,
+      cancel_in_progress: cancelInProgress,
+      queue,
+    }),
+  );
+}
+
+function sendConcurrencyRelease(
+  socket: WebSocket,
+  jobId: string,
+  requestId: string,
+): void {
+  socket.send(
+    JSON.stringify({
+      type: "concurrency_release",
+      message_id: crypto.randomUUID(),
+      job_id: jobId,
+      request_id: requestId,
+    }),
+  );
 }
 
 function fixtureJob(workspaceId: string): QueuedJob {

@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+gitzero-expression = { path = "../gitzero-expression" }
 indexmap.workspace = true
 regex.workspace = true
 serde.workspace = true

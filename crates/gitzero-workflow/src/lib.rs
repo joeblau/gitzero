@@ -1,3 +1,4 @@
+use gitzero_expression::analyze_template;
 use indexmap::IndexMap;
 use regex::Regex;
 use serde::Deserialize;
@@ -37,6 +38,8 @@ pub struct Workflow {
     pub permissions: Option<Value>,
     #[serde(rename = "run-name", default)]
     pub run_name: Option<Scalar>,
+    #[serde(default)]
+    pub concurrency: Option<Concurrency>,
     pub jobs: IndexMap<String, Job>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -63,6 +66,8 @@ pub struct Job {
     pub continue_on_error: Option<Scalar>,
     #[serde(rename = "timeout-minutes", default)]
     pub timeout_minutes: Option<Scalar>,
+    #[serde(default)]
+    pub concurrency: Option<Concurrency>,
     #[serde(default)]
     pub environment: Option<JobEnvironment>,
     #[serde(default)]
@@ -97,6 +102,24 @@ pub struct JobEnvironmentConfiguration {
     pub name: Scalar,
     #[serde(default)]
     pub url: Option<Scalar>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum Concurrency {
+    Group(Scalar),
+    Configuration(ConcurrencyConfiguration),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ConcurrencyConfiguration {
+    pub group: Scalar,
+    #[serde(rename = "cancel-in-progress", default)]
+    pub cancel_in_progress: Option<Scalar>,
+    #[serde(default)]
+    pub queue: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -202,6 +225,7 @@ impl<'de> Deserialize<'de> for Scalar {
 pub struct ExecutionPlan {
     pub workflow_name: String,
     pub workflow_path: String,
+    pub concurrency: Option<PlannedConcurrency>,
     pub jobs: Vec<PlannedJob>,
 }
 
@@ -225,6 +249,10 @@ pub struct PlannedJob {
     pub strategy_job_total: Option<usize>,
     pub continue_on_error: Option<String>,
     pub timeout_minutes: Option<String>,
+    pub concurrency: Option<PlannedConcurrency>,
+    pub concurrency_scope_ids: Vec<String>,
+    pub concurrency_acquire: Vec<PlannedConcurrencyScope>,
+    pub concurrency_release: Vec<String>,
     pub deployment_environment: Option<PlannedEnvironment>,
     pub environment: BTreeMap<String, String>,
     pub outputs: BTreeMap<String, String>,
@@ -235,6 +263,27 @@ pub struct PlannedJob {
 pub struct PlannedEnvironment {
     pub name: String,
     pub url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlannedConcurrencyQueue {
+    #[default]
+    Single,
+    Max,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedConcurrency {
+    pub group: String,
+    pub cancel_in_progress: String,
+    pub queue: PlannedConcurrencyQueue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedConcurrencyScope {
+    pub id: String,
+    pub configuration: PlannedConcurrency,
+    pub reusable_input_scopes: Vec<PlannedReusableInputScope>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -352,6 +401,12 @@ pub fn compile(workflow: &Workflow, path: &Path) -> Result<ExecutionPlan, Workfl
         ));
     }
     validate_defaults(&workflow_name, "workflow", &workflow.defaults)?;
+    let workflow_concurrency = planned_concurrency(
+        &workflow_name,
+        "workflow",
+        workflow.concurrency.as_ref(),
+        &["github", "inputs", "vars"],
+    )?;
     let workflow_env = scalar_map(&workflow.env);
     let mut jobs = Vec::new();
 
@@ -428,6 +483,15 @@ pub fn compile(workflow: &Workflow, path: &Path) -> Result<ExecutionPlan, Workfl
                     .timeout_minutes
                     .as_ref()
                     .map(|value| value.as_str().to_owned()),
+                concurrency: planned_concurrency(
+                    &workflow_name,
+                    &format!("job '{job_id}'"),
+                    job.concurrency.as_ref(),
+                    &["github", "inputs", "vars", "needs", "strategy", "matrix"],
+                )?,
+                concurrency_scope_ids: Vec::new(),
+                concurrency_acquire: Vec::new(),
+                concurrency_release: Vec::new(),
                 deployment_environment: planned_environment(
                     &workflow_name,
                     job_id,
@@ -445,6 +509,7 @@ pub fn compile(workflow: &Workflow, path: &Path) -> Result<ExecutionPlan, Workfl
     Ok(ExecutionPlan {
         workflow_name,
         workflow_path,
+        concurrency: workflow_concurrency,
         jobs,
     })
 }
@@ -1186,11 +1251,39 @@ fn expand_reusable_call(
     outputs: BTreeMap<String, String>,
 ) -> Vec<PlannedJob> {
     let gate_id = format!("{job_id}::gate");
+    let mut called_reusable_input_scopes = placeholder.reusable_input_scopes.clone();
+    called_reusable_input_scopes.push(PlannedReusableInputScope {
+        inputs: inputs.clone(),
+        matrix: placeholder.matrix.clone(),
+    });
+    let mut invocation_scopes = Vec::new();
+    if let Some(configuration) = &placeholder.concurrency {
+        invocation_scopes.push(PlannedConcurrencyScope {
+            id: format!("{job_id}::caller-concurrency"),
+            configuration: configuration.clone(),
+            reusable_input_scopes: placeholder.reusable_input_scopes.clone(),
+        });
+    }
+    if let Some(configuration) = &called_plan.concurrency {
+        invocation_scopes.push(PlannedConcurrencyScope {
+            id: format!("{job_id}::workflow-concurrency"),
+            configuration: configuration.clone(),
+            reusable_input_scopes: called_reusable_input_scopes.clone(),
+        });
+    }
+    let invocation_scope_ids = invocation_scopes
+        .iter()
+        .map(|scope| scope.id.clone())
+        .collect::<Vec<_>>();
     let mut gate = placeholder.clone();
     gate.id = gate_id.clone();
     gate.base_id = gate_id.clone();
     gate.name = format!("{} / reusable workflow gate", placeholder.name);
     gate.outputs.clear();
+    gate.concurrency = None;
+    gate.concurrency_scope_ids = invocation_scope_ids.clone();
+    gate.concurrency_acquire = invocation_scopes;
+    gate.concurrency_release.clear();
     gate.virtual_job = Some(PlannedVirtualJob::ReusableGate);
 
     let base_ids = called_plan
@@ -1224,17 +1317,27 @@ fn expand_reusable_call(
             .into_iter()
             .map(|(alias, dependency)| (alias, aliases[&dependency].clone()))
             .collect();
+        for scope_id in &mut job.concurrency_scope_ids {
+            *scope_id = format!("{job_id}::{scope_id}");
+        }
+        for scope in &mut job.concurrency_acquire {
+            scope.id = format!("{job_id}::{}", scope.id);
+            let mut reusable_input_scopes = called_reusable_input_scopes.clone();
+            reusable_input_scopes.extend(scope.reusable_input_scopes.clone());
+            scope.reusable_input_scopes = reusable_input_scopes;
+        }
+        for scope_id in &mut job.concurrency_release {
+            *scope_id = format!("{job_id}::{scope_id}");
+        }
+        job.concurrency_scope_ids
+            .splice(0..0, invocation_scope_ids.iter().cloned());
         for dependency in &placeholder.needs {
             job.need_aliases
                 .entry(dependency.clone())
                 .or_insert_with(|| dependency.clone());
         }
         job.needs.push(gate_id.clone());
-        let mut scopes = placeholder.reusable_input_scopes.clone();
-        scopes.push(PlannedReusableInputScope {
-            inputs: inputs.clone(),
-            matrix: placeholder.matrix.clone(),
-        });
+        let mut scopes = called_reusable_input_scopes.clone();
         scopes.extend(job.reusable_input_scopes);
         job.reusable_input_scopes = scopes;
         let mut secret_scopes = placeholder.reusable_secret_scopes.clone();
@@ -1265,6 +1368,10 @@ fn expand_reusable_call(
     result.needs = public_aliases.values().cloned().collect();
     result.need_aliases = public_aliases.clone();
     result.outputs.clear();
+    result.concurrency = None;
+    result.concurrency_scope_ids = invocation_scope_ids.clone();
+    result.concurrency_acquire.clear();
+    result.concurrency_release = invocation_scope_ids.into_iter().rev().collect();
     result.virtual_job = Some(PlannedVirtualJob::ReusableResult {
         jobs: public_aliases,
         outputs,
@@ -1298,6 +1405,10 @@ fn reusable_matrix_result(
     result.strategy_job_total = None;
     result.outputs.clear();
     result.steps.clear();
+    result.concurrency = None;
+    result.concurrency_scope_ids.clear();
+    result.concurrency_acquire.clear();
+    result.concurrency_release.clear();
     result.virtual_job = Some(PlannedVirtualJob::ReusableMatrixResult {
         max_parallel: placeholder
             .matrix_max_parallel
@@ -1494,6 +1605,99 @@ fn validate_job(workflow: &str, job_id: &str, job: &Job) -> Result<(), WorkflowE
         ));
     }
     Ok(())
+}
+
+fn planned_concurrency(
+    workflow: &str,
+    location: &str,
+    concurrency: Option<&Concurrency>,
+    allowed_contexts: &[&str],
+) -> Result<Option<PlannedConcurrency>, WorkflowError> {
+    let Some(concurrency) = concurrency else {
+        return Ok(None);
+    };
+    let (group, cancel_in_progress, queue) = match concurrency {
+        Concurrency::Group(group) => (group.as_str(), "false", PlannedConcurrencyQueue::Single),
+        Concurrency::Configuration(configuration) => {
+            if let Some(feature) = configuration.extra.keys().next() {
+                return Err(unsupported_workflow(
+                    workflow,
+                    format!("{location} concurrency key '{feature}' is not supported"),
+                ));
+            }
+            let queue = match configuration.queue.as_deref().unwrap_or("single") {
+                "single" => PlannedConcurrencyQueue::Single,
+                "max" => PlannedConcurrencyQueue::Max,
+                value => {
+                    return Err(unsupported_workflow(
+                        workflow,
+                        format!(
+                            "{location} concurrency queue must be 'single' or 'max', not '{value}'"
+                        ),
+                    ));
+                }
+            };
+            (
+                configuration.group.as_str(),
+                configuration
+                    .cancel_in_progress
+                    .as_ref()
+                    .map_or("false", Scalar::as_str),
+                queue,
+            )
+        }
+    };
+    if group.trim().is_empty()
+        || group.contains(['\0', '\n', '\r'])
+        || (!group.contains("${{") && group.len() > 256)
+        || group.len() > 4_096
+    {
+        return Err(unsupported_workflow(
+            workflow,
+            format!("{location} concurrency group is empty or exceeds its safe bounds"),
+        ));
+    }
+    for (field, value) in [("group", group), ("cancel-in-progress", cancel_in_progress)] {
+        let analysis = analyze_template(value).map_err(|error| {
+            unsupported_workflow(
+                workflow,
+                format!("{location} concurrency {field} is invalid: {error}"),
+            )
+        })?;
+        let unsupported = analysis
+            .context_roots
+            .iter()
+            .filter(|context| !allowed_contexts.contains(&context.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() || analysis.uses_hash_files || analysis.uses_status_function {
+            return Err(unsupported_workflow(
+                workflow,
+                format!(
+                    "{location} concurrency {field} uses a context or function unavailable to GitHub concurrency"
+                ),
+            ));
+        }
+    }
+    if !cancel_in_progress.contains("${{") && !matches!(cancel_in_progress, "true" | "false") {
+        return Err(unsupported_workflow(
+            workflow,
+            format!("{location} concurrency cancel-in-progress must be a boolean or expression"),
+        ));
+    }
+    if queue == PlannedConcurrencyQueue::Max && cancel_in_progress == "true" {
+        return Err(unsupported_workflow(
+            workflow,
+            format!(
+                "{location} concurrency cannot combine queue: max with cancel-in-progress: true"
+            ),
+        ));
+    }
+    Ok(Some(PlannedConcurrency {
+        group: group.to_owned(),
+        cancel_in_progress: cancel_in_progress.to_owned(),
+        queue,
+    }))
 }
 
 fn planned_environment(
@@ -2360,6 +2564,97 @@ jobs:
     }
 
     #[test]
+    fn preserves_workflow_and_job_concurrency_contracts() {
+        let workflow = parse(
+            r#"
+name: Concurrent
+on: pull_request
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !contains(github.ref, 'release/') }}
+jobs:
+  deploy:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        region: [west, east]
+    concurrency:
+      group: deploy-${{ matrix.region }}-${{ vars.channel }}
+      queue: max
+    steps:
+      - run: echo deploy
+"#,
+        )
+        .expect("parse concurrency");
+        let plan = compile(&workflow, Path::new(".github/workflows/concurrency.yml"))
+            .expect("compile concurrency");
+        assert_eq!(
+            plan.concurrency,
+            Some(PlannedConcurrency {
+                group: "${{ github.workflow }}-${{ github.ref }}".to_owned(),
+                cancel_in_progress: "${{ !contains(github.ref, 'release/') }}".to_owned(),
+                queue: PlannedConcurrencyQueue::Single,
+            })
+        );
+        assert_eq!(plan.jobs.len(), 2);
+        assert!(plan.jobs.iter().all(|job| {
+            job.concurrency
+                == Some(PlannedConcurrency {
+                    group: "deploy-${{ matrix.region }}-${{ vars.channel }}".to_owned(),
+                    cancel_in_progress: "false".to_owned(),
+                    queue: PlannedConcurrencyQueue::Max,
+                })
+        }));
+    }
+
+    #[test]
+    fn rejects_invalid_concurrency_contexts_and_queue_combinations() {
+        let unsupported_context = parse(
+            r#"
+on: pull_request
+concurrency: ${{ matrix.os }}
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - run: true
+"#,
+        )
+        .expect("parse unsupported context");
+        assert!(
+            compile(
+                &unsupported_context,
+                Path::new(".github/workflows/invalid.yml")
+            )
+            .expect_err("workflow-level matrix context must fail")
+            .to_string()
+            .contains("unavailable")
+        );
+
+        let invalid_queue = parse(
+            r#"
+on: pull_request
+jobs:
+  test:
+    runs-on: macos-latest
+    concurrency:
+      group: deploy
+      queue: max
+      cancel-in-progress: true
+    steps:
+      - run: true
+"#,
+        )
+        .expect("parse invalid queue");
+        assert!(
+            compile(&invalid_queue, Path::new(".github/workflows/invalid.yml"))
+                .expect_err("queue max cancellation must fail")
+                .to_string()
+                .contains("cannot combine")
+        );
+    }
+
+    #[test]
     fn preserves_string_and_object_deployment_environments() {
         let workflow = parse(
             r#"
@@ -2797,6 +3092,7 @@ jobs:
   reusable:
     needs: prepare
     uses: ./.github/workflows/reusable.yml
+    concurrency: caller-${{ needs.prepare.outputs.target }}
     with:
       target: ${{ needs.prepare.outputs.target }}
       release: true
@@ -2829,6 +3125,7 @@ on:
       artifact:
         description: Built artifact
         value: ${{ jobs.build.outputs.artifact }}
+concurrency: reusable-${{ inputs.target }}
 jobs:
   build:
     runs-on: macos-latest
@@ -2870,6 +3167,39 @@ jobs:
                 "reusable::verify",
                 "reusable",
                 "finish",
+            ]
+        );
+        let gate = plan
+            .jobs
+            .iter()
+            .find(|job| job.base_id == "reusable::gate")
+            .expect("reusable gate");
+        assert_eq!(gate.concurrency_acquire.len(), 2);
+        assert_eq!(
+            gate.concurrency_acquire[0].configuration.group,
+            "caller-${{ needs.prepare.outputs.target }}"
+        );
+        assert_eq!(
+            gate.concurrency_acquire[1].configuration.group,
+            "reusable-${{ inputs.target }}"
+        );
+        assert_eq!(gate.concurrency_acquire[1].reusable_input_scopes.len(), 1);
+        let build = plan
+            .jobs
+            .iter()
+            .find(|job| job.base_id == "reusable::build")
+            .expect("reusable build");
+        assert_eq!(build.concurrency_scope_ids.len(), 2);
+        let result = plan
+            .jobs
+            .iter()
+            .find(|job| job.base_id == "reusable")
+            .expect("reusable result");
+        assert_eq!(
+            result.concurrency_release,
+            [
+                "reusable::workflow-concurrency",
+                "reusable::caller-concurrency"
             ]
         );
         assert!(matches!(
@@ -3082,6 +3412,7 @@ jobs:
   inner:
     needs: prepare
     uses: ./.github/workflows/inner.yml
+    concurrency: outer-${{ inputs.enabled }}
     with:
       label: ${{ needs.prepare.outputs.label }}
       enabled: ${{ inputs.enabled }}
@@ -3108,6 +3439,7 @@ on:
     outputs:
       result:
         value: ${{ jobs.build.outputs.result }}
+concurrency: inner-${{ inputs.label }}
 jobs:
   build:
     runs-on: macos-latest
@@ -3130,6 +3462,24 @@ jobs:
             &workflows,
         )
         .expect("link nested reusable workflows");
+        let inner_gate = plan
+            .jobs
+            .iter()
+            .find(|job| job.base_id == "outer::inner::gate")
+            .expect("nested reusable gate");
+        assert_eq!(inner_gate.concurrency_acquire.len(), 2);
+        assert_eq!(
+            inner_gate.concurrency_acquire[0]
+                .reusable_input_scopes
+                .len(),
+            1
+        );
+        assert_eq!(
+            inner_gate.concurrency_acquire[1]
+                .reusable_input_scopes
+                .len(),
+            2
+        );
         assert_eq!(
             plan.jobs
                 .iter()

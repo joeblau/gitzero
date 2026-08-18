@@ -3,6 +3,7 @@ use crate::action::{
 };
 use crate::artifact::{ArtifactLimits, ArtifactService};
 use crate::cache::{CacheLimits, CacheService};
+use crate::concurrency::{ConcurrencyAcquisition, ConcurrencyClient};
 use anyhow::{Context, Result, bail};
 use base64::{
     Engine,
@@ -13,13 +14,14 @@ use gitzero_expression::{
     EvaluationContext, ExecutionStatus, ExpressionAnalysis, analyze_expression, analyze_template,
 };
 use gitzero_protocol::{
-    AgentMessage, Conclusion, LogStream, MAX_RUNNER_LABELS, MAX_RUNNER_REQUIREMENTS,
-    MAX_RUNNER_SELECTOR_BYTES, RunSpec, RunnerRequirement,
+    AgentMessage, Conclusion, ConcurrencyQueue, LogStream, MAX_RUNNER_LABELS,
+    MAX_RUNNER_REQUIREMENTS, MAX_RUNNER_SELECTOR_BYTES, RunSpec, RunnerRequirement,
 };
 use gitzero_workflow::{
-    ExecutionPlan, MAX_UNIQUE_REUSABLE_WORKFLOWS, PlannedJob, PlannedStep, PlannedVirtualJob,
-    ReusableInputType, StepKind, Workflow, compile_with_reusables, expand_dynamic_reusable_call,
-    expand_matrix_definition, matches_pull_request, parse, requires_pull_request_changed_paths,
+    ExecutionPlan, MAX_UNIQUE_REUSABLE_WORKFLOWS, PlannedConcurrency, PlannedConcurrencyQueue,
+    PlannedJob, PlannedStep, PlannedVirtualJob, ReusableInputType, StepKind, Workflow,
+    compile_with_reusables, expand_dynamic_reusable_call, expand_matrix_definition,
+    matches_pull_request, parse, requires_pull_request_changed_paths,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -136,11 +138,23 @@ impl Executor {
         self
     }
 
+    #[cfg(test)]
     pub async fn execute(
+        &self,
+        run: RunSpec,
+        cancel: watch::Receiver<bool>,
+        outbound: mpsc::Sender<AgentMessage>,
+    ) -> Result<()> {
+        self.execute_with_concurrency(run, cancel, outbound, ConcurrencyClient::local())
+            .await
+    }
+
+    pub(crate) async fn execute_with_concurrency(
         &self,
         mut run: RunSpec,
         cancel: watch::Receiver<bool>,
         outbound: mpsc::Sender<AgentMessage>,
+        concurrency: ConcurrencyClient,
     ) -> Result<()> {
         validate_sha(&run.pull_request.head_sha)?;
         validate_sha(&run.pull_request.base_sha)?;
@@ -250,6 +264,7 @@ impl Executor {
             let mut completed_steps = 0usize;
             let mut failed_jobs = Vec::new();
             let mut timed_out_jobs = Vec::new();
+            let mut cancelled_jobs = Vec::new();
             let mut workflow_errors = Vec::new();
             let mut running_plans = FuturesUnordered::new();
             for (plan_index, plan) in plans.iter().enumerate() {
@@ -270,6 +285,7 @@ impl Executor {
                     &job_summaries,
                     &environment_variable_cache,
                     &workflow_commands,
+                    &concurrency,
                 );
                 running_plans.push(async move { (workflow_name, execution.await) });
             }
@@ -279,6 +295,7 @@ impl Executor {
                         completed_steps += result.completed_steps;
                         failed_jobs.extend(result.failed_jobs);
                         timed_out_jobs.extend(result.timed_out_jobs);
+                        cancelled_jobs.extend(result.cancelled_jobs);
                     }
                     Err(error) => {
                         workflow_errors.push(format!("{workflow_name}: {error:#}"));
@@ -299,6 +316,10 @@ impl Executor {
             if !timed_out_jobs.is_empty() {
                 timed_out_jobs.sort();
                 return Err(RunTimedOut(timed_out_jobs.join(", ")).into());
+            }
+            if !cancelled_jobs.is_empty() {
+                cancelled_jobs.sort();
+                return Err(RunConcurrencyCancelled(cancelled_jobs.join(", ")).into());
             }
             Ok(ExecutionDisposition::Completed(format!(
                 "GitZero completed {completed_steps} step(s) successfully."
@@ -346,10 +367,15 @@ impl Executor {
         let (conclusion, summary) = match execution {
             Ok(summary) => (Conclusion::Success, summary),
             Err(_error) if *cancel.borrow() => (Conclusion::Cancelled, "Run cancelled.".to_owned()),
-            Err(error) => match error.downcast_ref::<RunTimedOut>() {
-                Some(timeout) => (Conclusion::TimedOut, timeout.to_string()),
-                None => (Conclusion::Failure, format!("{error:#}")),
-            },
+            Err(error) => {
+                if let Some(timeout) = error.downcast_ref::<RunTimedOut>() {
+                    (Conclusion::TimedOut, timeout.to_string())
+                } else if let Some(cancelled) = error.downcast_ref::<RunConcurrencyCancelled>() {
+                    (Conclusion::Cancelled, cancelled.to_string())
+                } else {
+                    (Conclusion::Failure, format!("{error:#}"))
+                }
+            }
         };
         let summaries = std::mem::take(&mut *job_summaries.lock().await);
         let summary = compose_check_summary(summary, summaries);
@@ -1233,6 +1259,16 @@ struct PlanExecution {
     completed_steps: usize,
     failed_jobs: Vec<String>,
     timed_out_jobs: Vec<String>,
+    cancelled_jobs: Vec<String>,
+}
+
+fn cancelled_plan_execution(plan: &ExecutionPlan) -> PlanExecution {
+    PlanExecution {
+        completed_steps: 0,
+        failed_jobs: Vec::new(),
+        timed_out_jobs: Vec::new(),
+        cancelled_jobs: vec![plan.workflow_name.clone()],
+    }
 }
 
 struct JobSummary {
@@ -1287,6 +1323,10 @@ impl JobSummaryBuilder {
 #[error("workflow jobs timed out: {0}")]
 struct RunTimedOut(String);
 
+#[derive(Debug, thiserror::Error)]
+#[error("workflow jobs cancelled by concurrency: {0}")]
+struct RunConcurrencyCancelled(String);
+
 struct JobExecution {
     conclusion: JobConclusion,
     completed_steps: usize,
@@ -1326,6 +1366,13 @@ struct BaseExecution {
     outputs: BTreeMap<String, String>,
     expanded_jobs: Vec<PlannedJob>,
 }
+
+struct ActiveConcurrencyScope {
+    lease: crate::concurrency::ConcurrencyLease,
+    cancel: watch::Receiver<bool>,
+}
+
+type ActiveConcurrencyScopes = Arc<Mutex<BTreeMap<String, ActiveConcurrencyScope>>>;
 
 struct ReusableMatrixRuntime {
     invocations: Vec<String>,
@@ -1390,6 +1437,127 @@ async fn execute_plan(
     job_summaries: &Arc<Mutex<Vec<JobSummary>>>,
     environment_variable_cache: &EnvironmentVariableCache,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
+    concurrency: &ConcurrencyClient,
+) -> Result<PlanExecution> {
+    let Some(configuration) = &plan.concurrency else {
+        return execute_plan_inner(
+            job_id,
+            plan,
+            plan_index,
+            run,
+            repository_dir,
+            run_dir,
+            environment,
+            cancel,
+            outbound,
+            sequence,
+            execution_slots,
+            runner_targeting,
+            job_summaries,
+            environment_variable_cache,
+            workflow_commands,
+            concurrency,
+        )
+        .await;
+    };
+    let template = plan
+        .jobs
+        .first()
+        .context("workflow concurrency requires at least one planned job")?;
+    let mut plan_environment = environment.clone();
+    plan_environment.extend(github_workflow_environment(run, plan));
+    let empty_bases = BTreeMap::new();
+    let empty_outputs = BTreeMap::new();
+    let empty_steps = JsonValue::Object(Default::default());
+    let mut context = expression_context(
+        run,
+        template,
+        &empty_bases,
+        &empty_outputs,
+        &plan_environment,
+        &empty_steps,
+        &empty_steps,
+        ExecutionStatus::Success,
+        repository_dir,
+        run_dir,
+        None,
+    )?;
+    context.insert_json("inputs", JsonValue::Object(Default::default()))?;
+    let (group, cancel_in_progress, queue) =
+        resolve_concurrency(configuration, &context, &plan.workflow_name)?;
+    let lease = match concurrency
+        .acquire(
+            run.id,
+            format!("workflow:{}", plan.workflow_path),
+            group,
+            cancel_in_progress,
+            queue,
+            cancel,
+        )
+        .await?
+    {
+        ConcurrencyAcquisition::Acquired(lease) => lease,
+        ConcurrencyAcquisition::Cancelled(reason) => {
+            info!(workflow = %plan.workflow_name, %reason, "workflow cancelled while waiting for concurrency");
+            return Ok(cancelled_plan_execution(plan));
+        }
+    };
+    let lease_cancel = lease.cancellation();
+    let (effective_cancel, relays) = combine_cancellations(cancel, vec![lease_cancel.clone()]);
+    let execution = execute_plan_inner(
+        job_id,
+        plan,
+        plan_index,
+        run,
+        repository_dir,
+        run_dir,
+        environment,
+        &effective_cancel,
+        outbound,
+        sequence,
+        execution_slots,
+        runner_targeting,
+        job_summaries,
+        environment_variable_cache,
+        workflow_commands,
+        concurrency,
+    )
+    .await;
+    for relay in relays {
+        relay.abort();
+    }
+    let concurrency_cancelled = *lease_cancel.borrow() && !*cancel.borrow();
+    let release = lease.release().await;
+    if concurrency_cancelled {
+        return Ok(cancelled_plan_execution(plan));
+    }
+    match execution {
+        Ok(execution) => {
+            release?;
+            Ok(execution)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_plan_inner(
+    job_id: Uuid,
+    plan: &ExecutionPlan,
+    plan_index: usize,
+    run: &RunSpec,
+    repository_dir: &Path,
+    run_dir: &Path,
+    environment: &BTreeMap<String, String>,
+    cancel: &watch::Receiver<bool>,
+    outbound: &mpsc::Sender<AgentMessage>,
+    sequence: &Arc<AtomicU64>,
+    execution_slots: &Arc<Semaphore>,
+    runner_targeting: &RunnerTargeting,
+    job_summaries: &Arc<Mutex<Vec<JobSummary>>>,
+    environment_variable_cache: &EnvironmentVariableCache,
+    workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
+    concurrency: &ConcurrencyClient,
 ) -> Result<PlanExecution> {
     let mut plan_environment = environment.clone();
     plan_environment.extend(github_workflow_environment(run, plan));
@@ -1408,6 +1576,7 @@ async fn execute_plan(
     let mut completion_order = Vec::<String>::new();
     let mut pending_bases = base_order.iter().cloned().collect::<BTreeSet<_>>();
     let mut reusable_matrices = reusable_matrix_runtimes(&jobs);
+    let active_concurrency_scopes: ActiveConcurrencyScopes = Arc::new(Mutex::new(BTreeMap::new()));
     let mut running_bases = FuturesUnordered::new();
     let mut completed_steps = 0;
     let mut cancellation_error = None;
@@ -1436,15 +1605,20 @@ async fn execute_plan(
             }
             pending_bases.remove(&base_id);
             start_reusable_matrix_invocation(&mut reusable_matrices, &base_id);
-            let matrix_cancellations = reusable_matrix_cancellations(&reusable_matrices, &base_id);
             let base_jobs = jobs
                 .iter()
                 .filter(|job| job.base_id == base_id)
                 .cloned()
                 .collect::<Vec<_>>();
+            let mut matrix_cancellations =
+                reusable_matrix_cancellations(&reusable_matrices, &base_id);
+            matrix_cancellations.extend(
+                concurrency_scope_cancellations(&active_concurrency_scopes, &base_jobs).await?,
+            );
             let completed_bases = completed_bases.clone();
             let completed_outputs = completed_outputs.clone();
             let completion_order = completion_order.clone();
+            let active_concurrency_scopes = active_concurrency_scopes.clone();
             running_bases.push(async move {
                 let (effective_cancel, relays) =
                     combine_cancellations(cancel, matrix_cancellations);
@@ -1469,6 +1643,8 @@ async fn execute_plan(
                     job_summaries,
                     environment_variable_cache,
                     workflow_commands,
+                    concurrency,
+                    &active_concurrency_scopes,
                 )
                 .await;
                 for relay in relays {
@@ -1583,10 +1759,26 @@ async fn execute_plan(
         .filter(|(job, conclusion)| **conclusion == JobConclusion::TimedOut && !job.contains("::"))
         .map(|(job, _)| format!("{} / {job}", plan.workflow_name))
         .collect();
+    let cancelled_jobs = completed_bases
+        .iter()
+        .filter(|(job, conclusion)| **conclusion == JobConclusion::Cancelled && !job.contains("::"))
+        .map(|(job, _)| format!("{} / {job}", plan.workflow_name))
+        .collect();
+    let remaining_scopes = {
+        let mut active = active_concurrency_scopes.lock().await;
+        std::mem::take(&mut *active)
+    };
+    if !remaining_scopes.is_empty() {
+        for scope in remaining_scopes.into_values() {
+            scope.lease.release().await?;
+        }
+        bail!("reusable workflow concurrency scopes did not reach their release gates");
+    }
     Ok(PlanExecution {
         completed_steps,
         failed_jobs,
         timed_out_jobs,
+        cancelled_jobs,
     })
 }
 
@@ -1888,6 +2080,163 @@ fn is_exact_expression(value: &str) -> bool {
     false
 }
 
+async fn concurrency_scope_cancellations(
+    active: &ActiveConcurrencyScopes,
+    jobs: &[PlannedJob],
+) -> Result<Vec<watch::Receiver<bool>>> {
+    let scope_ids = jobs
+        .iter()
+        .flat_map(|job| job.concurrency_scope_ids.iter())
+        .collect::<BTreeSet<_>>();
+    let active = active.lock().await;
+    Ok(scope_ids
+        .into_iter()
+        .filter_map(|scope_id| active.get(scope_id).map(|scope| scope.cancel.clone()))
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn acquire_concurrency_scopes(
+    job: &PlannedJob,
+    base_context: &EvaluationContext,
+    run: &RunSpec,
+    cancel: &watch::Receiver<bool>,
+    concurrency: &ConcurrencyClient,
+    active: &ActiveConcurrencyScopes,
+) -> Result<bool> {
+    let mut acquired = Vec::new();
+    for scope in &job.concurrency_acquire {
+        if active.lock().await.contains_key(&scope.id) {
+            release_concurrency_scopes(&acquired, active).await?;
+            bail!(
+                "concurrency scope '{}' was acquired more than once",
+                scope.id
+            );
+        }
+        let mut scope_job = job.clone();
+        scope_job.reusable_input_scopes = scope.reusable_input_scopes.clone();
+        let inputs = match resolve_reusable_inputs(&scope_job, base_context) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                release_concurrency_scopes(&acquired, active).await?;
+                return Err(error);
+            }
+        };
+        let mut context = base_context.clone();
+        if let Err(error) = context.insert_json("inputs", inputs) {
+            release_concurrency_scopes(&acquired, active).await?;
+            return Err(error.into());
+        }
+        let (group, cancel_in_progress, queue) =
+            match resolve_concurrency(&scope.configuration, &context, &scope.id) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    release_concurrency_scopes(&acquired, active).await?;
+                    return Err(error);
+                }
+            };
+        let existing_cancellations = {
+            let active = active.lock().await;
+            job.concurrency_scope_ids
+                .iter()
+                .filter_map(|scope_id| active.get(scope_id).map(|scope| scope.cancel.clone()))
+                .collect::<Vec<_>>()
+        };
+        let (acquire_cancel, relays) = combine_cancellations(cancel, existing_cancellations);
+        let acquisition = concurrency
+            .acquire(
+                run.id,
+                format!("scope:{}", scope.id),
+                group,
+                cancel_in_progress,
+                queue,
+                &acquire_cancel,
+            )
+            .await;
+        for relay in relays {
+            relay.abort();
+        }
+        let lease = match acquisition {
+            Ok(ConcurrencyAcquisition::Acquired(lease)) => lease,
+            Ok(ConcurrencyAcquisition::Cancelled(reason)) => {
+                info!(scope = %scope.id, %reason, "reusable workflow scope cancelled while waiting for concurrency");
+                release_concurrency_scopes(&acquired, active).await?;
+                return Ok(false);
+            }
+            Err(error) => {
+                release_concurrency_scopes(&acquired, active).await?;
+                return Err(error);
+            }
+        };
+        let cancellation = lease.cancellation();
+        active.lock().await.insert(
+            scope.id.clone(),
+            ActiveConcurrencyScope {
+                lease,
+                cancel: cancellation,
+            },
+        );
+        acquired.push(scope.id.clone());
+    }
+    Ok(true)
+}
+
+async fn release_concurrency_scopes(
+    scope_ids: &[String],
+    active: &ActiveConcurrencyScopes,
+) -> Result<()> {
+    let mut leases = Vec::new();
+    {
+        let mut active = active.lock().await;
+        for scope_id in scope_ids {
+            if let Some(scope) = active.remove(scope_id) {
+                leases.push(scope.lease);
+            }
+        }
+    }
+    let mut first_error = None;
+    for lease in leases {
+        if let Err(error) = lease.release().await {
+            first_error.get_or_insert(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_job_concurrency(
+    job: &PlannedJob,
+    run: &RunSpec,
+    completed_bases: &BTreeMap<String, JobConclusion>,
+    completed_outputs: &BTreeMap<String, BTreeMap<String, String>>,
+    environment: &BTreeMap<String, String>,
+    reusable_inputs: &JsonValue,
+    workspace: &Path,
+    run_dir: &Path,
+) -> Result<Option<(String, bool, ConcurrencyQueue)>> {
+    let Some(configuration) = &job.concurrency else {
+        return Ok(None);
+    };
+    let empty_steps = JsonValue::Object(Default::default());
+    let context = expression_context(
+        run,
+        job,
+        completed_bases,
+        completed_outputs,
+        environment,
+        &empty_steps,
+        reusable_inputs,
+        dependency_status(&job.needs, completed_bases),
+        workspace,
+        run_dir,
+        None,
+    )?;
+    resolve_concurrency(configuration, &context, &job.id).map(Some)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_base_group(
     job_id: Uuid,
@@ -1910,6 +2259,8 @@ async fn execute_base_group(
     job_summaries: &Arc<Mutex<Vec<JobSummary>>>,
     environment_variable_cache: &EnvironmentVariableCache,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
+    concurrency: &ConcurrencyClient,
+    active_concurrency_scopes: &ActiveConcurrencyScopes,
 ) -> Result<BaseExecution> {
     let mut condition_template = instances
         .first()
@@ -1957,6 +2308,25 @@ async fn execute_base_group(
             expanded_jobs: Vec::new(),
         });
     }
+    if !condition_template.concurrency_acquire.is_empty()
+        && !acquire_concurrency_scopes(
+            &condition_template,
+            &condition_context,
+            run,
+            cancel,
+            concurrency,
+            active_concurrency_scopes,
+        )
+        .await?
+    {
+        return Ok(BaseExecution {
+            base_id,
+            conclusion: JobConclusion::Cancelled,
+            completed_steps: 0,
+            outputs: BTreeMap::new(),
+            expanded_jobs: Vec::new(),
+        });
+    }
     if let Some(PlannedVirtualJob::ReusableDynamicCall(call)) = &condition_template.virtual_job {
         if instances.len() != 1 {
             bail!("dynamic reusable-call job '{base_id}' has multiple templates");
@@ -1988,7 +2358,7 @@ async fn execute_base_group(
         });
     }
     if let Some(virtual_job) = &condition_template.virtual_job {
-        return execute_virtual_job(
+        let execution = execute_virtual_job(
             base_id,
             virtual_job,
             &completed_bases,
@@ -1996,6 +2366,16 @@ async fn execute_base_group(
             &completion_order,
             condition_context,
         );
+        let release = release_concurrency_scopes(
+            &condition_template.concurrency_release,
+            active_concurrency_scopes,
+        )
+        .await;
+        return match (execution, release) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(execution), Ok(())) => Ok(execution),
+        };
     }
     if instances
         .first()
@@ -2044,6 +2424,7 @@ async fn execute_base_group(
         let job_summaries = job_summaries.clone();
         let environment_variable_cache = environment_variable_cache.clone();
         let workflow_commands = workflow_commands.clone();
+        let concurrency = concurrency.clone();
         let mut instance_cancel = cancel.clone();
         let outbound = outbound.clone();
         let sequence = sequence.clone();
@@ -2084,15 +2465,86 @@ async fn execute_base_group(
                 .await?;
                 return Ok((instance_index, JobExecution::skipped()));
             }
+            let (base_cancel, base_relays) =
+                combine_cancellations(&instance_cancel, vec![fail_fast.subscribe()]);
+            let mut concurrency_lease = None;
+            let mut concurrency_cancel = None;
+            let (effective_cancel, concurrency_relays) =
+                if let Some((group, cancel_in_progress, queue)) = resolve_job_concurrency(
+                    &workflow_job,
+                    run,
+                    &completed_bases,
+                    &completed_outputs,
+                    environment,
+                    &reusable_inputs,
+                    &workspace,
+                    run_dir,
+                )? {
+                    let acquisition = concurrency
+                        .acquire(
+                            run.id,
+                            format!("job:{event_job_id}"),
+                            group,
+                            cancel_in_progress,
+                            queue,
+                            &base_cancel,
+                        )
+                        .await;
+                    let lease = match acquisition {
+                        Ok(ConcurrencyAcquisition::Acquired(lease)) => lease,
+                        Ok(ConcurrencyAcquisition::Cancelled(reason)) => {
+                            for relay in base_relays {
+                                relay.abort();
+                            }
+                            info!(job = %workflow_job.id, %reason, "job cancelled while waiting for concurrency");
+                            return Ok((instance_index, JobExecution::cancelled()));
+                        }
+                        Err(error) => {
+                            for relay in base_relays {
+                                relay.abort();
+                            }
+                            return Err(error);
+                        }
+                    };
+                    let lease_cancel = lease.cancellation();
+                    let (effective_cancel, relays) =
+                        combine_cancellations(&base_cancel, vec![lease_cancel.clone()]);
+                    concurrency_cancel = Some(lease_cancel);
+                    concurrency_lease = Some(lease);
+                    (effective_cancel, relays)
+                } else {
+                    (base_cancel.clone(), Vec::new())
+                };
+            let mut slot_cancel = effective_cancel.clone();
             let _execution_permit =
-                match acquire_execution_slot(execution_slots, &mut instance_cancel).await {
+                match acquire_execution_slot(execution_slots, &mut slot_cancel).await {
                     Ok(permit) => permit,
-                    Err(_error) if *instance_cancel.borrow() => {
+                    Err(_error) if *slot_cancel.borrow() => {
+                        for relay in base_relays.into_iter().chain(concurrency_relays) {
+                            relay.abort();
+                        }
+                        if let Some(lease) = concurrency_lease {
+                            lease.release().await?;
+                        }
                         return Ok((instance_index, JobExecution::cancelled()));
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        for relay in base_relays.into_iter().chain(concurrency_relays) {
+                            relay.abort();
+                        }
+                        if let Some(lease) = concurrency_lease {
+                            lease.release().await?;
+                        }
+                        return Err(error);
+                    }
                 };
             if *fail_fast.borrow() {
+                for relay in base_relays.into_iter().chain(concurrency_relays) {
+                    relay.abort();
+                }
+                if let Some(lease) = concurrency_lease {
+                    lease.release().await?;
+                }
                 report_skipped(
                     job_id,
                     &event_job_id,
@@ -2104,34 +2556,6 @@ async fn execute_base_group(
                 .await?;
                 return Ok((instance_index, JobExecution::skipped()));
             }
-            let mut global_cancel = instance_cancel.clone();
-            let mut matrix_cancel = fail_fast.subscribe();
-            let (combined_cancel, combined_cancel_rx) =
-                watch::channel(*global_cancel.borrow() || *matrix_cancel.borrow());
-            let cancellation_relay = tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        changed = global_cancel.changed() => {
-                            if changed.is_err() {
-                                return;
-                            }
-                            if *global_cancel.borrow() {
-                                combined_cancel.send_replace(true);
-                                return;
-                            }
-                        }
-                        changed = matrix_cancel.changed() => {
-                            if changed.is_err() {
-                                return;
-                            }
-                            if *matrix_cancel.borrow() {
-                                combined_cancel.send_replace(true);
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
             let job_timed_out = Arc::new(AtomicBool::new(false));
             let execution = execute_job(
                 job_id,
@@ -2145,7 +2569,7 @@ async fn execute_base_group(
                 run_dir,
                 environment,
                 &reusable_inputs,
-                &combined_cancel_rx,
+                &effective_cancel,
                 &outbound,
                 &sequence,
                 runner_targeting,
@@ -2155,10 +2579,21 @@ async fn execute_base_group(
                 &workflow_commands,
             )
             .await;
-            cancellation_relay.abort();
+            for relay in base_relays.into_iter().chain(concurrency_relays) {
+                relay.abort();
+            }
+            let concurrency_cancelled = concurrency_cancel
+                .as_ref()
+                .is_some_and(|receiver| *receiver.borrow())
+                && !*instance_cancel.borrow()
+                && !*fail_fast.borrow();
+            if let Some(lease) = concurrency_lease {
+                lease.release().await?;
+            }
             let execution = match execution {
-                Ok(execution) => execution,
                 Err(_error) if job_timed_out.load(Ordering::Acquire) => JobExecution::timed_out(),
+                _ if concurrency_cancelled => JobExecution::cancelled(),
+                Ok(execution) => execution,
                 Err(_error) if *instance_cancel.borrow() => JobExecution::cancelled(),
                 Err(_error) if *fail_fast.borrow() && !*instance_cancel.borrow() => {
                     JobExecution::cancelled()
@@ -5217,6 +5652,31 @@ fn condition_allows(
         .with_context(|| format!("evaluate condition '{condition}'"))
 }
 
+fn resolve_concurrency(
+    concurrency: &PlannedConcurrency,
+    context: &EvaluationContext,
+    unit: &str,
+) -> Result<(String, bool, ConcurrencyQueue)> {
+    let group = context
+        .render(&concurrency.group)
+        .with_context(|| format!("render concurrency group for '{unit}'"))?;
+    let group = group.trim().to_owned();
+    if group.is_empty() || group.len() > 256 || group.contains(['\0', '\n', '\r']) {
+        bail!("concurrency group for '{unit}' resolved to an invalid value");
+    }
+    let cancel_in_progress = context
+        .evaluate_condition(&concurrency.cancel_in_progress)
+        .with_context(|| format!("evaluate concurrency cancel-in-progress for '{unit}'"))?;
+    let queue = match concurrency.queue {
+        PlannedConcurrencyQueue::Single => ConcurrencyQueue::Single,
+        PlannedConcurrencyQueue::Max => ConcurrencyQueue::Max,
+    };
+    if queue == ConcurrencyQueue::Max && cancel_in_progress {
+        bail!("concurrency for '{unit}' cannot resolve queue: max with cancel-in-progress: true");
+    }
+    Ok((group, cancel_in_progress, queue))
+}
+
 fn contains_status_function(condition: &str) -> bool {
     let compact = condition
         .chars()
@@ -6731,6 +7191,8 @@ async fn relay_masked_events(
             }
             AgentMessage::Hello { .. }
             | AgentMessage::Heartbeat { .. }
+            | AgentMessage::ConcurrencyAcquire { .. }
+            | AgentMessage::ConcurrencyRelease { .. }
             | AgentMessage::JobStarted { .. } => {}
         }
         outbound
@@ -8148,6 +8610,7 @@ jobs:
             BTreeMap::from([("channel".to_owned(), "environment".to_owned())]),
         )])));
         let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let concurrency = ConcurrencyClient::local();
         let execution = execute_plan(
             run.id,
             &plan,
@@ -8164,6 +8627,7 @@ jobs:
             &job_summaries,
             &environment_variable_cache,
             &workflow_commands,
+            &concurrency,
         );
         tokio::pin!(execution);
         let mut events = Vec::new();
@@ -9032,6 +9496,74 @@ jobs:
         assert_eq!(values["simple"], "value");
         assert_eq!(values["literal"], "value<<not-a-delimiter");
         assert_eq!(values["message"], "line one\nline two");
+    }
+
+    #[test]
+    fn resolves_job_concurrency_with_needs_matrix_and_variables() {
+        let workflow = parse(
+            r#"
+name: CI
+on: pull_request
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - run: true
+  deploy:
+    needs: build
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        region: [west, east]
+    concurrency:
+      group: ${{ github.workflow }}-${{ matrix.region }}-${{ needs.build.outputs.target }}-${{ vars.CHANNEL }}
+      cancel-in-progress: ${{ needs.build.result == 'failure' }}
+      queue: max
+    steps:
+      - run: true
+"#,
+        )
+        .expect("parse concurrency workflow");
+        let plan =
+            gitzero_workflow::compile(&workflow, Path::new(".github/workflows/concurrency.yml"))
+                .expect("compile concurrency workflow");
+        let job = plan
+            .jobs
+            .iter()
+            .find(|job| job.matrix.get("region") == Some(&JsonValue::String("west".to_owned())))
+            .expect("west deployment job");
+        let mut run = fixture_run(
+            Uuid::new_v4(),
+            "0123456789012345678901234567890123456789".to_owned(),
+            "abcdefabcdefabcdefabcdefabcdefabcdefabcd".to_owned(),
+            "https://github.com/local/fixture.git".to_owned(),
+        );
+        run.variables
+            .insert("CHANNEL".to_owned(), "stable".to_owned());
+        let completed = BTreeMap::from([("build".to_owned(), JobConclusion::Success)]);
+        let outputs = BTreeMap::from([(
+            "build".to_owned(),
+            BTreeMap::from([("target".to_owned(), "production".to_owned())]),
+        )]);
+        let environment = BTreeMap::from([("GITHUB_WORKFLOW".to_owned(), "CI".to_owned())]);
+        assert_eq!(
+            resolve_job_concurrency(
+                job,
+                &run,
+                &completed,
+                &outputs,
+                &environment,
+                &JsonValue::Object(Default::default()),
+                Path::new("/tmp/workspace"),
+                Path::new("/tmp/run"),
+            )
+            .expect("resolve job concurrency"),
+            Some((
+                "CI-west-production-stable".to_owned(),
+                false,
+                ConcurrencyQueue::Max,
+            ))
+        );
     }
 
     #[test]
@@ -9959,6 +10491,7 @@ jobs:
         let job_summaries = Arc::new(Mutex::new(Vec::new()));
         let environment_variable_cache = Arc::new(Mutex::new(BTreeMap::new()));
         let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let concurrency = ConcurrencyClient::local();
         let execution = execute_plan(
             run.id,
             &plan,
@@ -9975,6 +10508,7 @@ jobs:
             &job_summaries,
             &environment_variable_cache,
             &workflow_commands,
+            &concurrency,
         );
         tokio::pin!(execution);
         let mut events = Vec::new();
@@ -10114,6 +10648,7 @@ jobs:
         let job_summaries = Arc::new(Mutex::new(Vec::new()));
         let environment_variable_cache = Arc::new(Mutex::new(BTreeMap::new()));
         let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let concurrency = ConcurrencyClient::local();
         let execution = execute_plan(
             run.id,
             &plan,
@@ -10130,6 +10665,7 @@ jobs:
             &job_summaries,
             &environment_variable_cache,
             &workflow_commands,
+            &concurrency,
         );
         tokio::pin!(execution);
         let mut events = Vec::new();
@@ -10246,6 +10782,7 @@ jobs:
         let job_summaries = Arc::new(Mutex::new(Vec::new()));
         let environment_variable_cache = Arc::new(Mutex::new(BTreeMap::new()));
         let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let concurrency = ConcurrencyClient::local();
         let execution = execute_plan(
             run.id,
             &plan,
@@ -10262,6 +10799,7 @@ jobs:
             &job_summaries,
             &environment_variable_cache,
             &workflow_commands,
+            &concurrency,
         );
         tokio::pin!(execution);
         let mut events = Vec::new();
