@@ -4,6 +4,7 @@ use crate::action::{
 use crate::artifact::{ArtifactLimits, ArtifactService};
 use crate::cache::{CacheLimits, CacheService};
 use crate::concurrency::{ConcurrencyAcquisition, ConcurrencyClient};
+use crate::repository_access::RepositoryAccessClient;
 use anyhow::{Context, Result, bail};
 use base64::{
     Engine,
@@ -67,8 +68,80 @@ const MAX_SPARSE_CHECKOUT_BYTES: usize = 128 * 1_024;
 // byte to a six-character Unicode escape, so keep the response bounded above
 // that legitimate worst case.
 const MAX_GITHUB_API_RESPONSE_BYTES: usize = 10 * 1_024 * 1_024;
+const MAX_SHARED_REPOSITORIES_PER_RUN: usize = 256;
 
 type EnvironmentVariableCache = Arc<Mutex<BTreeMap<String, BTreeMap<String, String>>>>;
+
+#[derive(Clone)]
+struct RunRepositoryAccess {
+    client: RepositoryAccessClient,
+    tokens: Arc<Mutex<BTreeMap<String, String>>>,
+    workflow_commands: Arc<StdMutex<WorkflowCommandProcessor>>,
+}
+
+impl RunRepositoryAccess {
+    fn new(
+        client: RepositoryAccessClient,
+        workflow_commands: Arc<StdMutex<WorkflowCommandProcessor>>,
+    ) -> Self {
+        Self {
+            client,
+            tokens: Arc::new(Mutex::new(BTreeMap::new())),
+            workflow_commands,
+        }
+    }
+
+    async fn cached_token(&self, owner: &str, repository: &str) -> Option<String> {
+        self.tokens
+            .lock()
+            .await
+            .get(&repository_access_key(owner, repository))
+            .cloned()
+    }
+
+    async fn request_token(
+        &self,
+        run_id: Uuid,
+        owner: &str,
+        repository: &str,
+        refresh: bool,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<String> {
+        let key = repository_access_key(owner, repository);
+        let mut tokens = self.tokens.lock().await;
+        if refresh {
+            if let Some(mut token) = tokens.remove(&key) {
+                token.clear();
+            }
+        } else if let Some(token) = tokens.get(&key) {
+            return Ok(token.clone());
+        }
+        if tokens.len() >= MAX_SHARED_REPOSITORIES_PER_RUN {
+            bail!(
+                "workflow references more than {MAX_SHARED_REPOSITORIES_PER_RUN} private shared repositories"
+            );
+        }
+        let token = self
+            .client
+            .request_token(run_id, owner, repository, cancel)
+            .await?;
+        register_repository_token_masks(&self.workflow_commands, &token);
+        tokens.insert(key, token.clone());
+        Ok(token)
+    }
+
+    async fn clear(&self) {
+        let mut tokens = self.tokens.lock().await;
+        for token in tokens.values_mut() {
+            token.clear();
+        }
+        tokens.clear();
+    }
+}
+
+fn repository_access_key(owner: &str, repository: &str) -> String {
+    format!("{owner}/{repository}").to_ascii_lowercase()
+}
 
 #[derive(Clone, Debug)]
 pub struct ExecutorConfig {
@@ -145,16 +218,23 @@ impl Executor {
         cancel: watch::Receiver<bool>,
         outbound: mpsc::Sender<AgentMessage>,
     ) -> Result<()> {
-        self.execute_with_concurrency(run, cancel, outbound, ConcurrencyClient::local())
-            .await
+        self.execute_with_services(
+            run,
+            cancel,
+            outbound,
+            ConcurrencyClient::local(),
+            RepositoryAccessClient::local(),
+        )
+        .await
     }
 
-    pub(crate) async fn execute_with_concurrency(
+    pub(crate) async fn execute_with_services(
         &self,
         mut run: RunSpec,
         cancel: watch::Receiver<bool>,
         outbound: mpsc::Sender<AgentMessage>,
         concurrency: ConcurrencyClient,
+        repository_access: RepositoryAccessClient,
     ) -> Result<()> {
         validate_sha(&run.pull_request.head_sha)?;
         validate_sha(&run.pull_request.base_sha)?;
@@ -203,6 +283,8 @@ impl Executor {
         let workflow_commands = Arc::new(StdMutex::new(
             WorkflowCommandProcessor::with_global_masks(secrets.clone()),
         ));
+        let repository_access =
+            RunRepositoryAccess::new(repository_access, workflow_commands.clone());
         let (masked_outbound, masked_events) = mpsc::channel(512);
         let relay = tokio::spawn(relay_masked_events(
             masked_events,
@@ -225,6 +307,7 @@ impl Executor {
                 &cancel,
                 &outbound,
                 &sequence,
+                &repository_access,
             )
             .await?;
             let runner_requirements =
@@ -286,6 +369,7 @@ impl Executor {
                     &environment_variable_cache,
                     &workflow_commands,
                     &concurrency,
+                    &repository_access,
                 );
                 running_plans.push(async move { (workflow_name, execution.await) });
             }
@@ -334,6 +418,7 @@ impl Executor {
             (Ok(_), Ok(()), Err(error)) => Err(error.context("shut down workflow cache service")),
             (Ok(summary), Ok(()), Ok(())) => Ok(summary),
         };
+        repository_access.clear().await;
         run.checkout_token.clear();
         run.environment_token.clear();
 
@@ -535,6 +620,7 @@ async fn discover_workflows(
     cancel: &watch::Receiver<bool>,
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
+    repository_access: &RunRepositoryAccess,
 ) -> Result<Vec<ExecutionPlan>> {
     let directory = repository_dir.join(".github/workflows");
     let mut entries = match tokio::fs::read_dir(&directory).await {
@@ -621,6 +707,7 @@ async fn discover_workflows(
         cancel,
         outbound,
         sequence,
+        repository_access,
     )
     .await?;
 
@@ -656,6 +743,7 @@ async fn resolve_reusable_workflow_catalog(
     cancel: &watch::Receiver<bool>,
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
+    repository_access: &RunRepositoryAccess,
 ) -> Result<BTreeMap<String, Workflow>> {
     let mut sources = local_workflows
         .into_iter()
@@ -737,10 +825,17 @@ async fn resolve_reusable_workflow_catalog(
             let Some(remote) = remote else {
                 continue;
             };
-            let workflow =
-                load_remote_reusable_workflow(&remote, run_dir, run, cancel, outbound, sequence)
-                    .await
-                    .with_context(|| format!("load remote reusable workflow '{target}'"))?;
+            let workflow = load_remote_reusable_workflow(
+                &remote,
+                run_dir,
+                run,
+                cancel,
+                outbound,
+                sequence,
+                repository_access,
+            )
+            .await
+            .with_context(|| format!("load remote reusable workflow '{target}'"))?;
             sources.insert(
                 target.clone(),
                 ReusableWorkflowSource {
@@ -791,6 +886,7 @@ async fn load_remote_reusable_workflow(
     cancel: &watch::Receiver<bool>,
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
+    repository_access: &RunRepositoryAccess,
 ) -> Result<Workflow> {
     let same_repository = reference.owner.eq_ignore_ascii_case(&run.repository.owner)
         && reference
@@ -804,16 +900,15 @@ async fn load_remote_reusable_workflow(
             reference.owner, reference.repository
         )
     };
-    let checkout = materialize_remote_repository(
+    let checkout = materialize_remote_repository_with_shared_access(
         run.id,
         "gitzero-reusable-workflows",
         &reference.owner,
         &reference.repository,
         &reference.git_ref,
         &remote,
-        same_repository
-            .then_some(run.checkout_token.as_str())
-            .filter(|token| !token.is_empty()),
+        run,
+        repository_access,
         run_dir,
         cancel,
         outbound,
@@ -1438,6 +1533,7 @@ async fn execute_plan(
     environment_variable_cache: &EnvironmentVariableCache,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
     concurrency: &ConcurrencyClient,
+    repository_access: &RunRepositoryAccess,
 ) -> Result<PlanExecution> {
     let Some(configuration) = &plan.concurrency else {
         return execute_plan_inner(
@@ -1457,6 +1553,7 @@ async fn execute_plan(
             environment_variable_cache,
             workflow_commands,
             concurrency,
+            repository_access,
         )
         .await;
     };
@@ -1521,6 +1618,7 @@ async fn execute_plan(
         environment_variable_cache,
         workflow_commands,
         concurrency,
+        repository_access,
     )
     .await;
     for relay in relays {
@@ -1558,6 +1656,7 @@ async fn execute_plan_inner(
     environment_variable_cache: &EnvironmentVariableCache,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
     concurrency: &ConcurrencyClient,
+    repository_access: &RunRepositoryAccess,
 ) -> Result<PlanExecution> {
     let mut plan_environment = environment.clone();
     plan_environment.extend(github_workflow_environment(run, plan));
@@ -1644,6 +1743,7 @@ async fn execute_plan_inner(
                     environment_variable_cache,
                     workflow_commands,
                     concurrency,
+                    repository_access,
                     &active_concurrency_scopes,
                 )
                 .await;
@@ -2260,6 +2360,7 @@ async fn execute_base_group(
     environment_variable_cache: &EnvironmentVariableCache,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
     concurrency: &ConcurrencyClient,
+    repository_access: &RunRepositoryAccess,
     active_concurrency_scopes: &ActiveConcurrencyScopes,
 ) -> Result<BaseExecution> {
     let mut condition_template = instances
@@ -2425,6 +2526,7 @@ async fn execute_base_group(
         let environment_variable_cache = environment_variable_cache.clone();
         let workflow_commands = workflow_commands.clone();
         let concurrency = concurrency.clone();
+        let repository_access = repository_access.clone();
         let mut instance_cancel = cancel.clone();
         let outbound = outbound.clone();
         let sequence = sequence.clone();
@@ -2577,6 +2679,7 @@ async fn execute_base_group(
                 &job_summaries,
                 &environment_variable_cache,
                 &workflow_commands,
+                &repository_access,
             )
             .await;
             for relay in base_relays.into_iter().chain(concurrency_relays) {
@@ -2835,6 +2938,7 @@ async fn execute_job(
     job_summaries: &Arc<Mutex<Vec<JobSummary>>>,
     environment_variable_cache: &EnvironmentVariableCache,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
+    repository_access: &RunRepositoryAccess,
 ) -> Result<JobExecution> {
     let job_temp_directory = run_dir
         .join("_temp")
@@ -3035,6 +3139,7 @@ async fn execute_job(
                 job_timed_out,
                 &mut job_summary,
                 workflow_commands,
+                repository_access,
             )
             .await?;
             if execution.ran {
@@ -3286,6 +3391,7 @@ async fn execute_step(
     job_timed_out: &AtomicBool,
     job_summary: &mut JobSummaryBuilder,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
+    repository_access: &RunRepositoryAccess,
 ) -> Result<StepExecution> {
     let mut step_context = context.clone();
     step_context.extend_json_object(
@@ -3434,6 +3540,7 @@ async fn execute_step(
                 job_timed_out,
                 job_summary,
                 workflow_commands,
+                repository_access,
             )
             .await;
         }
@@ -4576,6 +4683,7 @@ async fn execute_action_step(
     job_timed_out: &AtomicBool,
     job_summary: &mut JobSummaryBuilder,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
+    repository_access: &RunRepositoryAccess,
 ) -> Result<StepExecution> {
     let step_timed_out = Arc::new(AtomicBool::new(false));
     let (effective_cancel, timeout_task) =
@@ -4584,7 +4692,16 @@ async fn execute_action_step(
     let cancel = &effective_cancel;
     let reference = ActionReference::parse(action)?;
     let action_directory = materialize_action(
-        job_id, step_id, &reference, run, workspace, run_dir, cancel, outbound, sequence,
+        job_id,
+        step_id,
+        &reference,
+        run,
+        workspace,
+        run_dir,
+        cancel,
+        outbound,
+        sequence,
+        repository_access,
     )
     .await;
     let action_directory = match action_directory {
@@ -4686,6 +4803,7 @@ async fn execute_action_step(
             job_timed_out,
             job_summary,
             workflow_commands,
+            repository_access,
         )
         .await?;
         if job_timed_out.load(Ordering::Acquire) {
@@ -4867,6 +4985,7 @@ async fn execute_composite_action(
     job_timed_out: &AtomicBool,
     job_summary: &mut JobSummaryBuilder,
     workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
+    repository_access: &RunRepositoryAccess,
 ) -> Result<ActionPhaseExecution> {
     if definition.runs.main.is_some()
         || definition.runs.pre.is_some()
@@ -4913,6 +5032,7 @@ async fn execute_composite_action(
             job_timed_out,
             job_summary,
             workflow_commands,
+            repository_access,
         ))
         .await?;
         steps.insert(
@@ -5097,6 +5217,7 @@ async fn materialize_action(
     cancel: &watch::Receiver<bool>,
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
+    repository_access: &RunRepositoryAccess,
 ) -> Result<PathBuf> {
     match reference {
         ActionReference::Local { path } => {
@@ -5111,17 +5232,15 @@ async fn materialize_action(
             git_ref,
         } => {
             let remote = format!("https://github.com/{owner}/{repository}.git");
-            let authenticated = owner.eq_ignore_ascii_case(&run.repository.owner)
-                && repository.eq_ignore_ascii_case(&run.repository.name)
-                && !run.checkout_token.is_empty();
-            let checkout = materialize_remote_repository(
+            let checkout = materialize_remote_repository_with_shared_access(
                 job_id,
                 step_id,
                 owner,
                 repository,
                 git_ref,
                 &remote,
-                authenticated.then_some(run.checkout_token.as_str()),
+                run,
+                repository_access,
                 run_dir,
                 cancel,
                 outbound,
@@ -5137,6 +5256,77 @@ async fn materialize_action(
             Ok(directory)
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn materialize_remote_repository_with_shared_access(
+    job_id: Uuid,
+    step_id: &str,
+    owner: &str,
+    repository: &str,
+    git_ref: &str,
+    remote: &str,
+    run: &RunSpec,
+    repository_access: &RunRepositoryAccess,
+    run_dir: &Path,
+    cancel: &watch::Receiver<bool>,
+    outbound: &mpsc::Sender<AgentMessage>,
+    sequence: &Arc<AtomicU64>,
+) -> Result<PathBuf> {
+    let same_repository = owner.eq_ignore_ascii_case(&run.repository.owner)
+        && repository.eq_ignore_ascii_case(&run.repository.name);
+    let cached_token = if same_repository {
+        (!run.checkout_token.is_empty()).then(|| run.checkout_token.clone())
+    } else {
+        repository_access.cached_token(owner, repository).await
+    };
+    let first = materialize_remote_repository(
+        job_id,
+        step_id,
+        owner,
+        repository,
+        git_ref,
+        remote,
+        cached_token.as_deref(),
+        run_dir,
+        cancel,
+        outbound,
+        sequence,
+    )
+    .await;
+    let first_error = match first {
+        Ok(checkout) => return Ok(checkout),
+        Err(error) if same_repository => return Err(error),
+        Err(error) => error,
+    };
+    let token = repository_access
+        .request_token(
+            run.id,
+            owner,
+            repository,
+            cached_token.is_some(),
+            cancel,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "fetch {owner}/{repository}@{git_ref} without usable shared-repository access: {first_error:#}"
+            )
+        })?;
+    materialize_remote_repository(
+        job_id,
+        step_id,
+        owner,
+        repository,
+        git_ref,
+        remote,
+        Some(&token),
+        run_dir,
+        cancel,
+        outbound,
+        sequence,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7127,6 +7317,19 @@ fn secret_values(run: &RunSpec) -> Vec<String> {
     values
 }
 
+fn register_repository_token_masks(
+    commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
+    token: &str,
+) {
+    let credential = STANDARD.encode(format!("x-access-token:{token}"));
+    let mut commands = commands
+        .lock()
+        .expect("workflow command processor was poisoned");
+    commands.register_global_mask(format!("AUTHORIZATION: basic {credential}"));
+    commands.register_global_mask(credential);
+    commands.register_global_mask(token.to_owned());
+}
+
 async fn relay_masked_events(
     mut incoming: mpsc::Receiver<AgentMessage>,
     outbound: mpsc::Sender<AgentMessage>,
@@ -7193,6 +7396,7 @@ async fn relay_masked_events(
             | AgentMessage::Heartbeat { .. }
             | AgentMessage::ConcurrencyAcquire { .. }
             | AgentMessage::ConcurrencyRelease { .. }
+            | AgentMessage::RepositoryTokenRequest { .. }
             | AgentMessage::JobStarted { .. } => {}
         }
         outbound
@@ -7242,6 +7446,15 @@ impl WorkflowCommandProcessor {
             Some(error) => bail!("workflow command processing failed: {error}"),
             None => Ok(()),
         }
+    }
+
+    fn register_global_mask(&mut self, value: String) {
+        if value.is_empty() || self.global_masks.iter().any(|mask| mask == &value) {
+            return;
+        }
+        self.global_masks.push(value);
+        self.global_masks
+            .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
     }
 
     fn fail(&mut self, error: String) {
@@ -7429,12 +7642,14 @@ impl WorkflowCommandProcessor {
     }
 
     fn mask_for_step(&self, step_id: &str, value: &mut String) {
+        mask_text(value, &self.global_masks);
         if let Some(scope) = self.scopes.get(&workflow_command_scope(step_id)) {
             mask_text(value, &scope.masks);
         }
     }
 
     fn mask_all(&self, value: &mut String) {
+        mask_text(value, &self.global_masks);
         for scope in self.scopes.values() {
             mask_text(value, &scope.masks);
         }
@@ -7546,6 +7761,12 @@ fn mask_text(value: &mut String, secrets: &[String]) {
 mod tests {
     use super::*;
     use gitzero_protocol::{PullRequestSpec, RepositorySpec};
+
+    fn local_repository_access(
+        workflow_commands: &Arc<StdMutex<WorkflowCommandProcessor>>,
+    ) -> RunRepositoryAccess {
+        RunRepositoryAccess::new(RepositoryAccessClient::local(), workflow_commands.clone())
+    }
 
     #[test]
     fn only_accepts_full_commit_shas() {
@@ -8432,6 +8653,22 @@ jobs:
     }
 
     #[test]
+    fn masks_dynamically_minted_shared_repository_tokens() {
+        let commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let token = "shared-repository-token-value";
+        register_repository_token_masks(&commands, token);
+        let credential = STANDARD.encode(format!("x-access-token:{token}"));
+        let mut log = format!("{token} {credential} AUTHORIZATION: basic {credential}");
+        let commands = commands
+            .lock()
+            .expect("workflow command processor was poisoned");
+        commands.mask_for_step("0/job/step", &mut log);
+        assert!(!log.contains(token));
+        assert!(!log.contains(&credential));
+        assert!(commands.value_is_masked_for_step("0/job/step", token));
+    }
+
+    #[test]
     fn environment_variables_are_job_scoped_and_override_case_insensitively() {
         let mut run = fixture_run(
             Uuid::nil(),
@@ -8611,6 +8848,7 @@ jobs:
         )])));
         let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
         let concurrency = ConcurrencyClient::local();
+        let repository_access = local_repository_access(&workflow_commands);
         let execution = execute_plan(
             run.id,
             &plan,
@@ -8628,6 +8866,7 @@ jobs:
             &environment_variable_cache,
             &workflow_commands,
             &concurrency,
+            &repository_access,
         );
         tokio::pin!(execution);
         let mut events = Vec::new();
@@ -9728,6 +9967,8 @@ jobs:
         let (_cancel_tx, cancel) = watch::channel(false);
         let (outbound, _incoming) = mpsc::channel(8);
         let sequence = Arc::new(AtomicU64::new(0));
+        let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let repository_access = local_repository_access(&workflow_commands);
         let run_dir = directory.path().join("run");
         tokio::fs::create_dir_all(&run_dir).await.expect("run dir");
         assert!(
@@ -9738,6 +9979,7 @@ jobs:
                 &cancel,
                 &outbound,
                 &sequence,
+                &repository_access,
             )
             .await
             .expect("discover unmatched")
@@ -9753,6 +9995,7 @@ jobs:
                 &cancel,
                 &outbound,
                 &sequence,
+                &repository_access,
             )
             .await
             .expect("discover matched")
@@ -10337,6 +10580,8 @@ jobs:
         let reference = ActionReference::parse("actions/setup-node@v6").expect("reference");
         let (outbound, _incoming) = mpsc::channel(128);
         let (_cancel_tx, cancel) = watch::channel(false);
+        let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let repository_access = local_repository_access(&workflow_commands);
         let action = materialize_action(
             run.id,
             "0/test/setup",
@@ -10347,6 +10592,7 @@ jobs:
             &cancel,
             &outbound,
             &Arc::new(AtomicU64::new(0)),
+            &repository_access,
         )
         .await
         .expect("download action");
@@ -10394,6 +10640,8 @@ jobs:
         .expect("remote reusable reference");
         let (outbound, _incoming) = mpsc::channel(128);
         let (_cancel_tx, cancel) = watch::channel(false);
+        let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let repository_access = local_repository_access(&workflow_commands);
         let workflow = load_remote_reusable_workflow(
             &reference,
             &run_dir,
@@ -10401,6 +10649,7 @@ jobs:
             &cancel,
             &outbound,
             &Arc::new(AtomicU64::new(0)),
+            &repository_access,
         )
         .await
         .expect("download reusable workflow");
@@ -10492,6 +10741,7 @@ jobs:
         let environment_variable_cache = Arc::new(Mutex::new(BTreeMap::new()));
         let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
         let concurrency = ConcurrencyClient::local();
+        let repository_access = local_repository_access(&workflow_commands);
         let execution = execute_plan(
             run.id,
             &plan,
@@ -10509,6 +10759,7 @@ jobs:
             &environment_variable_cache,
             &workflow_commands,
             &concurrency,
+            &repository_access,
         );
         tokio::pin!(execution);
         let mut events = Vec::new();
@@ -10649,6 +10900,7 @@ jobs:
         let environment_variable_cache = Arc::new(Mutex::new(BTreeMap::new()));
         let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
         let concurrency = ConcurrencyClient::local();
+        let repository_access = local_repository_access(&workflow_commands);
         let execution = execute_plan(
             run.id,
             &plan,
@@ -10666,6 +10918,7 @@ jobs:
             &environment_variable_cache,
             &workflow_commands,
             &concurrency,
+            &repository_access,
         );
         tokio::pin!(execution);
         let mut events = Vec::new();
@@ -10783,6 +11036,7 @@ jobs:
         let environment_variable_cache = Arc::new(Mutex::new(BTreeMap::new()));
         let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
         let concurrency = ConcurrencyClient::local();
+        let repository_access = local_repository_access(&workflow_commands);
         let execution = execute_plan(
             run.id,
             &plan,
@@ -10800,6 +11054,7 @@ jobs:
             &environment_variable_cache,
             &workflow_commands,
             &concurrency,
+            &repository_access,
         );
         tokio::pin!(execution);
         let mut events = Vec::new();

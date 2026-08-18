@@ -24,6 +24,10 @@ const repositoryActionsPermissionsSchema = z.object({
   sha_pinning_required: z.boolean().optional(),
 });
 
+const repositoryActionsAccessSchema = z.object({
+  access_level: z.enum(["none", "user", "organization", "enterprise"]),
+});
+
 const repositoryCheckRunSchema = z.object({
   id: z.number().int().positive(),
   name: z.string(),
@@ -192,6 +196,64 @@ export async function createAgentTokens(
     }),
   ]);
   return { checkoutToken, environmentToken };
+}
+
+export async function createSharedRepositoryToken(
+  env: GitHubEnvironment,
+  installationId: number,
+  callerOwner: string,
+  callerRepository: string,
+  callerOwnerType: string,
+  targetOwner: string,
+  targetRepository: string,
+): Promise<string> {
+  if (
+    callerOwner.toLowerCase() !== targetOwner.toLowerCase() ||
+    callerRepository.toLowerCase() === targetRepository.toLowerCase()
+  ) {
+    throw new Error(
+      "shared repository access requires a different repository under the caller owner",
+    );
+  }
+  const allowedLevels =
+    callerOwnerType === "Organization"
+      ? new Set(["organization", "enterprise"])
+      : callerOwnerType === "User"
+        ? new Set(["user"])
+        : null;
+  if (allowedLevels === null) {
+    throw new Error("the caller repository owner type is unavailable");
+  }
+
+  const appJwt = await createAppJwt(env);
+  const policyToken = await createInstallationTokenWithJwt(
+    env,
+    appJwt,
+    installationId,
+    targetRepository,
+    { administration: "read" },
+  );
+  const repositoryPath = `/repos/${encodeURIComponent(targetOwner)}/${encodeURIComponent(targetRepository)}`;
+  const access = repositoryActionsAccessSchema.parse(
+    await githubRequest(
+      env,
+      policyToken,
+      `${repositoryPath}/actions/permissions/access`,
+      { method: "GET" },
+    ),
+  );
+  if (!allowedLevels.has(access.access_level)) {
+    throw new Error(
+      `target repository Actions access policy '${access.access_level}' does not allow this caller`,
+    );
+  }
+  return createInstallationTokenWithJwt(
+    env,
+    appJwt,
+    installationId,
+    targetRepository,
+    { contents: "read" },
+  );
 }
 
 export async function fetchActionsVariables(

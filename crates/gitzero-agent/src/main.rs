@@ -3,6 +3,7 @@ mod artifact;
 mod cache;
 mod concurrency;
 mod executor;
+mod repository_access;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -13,6 +14,7 @@ use gitzero_protocol::{
     AgentHello, AgentMessage, Conclusion, MAX_RUNNER_LABELS, MAX_RUNNER_SELECTOR_BYTES,
     PROTOCOL_VERSION, ServerMessage,
 };
+use repository_access::RepositoryAccessClient;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, Semaphore, mpsc, watch},
@@ -187,6 +189,7 @@ async fn run_connection(
     let (mut writer, mut reader) = socket.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<AgentMessage>(512);
     let concurrency = ConcurrencyClient::remote(outbound_tx.clone());
+    let repository_access = RepositoryAccessClient::remote(outbound_tx.clone());
 
     let hello = AgentMessage::Hello {
         hello: AgentHello {
@@ -226,6 +229,7 @@ async fn run_connection(
                                 running.clone(),
                                 outbound_tx.clone(),
                                 concurrency.clone(),
+                                repository_access.clone(),
                             ).await?;
                         }
                         Message::Close(_) => return Ok(()),
@@ -247,6 +251,7 @@ async fn run_connection(
     }
     .await;
     concurrency.cancel_all().await;
+    repository_access.cancel_all().await;
     result
 }
 
@@ -257,6 +262,7 @@ async fn handle_server_message(
     running: RunningJobs,
     outbound: mpsc::Sender<AgentMessage>,
     concurrency: ConcurrencyClient,
+    repository_access: RepositoryAccessClient,
 ) -> Result<()> {
     match message {
         ServerMessage::Welcome {
@@ -284,7 +290,13 @@ async fn handle_server_message(
             let task = tokio::spawn(async move {
                 let _permit = permit;
                 if let Err(error) = executor
-                    .execute_with_concurrency(job, cancel_rx, outbound.clone(), concurrency)
+                    .execute_with_services(
+                        job,
+                        cancel_rx,
+                        outbound.clone(),
+                        concurrency,
+                        repository_access,
+                    )
                     .await
                 {
                     error!(job_id = %job_id, error = %error, "job execution crashed");
@@ -317,6 +329,14 @@ async fn handle_server_message(
         }
         ServerMessage::ConcurrencyCancelled { request_id, reason } => {
             concurrency.handle_cancelled(request_id, reason).await;
+        }
+        ServerMessage::RepositoryTokenGranted { request_id, token } => {
+            repository_access
+                .handle_granted(request_id, token.into_inner())
+                .await;
+        }
+        ServerMessage::RepositoryTokenDenied { request_id, reason } => {
+            repository_access.handle_denied(request_id, reason).await;
         }
         ServerMessage::Ack { .. } => {}
         ServerMessage::Error { code, message } => {

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createAgentTokens,
   createCheckRun,
+  createSharedRepositoryToken,
   disableRepositoryActions,
   fetchActionsVariables,
   fetchActionsVariablesWithToken,
@@ -223,6 +224,131 @@ describe("GitHub Actions variables", () => {
 });
 
 describe("GitHub production API contracts", () => {
+  it("mints a contents-only token after the target sharing policy authorizes the caller", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        if (url.pathname.endsWith("/access_tokens")) {
+          const permissions = JSON.parse(String(init?.body))
+            .permissions as Record<string, string>;
+          return Response.json({
+            token:
+              permissions.administration === "read"
+                ? "policy-token"
+                : "shared-contents-token",
+          });
+        }
+        expect(url.pathname).toBe(
+          "/repos/ACME/shared-actions/actions/permissions/access",
+        );
+        expect(new Headers(init?.headers).get("Authorization")).toBe(
+          "Bearer policy-token",
+        );
+        return Response.json({ access_level: "organization" });
+      }),
+    );
+
+    await expect(
+      createSharedRepositoryToken(
+        {
+          GITHUB_API_VERSION: "2026-03-10",
+          GITHUB_APP_ID: "1234",
+          GITHUB_APP_PRIVATE_KEY: privateKey,
+        },
+        7001,
+        "acme",
+        "widget",
+        "Organization",
+        "ACME",
+        "shared-actions",
+      ),
+    ).resolves.toBe("shared-contents-token");
+
+    expect(requests).toHaveLength(3);
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+      repositories: ["shared-actions"],
+      permissions: { administration: "read" },
+    });
+    expect(requests[1]?.init?.method).toBe("GET");
+    expect(JSON.parse(String(requests[2]?.init?.body))).toEqual({
+      repositories: ["shared-actions"],
+      permissions: { contents: "read" },
+    });
+    expect(JSON.parse(String(requests[2]?.init?.body))).not.toMatchObject({
+      permissions: { administration: expect.anything() },
+    });
+  });
+
+  it("fails closed before minting a contents token when sharing is disabled", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        return url.pathname.endsWith("/access_tokens")
+          ? Response.json({ token: "policy-token" })
+          : Response.json({ access_level: "none" });
+      }),
+    );
+
+    await expect(
+      createSharedRepositoryToken(
+        {
+          GITHUB_API_VERSION: "2026-03-10",
+          GITHUB_APP_ID: "1234",
+          GITHUB_APP_PRIVATE_KEY: privateKey,
+        },
+        7001,
+        "octocat",
+        "caller",
+        "User",
+        "octocat",
+        "private-action",
+      ),
+    ).rejects.toThrow("does not allow this caller");
+    expect(requests).toHaveLength(2);
+  });
+
+  it("rejects cross-owner and same-repository token requests without calling GitHub", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const environment = {
+      GITHUB_API_VERSION: "2026-03-10",
+      GITHUB_APP_ID: "1234",
+      GITHUB_APP_PRIVATE_KEY: "unused",
+    };
+
+    await expect(
+      createSharedRepositoryToken(
+        environment,
+        7001,
+        "acme",
+        "widget",
+        "Organization",
+        "another-owner",
+        "shared-actions",
+      ),
+    ).rejects.toThrow("under the caller owner");
+    await expect(
+      createSharedRepositoryToken(
+        environment,
+        7001,
+        "acme",
+        "widget",
+        "Organization",
+        "ACME",
+        "WIDGET",
+      ),
+    ).rejects.toThrow("different repository");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("reads repository Actions state with a repository-scoped Administration token", async () => {
     const privateKey = await testPrivateKeyPem();
     const requests: Array<{ url: URL; init?: RequestInit }> = [];

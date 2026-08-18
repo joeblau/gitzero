@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import {
   createAgentTokens,
   createCheckRun,
+  createSharedRepositoryToken,
   fetchActionsVariables,
   updateCheckRun,
 } from "./github";
@@ -1149,6 +1150,64 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
           agentId,
           "Concurrency unit completed.",
         );
+        return;
+      }
+      case "repository_token_request": {
+        const row = this.assignedJob(message.job_id, agentId);
+        if (row.status === "completed") {
+          sendServer(socket, {
+            type: "repository_token_denied",
+            request_id: message.request_id,
+            reason: "The parent GitZero run is no longer active.",
+          });
+          return;
+        }
+        const job = parseJob(row.job_json);
+        try {
+          const token = await createSharedRepositoryToken(
+            this.env,
+            job.installation_id,
+            job.repository.owner,
+            job.repository.name,
+            eventRepositoryOwnerType(this.eventPayload(job.id)),
+            message.owner,
+            message.repository,
+          );
+          const stillOwned = this.ctx.storage.sql
+            .exec<{ id: string }>(
+              `SELECT id FROM jobs
+               WHERE id = ? AND agent_id = ? AND status IN ('assigned', 'running')`,
+              job.id,
+              agentId,
+            )
+            .toArray().length;
+          if (stillOwned === 0 || socket.readyState !== WebSocket.OPEN) {
+            return;
+          }
+          sendServer(socket, {
+            type: "repository_token_granted",
+            request_id: message.request_id,
+            token,
+          });
+        } catch (error) {
+          console.error(
+            JSON.stringify({
+              message: "shared repository token request denied",
+              jobId: job.id,
+              agentId,
+              target: `${message.owner}/${message.repository}`,
+              error: truncateDiagnostic(error),
+            }),
+          );
+          if (socket.readyState === WebSocket.OPEN) {
+            sendServer(socket, {
+              type: "repository_token_denied",
+              request_id: message.request_id,
+              reason:
+                "Private repository access was denied. Confirm the target Actions sharing policy and GitHub App installation include this repository.",
+            });
+          }
+        }
         return;
       }
       case "step_started":

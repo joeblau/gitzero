@@ -3,7 +3,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_RUNNER_LABELS: usize = 32;
 pub const MAX_RUNNER_REQUIREMENTS: usize = 512;
 pub const MAX_RUNNER_SELECTOR_BYTES: usize = 256;
@@ -42,6 +42,28 @@ pub struct PullRequestSpec {
     pub base_sha: String,
     pub head_ref: String,
     pub base_ref: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RepositoryToken(String);
+
+impl RepositoryToken {
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl From<String> for RepositoryToken {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl std::fmt::Debug for RepositoryToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +148,14 @@ pub enum ServerMessage {
         request_id: Uuid,
         reason: String,
     },
+    RepositoryTokenGranted {
+        request_id: Uuid,
+        token: RepositoryToken,
+    },
+    RepositoryTokenDenied {
+        request_id: Uuid,
+        reason: String,
+    },
     Ack {
         message_id: Uuid,
     },
@@ -168,6 +198,13 @@ pub enum AgentMessage {
         message_id: Uuid,
         job_id: Uuid,
         request_id: Uuid,
+    },
+    RepositoryTokenRequest {
+        message_id: Uuid,
+        job_id: Uuid,
+        request_id: Uuid,
+        owner: String,
+        repository: String,
     },
     StepStarted {
         message_id: Uuid,
@@ -291,6 +328,32 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ServerMessage>(&json).expect("deserialize concurrency response"),
             cancelled
+        );
+
+        let token_request = AgentMessage::RepositoryTokenRequest {
+            message_id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            request_id,
+            owner: "acme".into(),
+            repository: "shared-actions".into(),
+        };
+        let json = serde_json::to_string(&token_request).expect("serialize token request");
+        assert!(json.contains(r#""type":"repository_token_request""#));
+        assert_eq!(
+            serde_json::from_str::<AgentMessage>(&json).expect("deserialize token request"),
+            token_request
+        );
+
+        let granted = ServerMessage::RepositoryTokenGranted {
+            request_id,
+            token: "target-secret-token".to_owned().into(),
+        };
+        let json = serde_json::to_string(&granted).expect("serialize token response");
+        assert!(json.contains(r#""token":"target-secret-token""#));
+        assert!(!format!("{granted:?}").contains("target-secret-token"));
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&json).expect("deserialize token response"),
+            granted
         );
     }
 

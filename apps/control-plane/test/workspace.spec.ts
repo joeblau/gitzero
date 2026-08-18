@@ -306,7 +306,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 4,
+          protocol_version: 5,
           agent_id: "mini-1",
           name: "Test Mini",
           version: "0.1.0",
@@ -317,7 +317,7 @@ describe("Workspace Durable Object", () => {
     );
 
     const [welcome, assignment] = await messages;
-    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 4 });
+    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 5 });
     expect(assignment).toMatchObject({
       type: "run_job",
       job: {
@@ -604,7 +604,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 4,
+          protocol_version: 5,
           agent_id: "mini-1",
           name: "duplicate",
           version: "0.1.0",
@@ -861,6 +861,102 @@ describe("Workspace Durable Object", () => {
       }),
     );
     socket.close(1000, "test complete");
+  });
+
+  it("returns target-scoped repository tokens only for authorized active runs", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const originalAppId = env.GITHUB_APP_ID;
+    const originalPrivateKey = env.GITHUB_APP_PRIVATE_KEY;
+    Reflect.set(env, "GITHUB_APP_ID", "1234");
+    Reflect.set(env, "GITHUB_APP_PRIVATE_KEY", privateKey);
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        if (url.pathname.endsWith("/access_tokens")) {
+          const permissions = JSON.parse(String(init?.body))
+            .permissions as Record<string, string>;
+          return Response.json({
+            token:
+              permissions.administration === "read"
+                ? "policy-token"
+                : "target-contents-token",
+          });
+        }
+        return Response.json({ access_level: "organization" });
+      }),
+    );
+
+    try {
+      const workspaceId = "7010";
+      const workspace = env.WORKSPACES.getByName(workspaceId);
+      const agent = await connectAgent(workspace, workspaceId, "mini-1", 1);
+      const assignment = collectMessageOfType(agent, "run_job");
+      const job = fixtureJob(workspaceId);
+      job.installation_id = 7010;
+      job.repository.owner = "acme";
+      job.repository.name = "caller";
+      job.repository.clone_url = "https://github.com/acme/caller.git";
+      job.event = { repository: { owner: { type: "Organization" } } };
+      await workspace.enqueue(job, "shared-repository-token");
+      await assignment;
+
+      const requestId = crypto.randomUUID();
+      const granted = collectMessageOfType(agent, "repository_token_granted");
+      agent.send(
+        JSON.stringify({
+          type: "repository_token_request",
+          message_id: crypto.randomUUID(),
+          job_id: job.id,
+          request_id: requestId,
+          owner: "ACME",
+          repository: "shared-actions",
+        }),
+      );
+      await expect(granted).resolves.toEqual({
+        type: "repository_token_granted",
+        request_id: requestId,
+        token: "target-contents-token",
+      });
+      expect(requests.map((request) => request.url.pathname)).toEqual([
+        "/app/installations/7010/access_tokens",
+        "/repos/ACME/shared-actions/actions/permissions/access",
+        "/app/installations/7010/access_tokens",
+      ]);
+      expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+        repositories: ["shared-actions"],
+        permissions: { administration: "read" },
+      });
+      expect(JSON.parse(String(requests[2]?.init?.body))).toEqual({
+        repositories: ["shared-actions"],
+        permissions: { contents: "read" },
+      });
+
+      const deniedRequestId = crypto.randomUUID();
+      const denied = collectMessageOfType(agent, "repository_token_denied");
+      agent.send(
+        JSON.stringify({
+          type: "repository_token_request",
+          message_id: crypto.randomUUID(),
+          job_id: job.id,
+          request_id: deniedRequestId,
+          owner: "another-owner",
+          repository: "private-action",
+        }),
+      );
+      await expect(denied).resolves.toMatchObject({
+        type: "repository_token_denied",
+        request_id: deniedRequestId,
+        reason: expect.stringContaining("access was denied"),
+      });
+      expect(requests).toHaveLength(3);
+      agent.close(1000, "test complete");
+    } finally {
+      Reflect.set(env, "GITHUB_APP_ID", originalAppId);
+      Reflect.set(env, "GITHUB_APP_PRIVATE_KEY", originalPrivateKey);
+    }
   });
 
   it("serializes case-insensitive concurrency groups and cancels superseded units", async () => {
@@ -1171,7 +1267,7 @@ async function connectAgentWithTargeting(
     JSON.stringify({
       type: "hello",
       hello: {
-        protocol_version: 4,
+        protocol_version: 5,
         agent_id: agentId,
         name: agentId,
         version: "0.1.0",

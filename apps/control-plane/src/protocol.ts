@@ -1,9 +1,14 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 const uuid = z.string().uuid();
 const sha = z.string().regex(/^[0-9a-fA-F]{40}$/);
+const repositoryComponent = z
+  .string()
+  .min(1)
+  .max(100)
+  .regex(/^[A-Za-z0-9._-]+$/);
 
 export const repositorySchema = z.object({
   owner: z.string().min(1),
@@ -135,6 +140,14 @@ export const agentMessageSchema = z.discriminatedUnion("type", [
     request_id: uuid,
   }),
   z.object({
+    type: z.literal("repository_token_request"),
+    message_id: uuid,
+    job_id: uuid,
+    request_id: uuid,
+    owner: repositoryComponent,
+    repository: repositoryComponent,
+  }),
+  z.object({
     type: z.literal("step_started"),
     message_id: uuid,
     job_id: uuid,
@@ -181,6 +194,8 @@ export type ServerMessage =
   | { type: "cancel_job"; job_id: string; reason: string }
   | { type: "concurrency_granted"; request_id: string }
   | { type: "concurrency_cancelled"; request_id: string; reason: string }
+  | { type: "repository_token_granted"; request_id: string; token: string }
+  | { type: "repository_token_denied"; request_id: string; reason: string }
   | { type: "ack"; message_id: string }
   | { type: "error"; code: string; message: string };
 
