@@ -276,6 +276,8 @@ pub struct PlannedJob {
     pub id: String,
     pub base_id: String,
     pub name: String,
+    pub defining_workflow_path: String,
+    pub workflow_identity: Option<PlannedWorkflowIdentity>,
     pub needs: Vec<String>,
     pub need_aliases: BTreeMap<String, String>,
     pub condition: Option<String>,
@@ -300,6 +302,14 @@ pub struct PlannedJob {
     pub environment: BTreeMap<String, String>,
     pub outputs: BTreeMap<String, String>,
     pub steps: Vec<PlannedStep>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlannedWorkflowIdentity {
+    pub workflow_ref: String,
+    pub workflow_sha: String,
+    pub workflow_repository: String,
+    pub workflow_file_path: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -544,6 +554,8 @@ pub fn compile(workflow: &Workflow, path: &Path) -> Result<ExecutionPlan, Workfl
                 id,
                 base_id: job_id.clone(),
                 name: job.name.clone().unwrap_or_else(|| job_id.clone()),
+                defining_workflow_path: workflow_path.clone(),
+                workflow_identity: None,
                 needs: job.needs.0.clone(),
                 need_aliases: job
                     .needs
@@ -3053,6 +3065,11 @@ jobs:
         let plan = compile(&workflow, Path::new(".github/workflows/ci.yml")).expect("compile");
         assert_eq!(plan.workflow_name, "CI");
         assert_eq!(plan.workflow_path, ".github/workflows/ci.yml");
+        assert_eq!(
+            plan.jobs[0].defining_workflow_path,
+            ".github/workflows/ci.yml"
+        );
+        assert_eq!(plan.jobs[0].workflow_identity, None);
         assert_eq!(plan.jobs[0].steps[0].github_action, "actionscheckout");
         assert_eq!(plan.jobs[0].steps[1].github_action, "__run");
         assert_eq!(plan.jobs[0].environment["RUST_BACKTRACE"], "1");
@@ -4140,6 +4157,20 @@ jobs:
                 "outer::inner::build",
                 "outer::inner",
                 "outer",
+            ]
+        );
+        assert_eq!(
+            plan.jobs
+                .iter()
+                .map(|job| job.defining_workflow_path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                ".github/workflows/ci.yml",
+                ".github/workflows/outer.yml",
+                ".github/workflows/outer.yml",
+                ".github/workflows/inner.yml",
+                ".github/workflows/outer.yml",
+                ".github/workflows/ci.yml",
             ]
         );
         let nested = &plan.jobs[3];

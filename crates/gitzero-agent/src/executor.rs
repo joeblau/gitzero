@@ -25,9 +25,10 @@ use gitzero_protocol::{
 };
 use gitzero_workflow::{
     ExecutionPlan, MAX_UNIQUE_REUSABLE_WORKFLOWS, PlannedConcurrency, PlannedConcurrencyQueue,
-    PlannedJob, PlannedPermissions, PlannedStep, PlannedVirtualJob, ReusableInputType,
-    Step as WorkflowStep, StepKind, Workflow, compile_with_reusables, expand_dynamic_reusable_call,
-    expand_matrix_definition, matches_pull_request, parse, requires_pull_request_changed_paths,
+    PlannedJob, PlannedPermissions, PlannedStep, PlannedVirtualJob, PlannedWorkflowIdentity,
+    ReusableInputType, Step as WorkflowStep, StepKind, Workflow, compile_with_reusables,
+    expand_dynamic_reusable_call, expand_matrix_definition, matches_pull_request, parse,
+    requires_pull_request_changed_paths,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -936,11 +937,12 @@ async fn discover_workflows(
 
     let mut plans = Vec::new();
     for (path, key) in matching.into_iter().zip(root_keys) {
-        let workflow = &reusable_workflows[&key];
-        plans.push(
-            compile_with_reusables(workflow, Path::new(&key), &reusable_workflows)
-                .with_context(|| format!("compile {}", path.display()))?,
-        );
+        let workflow = &reusable_workflows.workflows[&key];
+        let mut plan =
+            compile_with_reusables(workflow, Path::new(&key), &reusable_workflows.workflows)
+                .with_context(|| format!("compile {}", path.display()))?;
+        hydrate_plan_workflow_identities(&mut plan, &reusable_workflows.identities)?;
+        plans.push(plan);
     }
     Ok(plans)
 }
@@ -955,6 +957,12 @@ enum ReusableWorkflowOrigin {
 struct ReusableWorkflowSource {
     workflow: Workflow,
     origin: ReusableWorkflowOrigin,
+    identity: PlannedWorkflowIdentity,
+}
+
+struct ReusableWorkflowCatalog {
+    workflows: BTreeMap<String, Workflow>,
+    identities: BTreeMap<String, PlannedWorkflowIdentity>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1005,15 +1013,17 @@ async fn resolve_reusable_workflow_catalog(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
     repository_access: &RunRepositoryAccess,
-) -> Result<BTreeMap<String, Workflow>> {
+) -> Result<ReusableWorkflowCatalog> {
     let mut sources = local_workflows
         .into_iter()
         .map(|(key, workflow)| {
+            let identity = local_workflow_identity(run, &key);
             (
                 key,
                 ReusableWorkflowSource {
                     workflow,
                     origin: ReusableWorkflowOrigin::Local,
+                    identity,
                 },
             )
         })
@@ -1086,7 +1096,7 @@ async fn resolve_reusable_workflow_catalog(
             let Some(remote) = remote else {
                 continue;
             };
-            let (mut workflow, resolved_source) = load_remote_reusable_workflow(
+            let (mut workflow, resolved_source, canonical_ref) = load_remote_reusable_workflow(
                 &remote,
                 run_dir,
                 run,
@@ -1098,20 +1108,77 @@ async fn resolve_reusable_workflow_catalog(
             .await
             .with_context(|| format!("load remote reusable workflow '{target}'"))?;
             resolve_workflow_self_repository_actions(&mut workflow, &resolved_source)?;
+            let identity = remote_workflow_identity(&remote, &resolved_source, &canonical_ref);
             sources.insert(
                 target.clone(),
                 ReusableWorkflowSource {
                     workflow,
                     origin: ReusableWorkflowOrigin::Remote(resolved_source),
+                    identity,
                 },
             );
             pending.push_back(target);
         }
     }
-    Ok(sources
-        .into_iter()
-        .map(|(key, source)| (key, source.workflow))
-        .collect())
+    let mut workflows = BTreeMap::new();
+    let mut identities = BTreeMap::new();
+    for (key, source) in sources {
+        workflows.insert(key.clone(), source.workflow);
+        identities.insert(key, source.identity);
+    }
+    Ok(ReusableWorkflowCatalog {
+        workflows,
+        identities,
+    })
+}
+
+fn local_workflow_identity(run: &RunSpec, path: &str) -> PlannedWorkflowIdentity {
+    let repository = format!("{}/{}", run.repository.owner, run.repository.name);
+    PlannedWorkflowIdentity {
+        workflow_ref: format!("{repository}/{path}@{}", run.pull_request.execution_ref),
+        workflow_sha: run.pull_request.merge_sha.clone(),
+        workflow_repository: repository,
+        workflow_file_path: path.to_owned(),
+    }
+}
+
+fn remote_workflow_identity(
+    reference: &RemoteReusableWorkflowReference,
+    resolved_source: &ActionRepositorySource,
+    canonical_ref: &str,
+) -> PlannedWorkflowIdentity {
+    PlannedWorkflowIdentity {
+        workflow_ref: format!(
+            "{}/{}/{}@{}",
+            reference.owner, reference.repository, reference.path, canonical_ref
+        ),
+        workflow_sha: resolved_source.git_ref.clone(),
+        workflow_repository: format!("{}/{}", reference.owner, reference.repository),
+        workflow_file_path: reference.path.clone(),
+    }
+}
+
+fn hydrate_plan_workflow_identities(
+    plan: &mut ExecutionPlan,
+    identities: &BTreeMap<String, PlannedWorkflowIdentity>,
+) -> Result<()> {
+    for job in &mut plan.jobs {
+        job.workflow_identity = Some(
+            identities
+                .get(&job.defining_workflow_path)
+                .with_context(|| {
+                    format!(
+                        "resolve defining workflow identity for '{}'",
+                        job.defining_workflow_path
+                    )
+                })?
+                .clone(),
+        );
+        if let Some(PlannedVirtualJob::ReusableDynamicCall(call)) = &mut job.virtual_job {
+            hydrate_plan_workflow_identities(&mut call.called_plan, identities)?;
+        }
+    }
+    Ok(())
 }
 
 fn local_reusable_reference_path(source: &str) -> Option<Result<String>> {
@@ -1185,7 +1252,7 @@ async fn load_remote_reusable_workflow(
     outbound: &mpsc::Sender<AgentMessage>,
     sequence: &Arc<AtomicU64>,
     repository_access: &RunRepositoryAccess,
-) -> Result<(Workflow, ActionRepositorySource)> {
+) -> Result<(Workflow, ActionRepositorySource, String)> {
     let same_repository = reference.owner.eq_ignore_ascii_case(&run.repository.owner)
         && reference
             .repository
@@ -1230,9 +1297,18 @@ async fn load_remote_reusable_workflow(
     )
     .await?;
     validate_remote_commit(&resolved_sha)?;
+    let canonical_ref = read_cached_remote_canonical_ref(
+        run_dir,
+        &reference.owner,
+        &reference.repository,
+        &reference.git_ref,
+    )
+    .await?
+    .unwrap_or_else(|| reference.git_ref.clone());
     Ok((
         workflow,
         ActionRepositorySource::from_remote(reference, resolved_sha),
+        canonical_ref,
     ))
 }
 
@@ -7968,12 +8044,30 @@ async fn materialize_remote_repository_with_fetch(
         )
         .await?;
         validate_remote_commit(&resolved)?;
+        let canonical_ref = fetched_remote_canonical_ref(
+            &cache,
+            git_ref,
+            fetch_remote,
+            checkout_token,
+            checkout_environment,
+            cancel,
+        )
+        .await?;
         if let Some(parent) = resolution.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
         tokio::fs::write(&resolution, format!("{resolved}\n"))
             .await
             .with_context(|| format!("write remote resolution {}", resolution.display()))?;
+        let canonical_ref_path = remote_repository_canonical_ref_path(&resolution)?;
+        tokio::fs::write(&canonical_ref_path, format!("{canonical_ref}\n"))
+            .await
+            .with_context(|| {
+                format!(
+                    "write canonical remote ref {}",
+                    canonical_ref_path.display()
+                )
+            })?;
         commit = Some(resolved);
     }
     let commit = commit.expect("remote commit was fetched or cached");
@@ -8052,6 +8146,95 @@ fn remote_repository_resolution_path(
         .join(owner)
         .join(repository)
         .join(URL_SAFE_NO_PAD.encode(git_ref))
+}
+
+fn remote_repository_canonical_ref_path(resolution: &Path) -> Result<PathBuf> {
+    let name = resolution
+        .file_name()
+        .context("remote resolution path must have a file name")?;
+    let mut name = name.to_os_string();
+    name.push(".ref");
+    Ok(resolution.with_file_name(name))
+}
+
+async fn fetched_remote_canonical_ref(
+    cache: &Path,
+    git_ref: &str,
+    fetch_remote: &str,
+    checkout_token: Option<&str>,
+    checkout_environment: Option<&BTreeMap<String, String>>,
+    cancel: &watch::Receiver<bool>,
+) -> Result<String> {
+    if validate_remote_commit(git_ref).is_ok() || git_ref.starts_with("refs/") {
+        return Ok(git_ref.to_owned());
+    }
+    let source = tokio::fs::read_to_string(cache.join("FETCH_HEAD"))
+        .await
+        .context("read fetched remote ref identity")?;
+    for line in source.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let _object_id = fields.next();
+        let merge_marker = fields.next();
+        let description = fields.next();
+        if merge_marker != Some("") {
+            continue;
+        }
+        let Some(description) = description else {
+            continue;
+        };
+        for (prefix, qualified_prefix) in [("branch '", "refs/heads/"), ("tag '", "refs/tags/")] {
+            if let Some(value) = description.strip_prefix(prefix)
+                && let Some((name, _remote)) = value.split_once("' of ")
+                && !name.is_empty()
+            {
+                return Ok(format!("{qualified_prefix}{name}"));
+            }
+        }
+    }
+    if git_ref == "HEAD" {
+        let mut command = Command::new("git");
+        command.arg("--git-dir").arg(cache).args([
+            "ls-remote",
+            "--quiet",
+            "--symref",
+            fetch_remote,
+            "HEAD",
+        ]);
+        configure_remote_repository_access(&mut command, checkout_token, checkout_environment);
+        let output = run_process_capture_stdout(&mut command, cancel.clone())
+            .await
+            .context("resolve remote HEAD identity")?;
+        if let Some(reference) = output.lines().find_map(|line| {
+            line.strip_prefix("ref: ")
+                .and_then(|line| line.split_once('\t'))
+                .and_then(|(reference, name)| (name == "HEAD").then_some(reference))
+        }) {
+            return Ok(reference.to_owned());
+        }
+    }
+    Ok(git_ref.to_owned())
+}
+
+async fn read_cached_remote_canonical_ref(
+    run_dir: &Path,
+    owner: &str,
+    repository: &str,
+    git_ref: &str,
+) -> Result<Option<String>> {
+    let resolution = remote_repository_resolution_path(run_dir, owner, repository, git_ref);
+    let path = remote_repository_canonical_ref_path(&resolution)?;
+    let value = match tokio::fs::read_to_string(&path).await {
+        Ok(value) => value.trim().to_owned(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read canonical remote ref {}", path.display()));
+        }
+    };
+    if value.is_empty() || value.contains(['\0', '\n', '\r']) {
+        return Ok(None);
+    }
+    Ok(Some(value))
 }
 
 fn remote_repository_cache_path(run_dir: &Path, owner: &str, repository: &str) -> Result<PathBuf> {
@@ -8751,7 +8934,31 @@ fn expression_context_with_variables(
     context.insert_json("needs", JsonValue::Object(needs))?;
     context.insert_json("steps", steps.clone())?;
     context.insert_json("inputs", inputs.clone())?;
-    context.insert_json("job", json!({"status": execution_status_result(status)}))?;
+    let mut job_context = serde_json::Map::from_iter([(
+        "status".to_owned(),
+        JsonValue::String(execution_status_result(status).to_owned()),
+    )]);
+    if let Some(identity) = &job.workflow_identity {
+        job_context.extend([
+            (
+                "workflow_ref".to_owned(),
+                JsonValue::String(identity.workflow_ref.clone()),
+            ),
+            (
+                "workflow_sha".to_owned(),
+                JsonValue::String(identity.workflow_sha.clone()),
+            ),
+            (
+                "workflow_repository".to_owned(),
+                JsonValue::String(identity.workflow_repository.clone()),
+            ),
+            (
+                "workflow_file_path".to_owned(),
+                JsonValue::String(identity.workflow_file_path.clone()),
+            ),
+        ]);
+    }
+    context.insert_json("job", JsonValue::Object(job_context))?;
     context.insert_json(
         "runner",
         json!({
@@ -11001,6 +11208,126 @@ mod tests {
         assert!(validate_sha("-012345678901234567890123456789012345678").is_err());
         assert!(validate_sha(&"a".repeat(63)).is_err());
         assert!(validate_sha(&format!("{}z", "a".repeat(63))).is_err());
+    }
+
+    #[test]
+    fn job_workflow_identity_matches_current_runner_context_fields() {
+        let run = fixture_run(
+            Uuid::new_v4(),
+            "a".repeat(40),
+            "b".repeat(40),
+            "https://github.com/local/fixture.git".to_owned(),
+        );
+        let workflow = parse(
+            r#"
+name: Identity
+on: pull_request
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - run: echo identity
+"#,
+        )
+        .expect("parse workflow");
+        let mut plan = compile_with_reusables(
+            &workflow,
+            Path::new(".github/workflows/ci.yml"),
+            &BTreeMap::new(),
+        )
+        .expect("compile workflow");
+        let identity = local_workflow_identity(&run, ".github/workflows/ci.yml");
+        hydrate_plan_workflow_identities(
+            &mut plan,
+            &BTreeMap::from([(".github/workflows/ci.yml".to_owned(), identity.clone())]),
+        )
+        .expect("hydrate workflow identity");
+        let environment = github_workflow_environment(&run, &plan);
+        let context = expression_context(
+            &run,
+            &plan.jobs[0],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &environment,
+            &JsonValue::Object(Default::default()),
+            &JsonValue::Object(Default::default()),
+            ExecutionStatus::Success,
+            Path::new("/tmp/workspace"),
+            Path::new("/tmp/run"),
+            None,
+        )
+        .expect("expression context");
+        assert_eq!(
+            context.evaluate_json("job").expect("job context"),
+            json!({
+                "status": "success",
+                "workflow_ref": "local/fixture/.github/workflows/ci.yml@refs/pull/1/merge",
+                "workflow_sha": "a".repeat(40),
+                "workflow_repository": "local/fixture",
+                "workflow_file_path": ".github/workflows/ci.yml",
+            })
+        );
+
+        let reference = RemoteReusableWorkflowReference::parse(
+            "shared/automation/.github/workflows/build.yml@main",
+        )
+        .expect("remote reusable reference");
+        let resolved = ActionRepositorySource::from_remote(&reference, "c".repeat(40));
+        assert_eq!(
+            remote_workflow_identity(&reference, &resolved, "refs/heads/main"),
+            PlannedWorkflowIdentity {
+                workflow_ref: "shared/automation/.github/workflows/build.yml@refs/heads/main"
+                    .to_owned(),
+                workflow_sha: "c".repeat(40),
+                workflow_repository: "shared/automation".to_owned(),
+                workflow_file_path: ".github/workflows/build.yml".to_owned(),
+            }
+        );
+        assert_eq!(plan.jobs[0].workflow_identity, Some(identity));
+    }
+
+    #[tokio::test]
+    async fn fetched_workflow_refs_are_fully_qualified() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let cache = fixture.path();
+        let (_cancel_tx, cancel) = watch::channel(false);
+        tokio::fs::write(
+            cache.join("FETCH_HEAD"),
+            format!(
+                "{}\t\tbranch 'release/v1' of https://github.com/shared/automation\n",
+                "a".repeat(40)
+            ),
+        )
+        .await
+        .expect("branch FETCH_HEAD");
+        assert_eq!(
+            fetched_remote_canonical_ref(cache, "release/v1", "origin", None, None, &cancel)
+                .await
+                .expect("canonical branch"),
+            "refs/heads/release/v1"
+        );
+
+        tokio::fs::write(
+            cache.join("FETCH_HEAD"),
+            format!(
+                "{}\t\ttag 'v2' of https://github.com/shared/automation\n",
+                "b".repeat(40)
+            ),
+        )
+        .await
+        .expect("tag FETCH_HEAD");
+        assert_eq!(
+            fetched_remote_canonical_ref(cache, "v2", "origin", None, None, &cancel)
+                .await
+                .expect("canonical tag"),
+            "refs/tags/v2"
+        );
+        assert_eq!(
+            fetched_remote_canonical_ref(cache, &"c".repeat(64), "origin", None, None, &cancel,)
+                .await
+                .expect("canonical SHA-256 commit"),
+            "c".repeat(64)
+        );
     }
 
     #[test]
@@ -17012,7 +17339,7 @@ jobs:
         let (_cancel_tx, cancel) = watch::channel(false);
         let workflow_commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
         let repository_access = local_repository_access(&workflow_commands);
-        let (workflow, _source) = load_remote_reusable_workflow(
+        let (workflow, _source, _canonical_ref) = load_remote_reusable_workflow(
             &reference,
             &run_dir,
             &run,
@@ -17845,6 +18172,18 @@ jobs:
   direct:
     runs-on: macos-latest
     steps:
+      - name: Verify direct workflow identity
+        env:
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          JOB_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
+        run: |
+          test "$JOB_WORKFLOW_REF" = "local/fixture/.github/workflows/self.yml@refs/pull/1/merge"
+          test "$JOB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          test "$JOB_WORKFLOW_REPOSITORY" = "local/fixture"
+          test "$JOB_WORKFLOW_FILE_PATH" = ".github/workflows/self.yml"
+          echo workflow-identity-direct
       - uses: $/.github/actions/root
         with:
           expected: execution-snapshot
@@ -17880,6 +18219,33 @@ jobs:
   verify:
     runs-on: macos-latest
     steps:
+      - name: Check out the local defining workflow source
+        if: ${{ inputs.expected == 'execution-snapshot' }}
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: workflow-source
+      - name: Verify defining workflow identity
+        env:
+          EXPECTED_MARKER: ${{ inputs.expected }}
+          JOB_WORKFLOW_REF: ${{ job.workflow_ref }}
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          JOB_WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+          JOB_WORKFLOW_FILE_PATH: ${{ job.workflow_file_path }}
+        run: |
+          test "$JOB_WORKFLOW_REPOSITORY" = "local/fixture"
+          test "$JOB_WORKFLOW_FILE_PATH" = ".github/workflows/reusable.yml"
+          test "${#JOB_WORKFLOW_SHA}" -eq 40
+          if [[ "$EXPECTED_MARKER" = "execution-snapshot" ]]; then
+            test "$JOB_WORKFLOW_REF" = "local/fixture/.github/workflows/reusable.yml@refs/pull/1/merge"
+            test "$JOB_WORKFLOW_SHA" = "$GITHUB_SHA"
+            test -f workflow-source/.github/workflows/reusable.yml
+          else
+            test "$JOB_WORKFLOW_REF" = "local/fixture/.github/workflows/reusable.yml@refs/heads/main"
+            test "$JOB_WORKFLOW_SHA" != "$GITHUB_SHA"
+          fi
+          echo workflow-identity-$EXPECTED_MARKER
       - uses: $/.github/actions/root
         with:
           expected: ${{ inputs.expected }}
@@ -18005,6 +18371,21 @@ runs:
                 .count(),
             1,
             "remote reusable action must use its own pinned main snapshot"
+        );
+        assert!(logs.contains(&"workflow-identity-direct\n"));
+        assert_eq!(
+            logs.iter()
+                .filter(|data| **data == "workflow-identity-execution-snapshot\n")
+                .count(),
+            1,
+            "local reusable jobs must expose the execution-snapshot workflow identity"
+        );
+        assert_eq!(
+            logs.iter()
+                .filter(|data| **data == "workflow-identity-advanced-main\n")
+                .count(),
+            1,
+            "remote reusable jobs must expose their independently pinned workflow identity"
         );
         assert!(events.iter().any(|message| matches!(
             message,
