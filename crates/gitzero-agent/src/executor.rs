@@ -5,7 +5,7 @@ use crate::artifact::{ArtifactLimits, ArtifactService};
 use crate::cache::{CacheLimits, CacheService};
 use crate::concurrency::{ConcurrencyAcquisition, ConcurrencyClient};
 use crate::problem_matcher::ProblemMatcherRegistry;
-use crate::repository_access::RepositoryAccessClient;
+use crate::repository_access::{ExpiringToken, RepositoryAccessClient};
 use anyhow::{Context, Result, bail};
 use base64::{
     Engine,
@@ -83,8 +83,8 @@ type EnvironmentVariableCache = Arc<Mutex<BTreeMap<String, BTreeMap<String, Stri
 #[derive(Clone)]
 struct RunRepositoryAccess {
     client: RepositoryAccessClient,
-    tokens: Arc<Mutex<BTreeMap<(RepositoryTokenPurpose, String), String>>>,
-    workflow_tokens: Arc<Mutex<BTreeMap<PlannedPermissions, String>>>,
+    tokens: Arc<Mutex<BTreeMap<(RepositoryTokenPurpose, String), ExpiringToken>>>,
+    workflow_tokens: Arc<Mutex<BTreeMap<PlannedPermissions, ExpiringToken>>>,
     workflow_commands: Arc<StdMutex<WorkflowCommandProcessor>>,
 }
 
@@ -107,11 +107,18 @@ impl RunRepositoryAccess {
         owner: &str,
         repository: &str,
     ) -> Option<String> {
-        self.tokens
-            .lock()
-            .await
-            .get(&(purpose, repository_access_key(owner, repository)))
-            .cloned()
+        let key = (purpose, repository_access_key(owner, repository));
+        let mut tokens = self.tokens.lock().await;
+        match tokens.get(&key) {
+            Some(token) if token.is_usable() => Some(token.token.clone()),
+            Some(_) => {
+                if let Some(mut token) = tokens.remove(&key) {
+                    token.clear();
+                }
+                None
+            }
+            None => None,
+        }
     }
 
     async fn request_token(
@@ -129,8 +136,12 @@ impl RunRepositoryAccess {
             if let Some(mut token) = tokens.remove(&key) {
                 token.clear();
             }
-        } else if let Some(token) = tokens.get(&key) {
-            return Ok(token.clone());
+        } else if let Some(token) = tokens.get(&key)
+            && token.is_usable()
+        {
+            return Ok(token.token.clone());
+        } else if let Some(mut token) = tokens.remove(&key) {
+            token.clear();
         }
         if tokens.len() >= MAX_REPOSITORY_TOKENS_PER_RUN {
             bail!(
@@ -141,9 +152,54 @@ impl RunRepositoryAccess {
             .client
             .request_token(run_id, purpose, owner, repository, cancel)
             .await?;
-        register_repository_token_masks(&self.workflow_commands, &token);
-        tokens.insert(key, token.clone());
-        Ok(token)
+        register_repository_token_masks(&self.workflow_commands, &token.token);
+        let value = token.token.clone();
+        tokens.insert(key, token);
+        Ok(value)
+    }
+
+    async fn source_token(
+        &self,
+        run: &RunSpec,
+        refresh: bool,
+        cancel: &watch::Receiver<bool>,
+    ) -> Result<Option<String>> {
+        if !refresh {
+            if let Some(token) = self
+                .cached_token(
+                    RepositoryTokenPurpose::Source,
+                    &run.repository.owner,
+                    &run.repository.name,
+                )
+                .await
+            {
+                return Ok(Some(token));
+            }
+            if !run.checkout_token.is_empty() {
+                let initial = ExpiringToken {
+                    token: run.checkout_token.clone(),
+                    expires_at_epoch_seconds: run
+                        .checkout_token_expires_at_epoch_seconds
+                        .unwrap_or_default(),
+                };
+                if initial.is_usable() {
+                    return Ok(Some(initial.token));
+                }
+            }
+        }
+        if run.installation_id == 0 {
+            return Ok(None);
+        }
+        self.request_token(
+            run.id,
+            RepositoryTokenPurpose::Source,
+            &run.repository.owner,
+            &run.repository.name,
+            refresh,
+            cancel,
+        )
+        .await
+        .map(Some)
     }
 
     async fn workflow_token(
@@ -155,15 +211,21 @@ impl RunRepositoryAccess {
         if permissions.read.is_empty() && permissions.write.is_empty() {
             return Ok(None);
         }
-        if permissions == &PlannedPermissions::default() && !run.checkout_token.is_empty() {
-            return Ok(Some(run.checkout_token.clone()));
+        if permissions == &PlannedPermissions::default()
+            && let Some(token) = self.source_token(run, false, cancel).await?
+        {
+            return Ok(Some(token));
         }
         if run.installation_id == 0 {
             return Ok(None);
         }
         let mut tokens = self.workflow_tokens.lock().await;
-        if let Some(token) = tokens.get(permissions) {
-            return Ok(Some(token.clone()));
+        if let Some(token) = tokens.get(permissions)
+            && token.is_usable()
+        {
+            return Ok(Some(token.token.clone()));
+        } else if let Some(mut token) = tokens.remove(permissions) {
+            token.clear();
         }
         if tokens.len() >= MAX_WORKFLOW_TOKEN_SCOPES_PER_RUN {
             bail!(
@@ -174,9 +236,10 @@ impl RunRepositoryAccess {
             .client
             .request_workflow_token(run.id, &permissions.read, &permissions.write, cancel)
             .await?;
-        register_repository_token_masks(&self.workflow_commands, &token);
-        tokens.insert(permissions.clone(), token.clone());
-        Ok(Some(token))
+        register_repository_token_masks(&self.workflow_commands, &token.token);
+        let value = token.token.clone();
+        tokens.insert(permissions.clone(), token);
+        Ok(Some(value))
     }
 
     async fn clear(&self) {
@@ -298,6 +361,7 @@ impl Executor {
         validate_sha(&run.pull_request.base_sha)?;
         validate_sha(&run.pull_request.merge_sha)?;
         validate_execution_ref(&run)?;
+        validate_checkout_token_metadata(&run)?;
         let run_dir = self.config.work_root.join(run.id.to_string());
         let repository_dir = run_dir.join("repository");
         prepare_directory(&run_dir).await?;
@@ -362,7 +426,16 @@ impl Executor {
         let environment_variable_cache: EnvironmentVariableCache =
             Arc::new(Mutex::new(BTreeMap::new()));
         let execution: Result<ExecutionDisposition> = async {
-            checkout(&run, &repository_dir, &cancel, &outbound, &sequence).await?;
+            let source_token = repository_access.source_token(&run, false, &cancel).await?;
+            checkout(
+                &run,
+                source_token.as_deref(),
+                &repository_dir,
+                &cancel,
+                &outbound,
+                &sequence,
+            )
+            .await?;
             let plans = discover_workflows(
                 &repository_dir,
                 &run_dir,
@@ -487,7 +560,6 @@ impl Executor {
         };
         repository_access.clear().await;
         run.checkout_token.clear();
-        run.environment_token.clear();
 
         let execution = match execution {
             Ok(ExecutionDisposition::Completed {
@@ -562,6 +634,7 @@ impl Executor {
 
 async fn checkout(
     run: &RunSpec,
+    checkout_token: Option<&str>,
     repository_dir: &Path,
     cancel: &watch::Receiver<bool>,
     outbound: &mpsc::Sender<AgentMessage>,
@@ -608,7 +681,6 @@ async fn checkout(
     .await
     .context("configure repository remote")?;
 
-    let credential = STANDARD.encode(format!("x-access-token:{}", run.checkout_token));
     let mut fetch = Command::new("git");
     fetch
         .args([
@@ -621,7 +693,8 @@ async fn checkout(
         ])
         .env("GIT_TERMINAL_PROMPT", "0")
         .current_dir(repository_dir);
-    if !run.checkout_token.is_empty() {
+    if let Some(checkout_token) = checkout_token {
+        let credential = STANDARD.encode(format!("x-access-token:{checkout_token}"));
         fetch
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
@@ -726,7 +799,10 @@ async fn discover_workflows(
     let changed_paths = if needs_changed_paths {
         let paths = match &run.changed_paths {
             Some(paths) => paths.clone(),
-            None => fetch_pull_request_changed_paths(run, cancel).await?,
+            None => {
+                let source_token = repository_access.source_token(run, false, cancel).await?;
+                fetch_pull_request_changed_paths(run, source_token.as_deref(), cancel).await?
+            }
         };
         validate_changed_paths(&paths)?;
         Some(paths)
@@ -1023,6 +1099,7 @@ async fn environment_variables_for_job(
     run: &RunSpec,
     environment_name: &str,
     cache: &EnvironmentVariableCache,
+    repository_access: &RunRepositoryAccess,
     cancel: &watch::Receiver<bool>,
 ) -> Result<BTreeMap<String, String>> {
     let cache_key = environment_name.to_lowercase();
@@ -1030,18 +1107,31 @@ async fn environment_variables_for_job(
     if let Some(variables) = cache.get(&cache_key) {
         return Ok(variables.clone());
     }
-    if run.environment_token.is_empty() {
+    if run.installation_id == 0 {
         bail!(
-            "job references GitHub environment '{environment_name}', but no environment-read token was assigned"
+            "job references GitHub environment '{environment_name}', but no GitHub App installation is available"
         );
     }
+    let environment_token = repository_access
+        .request_token(
+            run.id,
+            RepositoryTokenPurpose::Environment,
+            &run.repository.owner,
+            &run.repository.name,
+            false,
+            cancel,
+        )
+        .await
+        .with_context(|| {
+            format!("issue environment-read token for GitHub environment '{environment_name}'")
+        })?;
     let variables = fetch_github_environment_variables_from(
         "https://api.github.com",
         &run.repository.owner,
         &run.repository.name,
         environment_name,
         &run.github_api_version,
-        &run.environment_token,
+        &environment_token,
         cancel,
     )
     .await?;
@@ -1251,6 +1341,7 @@ async fn github_api_get_json<T: DeserializeOwned>(
 
 async fn fetch_pull_request_changed_paths(
     run: &RunSpec,
+    token: Option<&str>,
     cancel: &watch::Receiver<bool>,
 ) -> Result<Vec<String>> {
     let mut endpoint = reqwest::Url::parse("https://api.github.com")?;
@@ -1282,8 +1373,8 @@ async fn fetch_pull_request_changed_paths(
             .get(endpoint.clone())
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", &run.github_api_version);
-        if !run.checkout_token.is_empty() {
-            request = request.bearer_auth(&run.checkout_token);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
         }
         let mut cancellation = cancel.clone();
         let response = tokio::select! {
@@ -3025,7 +3116,7 @@ async fn execute_job(
                 job_temp_directory.display()
             )
         })?;
-    let workflow_token = repository_access
+    let mut workflow_token = repository_access
         .workflow_token(run, &job.permissions, cancel)
         .await
         .with_context(|| {
@@ -3110,6 +3201,7 @@ async fn execute_job(
                 run,
                 environment_name,
                 environment_variable_cache,
+                repository_access,
                 cancel,
             )
             .await?;
@@ -3190,6 +3282,15 @@ async fn execute_job(
                 }
                 bail!("run cancelled");
             }
+            workflow_token = repository_access
+                .workflow_token(run, &job.permissions, cancel)
+                .await
+                .with_context(|| {
+                    format!(
+                        "refresh scoped workflow token for workflow '{workflow_name}' job '{}'",
+                        job.id
+                    )
+                })?;
             context = expression_context_with_variables(
                 run,
                 &runtime_variables,
@@ -3334,6 +3435,15 @@ async fn execute_job(
             });
         }
 
+        workflow_token = repository_access
+            .workflow_token(run, &job.permissions, cancel)
+            .await
+            .with_context(|| {
+                format!(
+                    "refresh scoped workflow token for workflow '{workflow_name}' job '{}' outputs",
+                    job.id
+                )
+            })?;
         let output_context = expression_context_with_variables(
             run,
             &runtime_variables,
@@ -5514,7 +5624,7 @@ async fn materialize_remote_repository_with_shared_access(
     let same_repository = owner.eq_ignore_ascii_case(&run.repository.owner)
         && repository.eq_ignore_ascii_case(&run.repository.name);
     let cached_token = if same_repository {
-        (!run.checkout_token.is_empty()).then(|| run.checkout_token.clone())
+        repository_access.source_token(run, false, cancel).await?
     } else {
         repository_access
             .cached_token(RepositoryTokenPurpose::SharedSource, owner, repository)
@@ -5537,24 +5647,34 @@ async fn materialize_remote_repository_with_shared_access(
     .await;
     let first_error = match first {
         Ok(checkout) => return Ok(checkout),
-        Err(error) if same_repository => return Err(error),
         Err(error) => error,
     };
-    let token = repository_access
-        .request_token(
-            run.id,
-            RepositoryTokenPurpose::SharedSource,
-            owner,
-            repository,
-            cached_token.is_some(),
-            cancel,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "fetch {owner}/{repository}@{git_ref} without usable shared-repository access: {first_error:#}"
+    let token = if same_repository {
+        repository_access
+            .source_token(run, true, cancel)
+            .await?
+            .with_context(|| {
+                format!(
+                    "fetch {owner}/{repository}@{git_ref} without usable source-repository access: {first_error:#}"
+                )
+            })?
+    } else {
+        repository_access
+            .request_token(
+                run.id,
+                RepositoryTokenPurpose::SharedSource,
+                owner,
+                repository,
+                cached_token.is_some(),
+                cancel,
             )
-        })?;
+            .await
+            .with_context(|| {
+                format!(
+                    "fetch {owner}/{repository}@{git_ref} without usable shared-repository access: {first_error:#}"
+                )
+            })?
+    };
     materialize_remote_repository(
         job_id,
         step_id,
@@ -7541,6 +7661,13 @@ fn validate_sha(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_checkout_token_metadata(run: &RunSpec) -> Result<()> {
+    if run.checkout_token.is_empty() != run.checkout_token_expires_at_epoch_seconds.is_none() {
+        bail!("checkout token and expiry must either both be present or absent");
+    }
+    Ok(())
+}
+
 fn validate_execution_ref(run: &RunSpec) -> Result<()> {
     let merge_ref = format!("refs/pull/{}/merge", run.pull_request.number);
     let base_ref = format!("refs/heads/{}", run.pull_request.base_ref);
@@ -7619,9 +7746,6 @@ fn secret_values(run: &RunSpec) -> Vec<String> {
         let credential = STANDARD.encode(format!("x-access-token:{}", run.checkout_token));
         values.push(credential.clone());
         values.push(format!("AUTHORIZATION: basic {credential}"));
-    }
-    if !run.environment_token.is_empty() {
-        values.push(run.environment_token.clone());
     }
     for (name, value) in &run.environment {
         let name = name.to_ascii_uppercase();
@@ -8969,6 +9093,7 @@ jobs:
             "https://github.com/local/fixture.git".to_owned(),
         );
         run.checkout_token = "source-repository-token".to_owned();
+        run.checkout_token_expires_at_epoch_seconds = Some(4_102_444_800);
         let repository = CheckoutRepository {
             owner: "public-fixture".to_owned(),
             name: "dependency".to_owned(),
@@ -9308,6 +9433,25 @@ jobs:
     }
 
     #[test]
+    fn requires_checkout_tokens_and_expiries_as_a_pair() {
+        let mut run = fixture_run(
+            Uuid::nil(),
+            "0".repeat(40),
+            "1".repeat(40),
+            "https://github.com/octocat/Hello-World.git".to_owned(),
+        );
+        assert!(validate_checkout_token_metadata(&run).is_ok());
+
+        run.checkout_token = "source-token".to_owned();
+        assert!(validate_checkout_token_metadata(&run).is_err());
+        run.checkout_token_expires_at_epoch_seconds = Some(4_102_444_800);
+        assert!(validate_checkout_token_metadata(&run).is_ok());
+
+        run.checkout_token.clear();
+        assert!(validate_checkout_token_metadata(&run).is_err());
+    }
+
+    #[test]
     fn checkout_filter_and_sparse_inputs_are_bounded_and_normalized() {
         assert_eq!(
             checkout_filter(Some(&" blob:none ".to_owned())).expect("filter"),
@@ -9347,14 +9491,13 @@ jobs:
             "https://github.com/octocat/Hello-World.git".to_owned(),
         );
         run.checkout_token = "checkout-token-value".to_owned();
-        run.environment_token = "environment-token-value".to_owned();
+        run.checkout_token_expires_at_epoch_seconds = Some(4_102_444_800);
         run.environment
             .insert("DEPLOY_SECRET".to_owned(), "environment-secret".to_owned());
         let secrets = secret_values(&run);
-        let mut log =
-            "checkout-token-value, environment-token-value, and environment-secret".to_owned();
+        let mut log = "checkout-token-value and environment-secret".to_owned();
         mask_text(&mut log, &secrets);
-        assert_eq!(log, "***, ***, and ***");
+        assert_eq!(log, "*** and ***");
     }
 
     #[test]
@@ -9383,6 +9526,8 @@ jobs:
         let (_cancel_tx, cancel) = watch::channel(false);
 
         for (purpose, granted_token) in [
+            (RepositoryTokenPurpose::Source, "source-token"),
+            (RepositoryTokenPurpose::Environment, "environment-token"),
             (RepositoryTokenPurpose::SharedSource, "shared-source-token"),
             (RepositoryTokenPurpose::Checkout, "private-checkout-token"),
         ] {
@@ -9407,7 +9552,7 @@ jobs:
                 message => panic!("unexpected event: {message:?}"),
             };
             client
-                .handle_granted(request_id, granted_token.to_owned())
+                .handle_granted(request_id, granted_token.to_owned(), 4_102_444_800)
                 .await;
             assert_eq!(
                 request.await.expect("join token request").expect("token"),
@@ -9415,6 +9560,20 @@ jobs:
             );
         }
 
+        assert_eq!(
+            access
+                .cached_token(RepositoryTokenPurpose::Source, "acme", "private-tools")
+                .await
+                .as_deref(),
+            Some("source-token")
+        );
+        assert_eq!(
+            access
+                .cached_token(RepositoryTokenPurpose::Environment, "acme", "private-tools",)
+                .await
+                .as_deref(),
+            Some("environment-token")
+        );
         assert_eq!(
             access
                 .cached_token(
@@ -9434,12 +9593,132 @@ jobs:
             Some("private-checkout-token")
         );
         assert!(events.try_recv().is_err());
-        let mut log = "shared-source-token private-checkout-token".to_owned();
+        let key = (
+            RepositoryTokenPurpose::SharedSource,
+            repository_access_key("acme", "private-tools"),
+        );
+        access
+            .tokens
+            .lock()
+            .await
+            .get_mut(&key)
+            .expect("cached shared-source token")
+            .expires_at_epoch_seconds = 1;
+        let refresh = {
+            let access = access.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                access
+                    .request_token(
+                        run_id,
+                        RepositoryTokenPurpose::SharedSource,
+                        "acme",
+                        "private-tools",
+                        false,
+                        &cancel,
+                    )
+                    .await
+            })
+        };
+        let refresh_request_id = match events.recv().await.expect("token refresh request") {
+            AgentMessage::RepositoryTokenRequest {
+                request_id,
+                purpose,
+                ..
+            } => {
+                assert_eq!(purpose, RepositoryTokenPurpose::SharedSource);
+                request_id
+            }
+            message => panic!("unexpected event: {message:?}"),
+        };
+        client
+            .handle_granted(
+                refresh_request_id,
+                "refreshed-shared-source-token".to_owned(),
+                4_102_444_800,
+            )
+            .await;
+        assert_eq!(
+            refresh
+                .await
+                .expect("join refresh")
+                .expect("refreshed token"),
+            "refreshed-shared-source-token"
+        );
+        let mut log =
+            "source-token environment-token refreshed-shared-source-token private-checkout-token"
+                .to_owned();
         commands
             .lock()
             .expect("workflow command processor was poisoned")
             .mask_for_step("0/job/step", &mut log);
-        assert_eq!(log, "*** ***");
+        assert_eq!(log, "*** *** *** ***");
+    }
+
+    #[tokio::test]
+    async fn refreshes_an_expiring_initial_source_token() {
+        let commands = Arc::new(StdMutex::new(WorkflowCommandProcessor::default()));
+        let (outbound, mut events) = mpsc::channel(4);
+        let client = RepositoryAccessClient::remote(outbound);
+        let access = RunRepositoryAccess::new(client.clone(), commands);
+        let mut run = fixture_run(
+            Uuid::new_v4(),
+            "0".repeat(40),
+            "1".repeat(40),
+            "https://github.com/acme/widget.git".to_owned(),
+        );
+        run.installation_id = 42;
+        run.repository.owner = "acme".to_owned();
+        run.repository.name = "widget".to_owned();
+        run.checkout_token = "initial-source-token".to_owned();
+        run.checkout_token_expires_at_epoch_seconds = Some(4_102_444_800);
+        let (_cancel_tx, cancel) = watch::channel(false);
+
+        assert_eq!(
+            access
+                .source_token(&run, false, &cancel)
+                .await
+                .expect("fresh source token"),
+            Some("initial-source-token".to_owned())
+        );
+        assert!(events.try_recv().is_err());
+
+        run.checkout_token_expires_at_epoch_seconds = Some(1);
+        let refresh = {
+            let access = access.clone();
+            let run = run.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { access.source_token(&run, false, &cancel).await })
+        };
+        let request_id = match events.recv().await.expect("source refresh request") {
+            AgentMessage::RepositoryTokenRequest {
+                request_id,
+                purpose,
+                owner,
+                repository,
+                ..
+            } => {
+                assert_eq!(purpose, RepositoryTokenPurpose::Source);
+                assert_eq!(owner, "acme");
+                assert_eq!(repository, "widget");
+                request_id
+            }
+            message => panic!("unexpected event: {message:?}"),
+        };
+        client
+            .handle_granted(
+                request_id,
+                "refreshed-source-token".to_owned(),
+                4_102_444_800,
+            )
+            .await;
+        assert_eq!(
+            refresh
+                .await
+                .expect("join source refresh")
+                .expect("refreshed source token"),
+            Some("refreshed-source-token".to_owned())
+        );
     }
 
     #[tokio::test]
@@ -9485,6 +9764,7 @@ jobs:
         run.repository.owner = "acme".to_owned();
         run.repository.name = "widget".to_owned();
         run.checkout_token = "source-repository-token".to_owned();
+        run.checkout_token_expires_at_epoch_seconds = Some(4_102_444_800);
         let repository = CheckoutRepository {
             owner: "ACME".to_owned(),
             name: "private-tools".to_owned(),
@@ -9563,7 +9843,11 @@ jobs:
             message => panic!("unexpected event: {message:?}"),
         };
         client
-            .handle_granted(request_id, "managed-private-token".to_owned())
+            .handle_granted(
+                request_id,
+                "managed-private-token".to_owned(),
+                4_102_444_800,
+            )
             .await;
         let (outputs, environment) = checkout.await.expect("join private checkout");
         let outputs = outputs.expect("managed private checkout");
@@ -9693,6 +9977,7 @@ jobs:
         );
         run.installation_id = 42;
         run.checkout_token = "baseline-checkout-token".to_owned();
+        run.checkout_token_expires_at_epoch_seconds = Some(4_102_444_800);
         let permissions = PlannedPermissions {
             read: BTreeSet::new(),
             write: BTreeSet::from(["checks".to_owned()]),
@@ -9721,7 +10006,7 @@ jobs:
             message => panic!("unexpected event: {message:?}"),
         };
         client
-            .handle_granted(request_id, "checks-read-token".to_owned())
+            .handle_granted(request_id, "checks-read-token".to_owned(), 4_102_444_800)
             .await;
         assert_eq!(
             request.await.expect("join token request").expect("token"),
@@ -9738,12 +10023,44 @@ jobs:
             events.try_recv().is_err(),
             "cached token minted more than once"
         );
-        let mut log = "checks-read-token".to_owned();
+        access
+            .workflow_tokens
+            .lock()
+            .await
+            .get_mut(&permissions)
+            .expect("cached workflow token")
+            .expires_at_epoch_seconds = 1;
+        let refresh = {
+            let access = access.clone();
+            let run = run.clone();
+            let permissions = permissions.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { access.workflow_token(&run, &permissions, &cancel).await })
+        };
+        let refresh_request_id = match events.recv().await.expect("workflow token refresh") {
+            AgentMessage::WorkflowTokenRequest { request_id, .. } => request_id,
+            message => panic!("unexpected event: {message:?}"),
+        };
+        client
+            .handle_granted(
+                refresh_request_id,
+                "refreshed-checks-read-token".to_owned(),
+                4_102_444_800,
+            )
+            .await;
+        assert_eq!(
+            refresh
+                .await
+                .expect("join workflow refresh")
+                .expect("refreshed workflow token"),
+            Some("refreshed-checks-read-token".to_owned())
+        );
+        let mut log = "checks-read-token refreshed-checks-read-token".to_owned();
         commands
             .lock()
             .expect("workflow command processor was poisoned")
             .mask_all(&mut log);
-        assert_eq!(log, "***");
+        assert_eq!(log, "*** ***");
     }
 
     #[test]
@@ -10746,6 +11063,7 @@ jobs:
             "https://github.com/octocat/Hello-World.git".to_owned(),
         );
         run.checkout_token = "repository-installation-token".to_owned();
+        run.checkout_token_expires_at_epoch_seconds = Some(4_102_444_800);
         let completed = BTreeMap::new();
         let outputs = BTreeMap::new();
         let environment = BTreeMap::new();
@@ -12030,7 +12348,7 @@ jobs:
         run.pull_request.number = 1;
 
         let (_cancel_tx, cancel) = watch::channel(false);
-        let paths = fetch_pull_request_changed_paths(&run, &cancel)
+        let paths = fetch_pull_request_changed_paths(&run, None, &cancel)
             .await
             .expect("list public pull request files");
 
@@ -12832,6 +13150,7 @@ jobs:
         );
         let workflow_token = "fixture-github-token-value";
         run.checkout_token = workflow_token.to_owned();
+        run.checkout_token_expires_at_epoch_seconds = Some(4_102_444_800);
         run.changed_paths = Some(vec![".github/workflows/ci.yml".to_owned()]);
         run.variables = BTreeMap::from([
             ("ENABLED".to_owned(), "true".to_owned()),
@@ -13218,6 +13537,7 @@ jobs:
             format!("file://{}", remote.display()),
         );
         run.checkout_token = "fixture-built-in-token".to_owned();
+        run.checkout_token_expires_at_epoch_seconds = Some(4_102_444_800);
 
         let execution = executor.execute(run, cancel_rx, outbound);
         tokio::pin!(execution);
@@ -13855,7 +14175,7 @@ jobs:
             check_run_id: None,
             event: JsonValue::Object(Default::default()),
             checkout_token: String::new(),
-            environment_token: String::new(),
+            checkout_token_expires_at_epoch_seconds: None,
             github_api_version: "2026-03-10".to_owned(),
             changed_paths: None,
             environment: BTreeMap::new(),

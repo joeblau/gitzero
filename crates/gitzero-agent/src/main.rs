@@ -332,17 +332,25 @@ async fn handle_server_message(
         ServerMessage::ConcurrencyCancelled { request_id, reason } => {
             concurrency.handle_cancelled(request_id, reason).await;
         }
-        ServerMessage::RepositoryTokenGranted { request_id, token } => {
+        ServerMessage::RepositoryTokenGranted {
+            request_id,
+            token,
+            expires_at_epoch_seconds,
+        } => {
             repository_access
-                .handle_granted(request_id, token.into_inner())
+                .handle_granted(request_id, token.into_inner(), expires_at_epoch_seconds)
                 .await;
         }
         ServerMessage::RepositoryTokenDenied { request_id, reason } => {
             repository_access.handle_denied(request_id, reason).await;
         }
-        ServerMessage::WorkflowTokenGranted { request_id, token } => {
+        ServerMessage::WorkflowTokenGranted {
+            request_id,
+            token,
+            expires_at_epoch_seconds,
+        } => {
             repository_access
-                .handle_granted(request_id, token.into_inner())
+                .handle_granted(request_id, token.into_inner(), expires_at_epoch_seconds)
                 .await;
         }
         ServerMessage::WorkflowTokenDenied { request_id, reason } => {

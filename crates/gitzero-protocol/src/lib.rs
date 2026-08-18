@@ -3,7 +3,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 pub const MAX_RUNNER_LABELS: usize = 32;
 pub const MAX_RUNNER_REQUIREMENTS: usize = 512;
 pub const MAX_RUNNER_SELECTOR_BYTES: usize = 256;
@@ -94,7 +94,7 @@ pub struct RunSpec {
     pub event: JsonValue,
     pub checkout_token: String,
     #[serde(default)]
-    pub environment_token: String,
+    pub checkout_token_expires_at_epoch_seconds: Option<u64>,
     #[serde(default = "default_github_api_version")]
     pub github_api_version: String,
     #[serde(default)]
@@ -121,7 +121,10 @@ impl std::fmt::Debug for RunSpec {
                 &self.event.get("action").and_then(JsonValue::as_str),
             )
             .field("checkout_token", &"[REDACTED]")
-            .field("environment_token", &"[REDACTED]")
+            .field(
+                "checkout_token_expires_at_epoch_seconds",
+                &self.checkout_token_expires_at_epoch_seconds,
+            )
             .field("github_api_version", &self.github_api_version)
             .field(
                 "changed_path_count",
@@ -157,6 +160,7 @@ pub enum ServerMessage {
     RepositoryTokenGranted {
         request_id: Uuid,
         token: RepositoryToken,
+        expires_at_epoch_seconds: u64,
     },
     RepositoryTokenDenied {
         request_id: Uuid,
@@ -165,6 +169,7 @@ pub enum ServerMessage {
     WorkflowTokenGranted {
         request_id: Uuid,
         token: RepositoryToken,
+        expires_at_epoch_seconds: u64,
     },
     WorkflowTokenDenied {
         request_id: Uuid,
@@ -261,6 +266,8 @@ pub enum AgentMessage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepositoryTokenPurpose {
+    Source,
+    Environment,
     SharedSource,
     Checkout,
 }
@@ -321,7 +328,6 @@ mod tests {
         let rendered = format!("{spec:?}");
         assert!(rendered.contains("[REDACTED]"));
         assert!(!rendered.contains("secret-token"));
-        assert!(!rendered.contains("environment-secret-token"));
         assert!(!rendered.contains("configured-variable-value"));
     }
 
@@ -401,6 +407,7 @@ mod tests {
         let granted = ServerMessage::RepositoryTokenGranted {
             request_id,
             token: "target-secret-token".to_owned().into(),
+            expires_at_epoch_seconds: 4_102_444_800,
         };
         let json = serde_json::to_string(&granted).expect("serialize token response");
         assert!(json.contains(r#""token":"target-secret-token""#));
@@ -422,6 +429,19 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AgentMessage>(&json).expect("deserialize workflow token"),
             workflow_request
+        );
+
+        let workflow_granted = ServerMessage::WorkflowTokenGranted {
+            request_id,
+            token: "workflow-secret-token".to_owned().into(),
+            expires_at_epoch_seconds: 4_102_444_800,
+        };
+        let json = serde_json::to_string(&workflow_granted).expect("serialize workflow grant");
+        assert!(json.contains(r#""expires_at_epoch_seconds":4102444800"#));
+        assert!(!format!("{workflow_granted:?}").contains("workflow-secret-token"));
+        assert_eq!(
+            serde_json::from_str::<ServerMessage>(&json).expect("deserialize workflow grant"),
+            workflow_granted
         );
 
         let annotated = AgentMessage::JobFinished {
@@ -453,10 +473,10 @@ mod tests {
         let mut value = serde_json::to_value(fixture_run()).expect("serialize");
         let object = value.as_object_mut().expect("run object");
         object.remove("variables");
-        object.remove("environment_token");
+        object.remove("checkout_token_expires_at_epoch_seconds");
         let decoded: RunSpec = serde_json::from_value(value).expect("deserialize");
         assert!(decoded.variables.is_empty());
-        assert!(decoded.environment_token.is_empty());
+        assert!(decoded.checkout_token_expires_at_epoch_seconds.is_none());
     }
 
     fn fixture_run() -> RunSpec {
@@ -486,7 +506,7 @@ mod tests {
                 "sender": {"id": 1, "login": "octocat"}
             }),
             checkout_token: "secret-token".into(),
-            environment_token: "environment-secret-token".into(),
+            checkout_token_expires_at_epoch_seconds: Some(4_102_444_800),
             github_api_version: default_github_api_version(),
             changed_paths: None,
             environment: BTreeMap::new(),

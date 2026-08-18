@@ -82,6 +82,11 @@ const pullRequestMergeSchema = z.object({
     .nullable(),
 });
 
+const installationAccessTokenSchema = z.object({
+  token: z.string().min(1),
+  expires_at: z.iso.datetime({ offset: true }),
+});
+
 type ActionsVariable = z.infer<
   typeof actionsVariablePageSchema
 >["variables"][number];
@@ -106,6 +111,11 @@ export type PullRequestMergeSnapshot =
       current_head_sha: string;
       current_base_sha: string;
     };
+
+export interface InstallationAccessToken {
+  token: string;
+  expiresAtEpochSeconds: number;
+}
 
 export async function validateGitHubAppCredentials(
   env: GitHubEnvironment,
@@ -311,23 +321,26 @@ function githubCheckAnnotation(annotation: CheckAnnotation): object {
   };
 }
 
-export async function createAgentTokens(
+export async function createAgentToken(
   env: GitHubEnvironment,
   installationId: number,
   repository: string,
-): Promise<{ checkoutToken: string; environmentToken: string }> {
-  const appJwt = await createAppJwt(env);
-  const [checkoutToken, environmentToken] = await Promise.all([
-    createInstallationTokenWithJwt(env, appJwt, installationId, repository, {
-      contents: "read",
-      pull_requests: "read",
-    }),
-    createInstallationTokenWithJwt(env, appJwt, installationId, repository, {
-      actions: "read",
-      environments: "read",
-    }),
-  ]);
-  return { checkoutToken, environmentToken };
+): Promise<InstallationAccessToken> {
+  return createInstallationAccessToken(env, installationId, repository, {
+    contents: "read",
+    pull_requests: "read",
+  });
+}
+
+export async function createEnvironmentToken(
+  env: GitHubEnvironment,
+  installationId: number,
+  repository: string,
+): Promise<InstallationAccessToken> {
+  return createInstallationAccessToken(env, installationId, repository, {
+    actions: "read",
+    environments: "read",
+  });
 }
 
 export async function createWorkflowToken(
@@ -336,7 +349,7 @@ export async function createWorkflowToken(
   repository: string,
   readPermissions: readonly string[],
   writePermissions: readonly string[],
-): Promise<string> {
+): Promise<InstallationAccessToken> {
   const combined = [...readPermissions, ...writePermissions];
   if (
     combined.length === 0 ||
@@ -353,7 +366,7 @@ export async function createWorkflowToken(
       "workflow token permissions must be a nonempty disjoint set of supported read/write scopes",
     );
   }
-  return createInstallationToken(
+  return createInstallationAccessToken(
     env,
     installationId,
     repository,
@@ -376,7 +389,7 @@ export async function createSharedRepositoryToken(
   callerOwnerType: string,
   targetOwner: string,
   targetRepository: string,
-): Promise<string> {
+): Promise<InstallationAccessToken> {
   validateCrossRepositoryTarget(
     callerOwner,
     callerRepository,
@@ -415,7 +428,7 @@ export async function createSharedRepositoryToken(
       `target repository Actions access policy '${access.access_level}' does not allow this caller`,
     );
   }
-  return createInstallationTokenWithJwt(
+  return createInstallationAccessTokenWithJwt(
     env,
     appJwt,
     installationId,
@@ -431,14 +444,14 @@ export async function createPrivateCheckoutToken(
   callerRepository: string,
   targetOwner: string,
   targetRepository: string,
-): Promise<string> {
+): Promise<InstallationAccessToken> {
   validateCrossRepositoryTarget(
     callerOwner,
     callerRepository,
     targetOwner,
     targetRepository,
   );
-  return createInstallationToken(env, installationId, targetRepository, {
+  return createInstallationAccessToken(env, installationId, targetRepository, {
     contents: "read",
   });
 }
@@ -638,11 +651,27 @@ async function createInstallationToken(
   repository: string,
   permissions: Record<string, "read" | "write">,
 ): Promise<string> {
+  return (
+    await createInstallationAccessToken(
+      env,
+      installationId,
+      repository,
+      permissions,
+    )
+  ).token;
+}
+
+async function createInstallationAccessToken(
+  env: GitHubEnvironment,
+  installationId: number,
+  repository: string,
+  permissions: Record<string, "read" | "write">,
+): Promise<InstallationAccessToken> {
   if (!Number.isSafeInteger(installationId) || installationId <= 0) {
     throw new Error("a positive GitHub App installation ID is required");
   }
   const appJwt = await createAppJwt(env);
-  return createInstallationTokenWithJwt(
+  return createInstallationAccessTokenWithJwt(
     env,
     appJwt,
     installationId,
@@ -658,22 +687,51 @@ async function createInstallationTokenWithJwt(
   repository: string,
   permissions: Record<string, "read" | "write">,
 ): Promise<string> {
+  return (
+    await createInstallationAccessTokenWithJwt(
+      env,
+      appJwt,
+      installationId,
+      repository,
+      permissions,
+    )
+  ).token;
+}
+
+async function createInstallationAccessTokenWithJwt(
+  env: GitHubApiEnvironment,
+  appJwt: string,
+  installationId: number,
+  repository: string,
+  permissions: Record<string, "read" | "write">,
+): Promise<InstallationAccessToken> {
   if (!Number.isSafeInteger(installationId) || installationId <= 0) {
     throw new Error("a positive GitHub App installation ID is required");
   }
-  const response = await githubRequest<{ token: string }>(
-    env,
-    appJwt,
-    `/app/installations/${installationId}/access_tokens`,
-    {
-      method: "POST",
-      body: JSON.stringify({
-        repositories: [repository],
-        permissions,
-      }),
-    },
+  const response = installationAccessTokenSchema.parse(
+    await githubRequest(
+      env,
+      appJwt,
+      `/app/installations/${installationId}/access_tokens`,
+      {
+        method: "POST",
+        body: JSON.stringify({
+          repositories: [repository],
+          permissions,
+        }),
+      },
+    ),
   );
-  return response.token;
+  const expiresAtEpochSeconds = Math.floor(
+    Date.parse(response.expires_at) / 1_000,
+  );
+  if (
+    !Number.isSafeInteger(expiresAtEpochSeconds) ||
+    expiresAtEpochSeconds <= 0
+  ) {
+    throw new Error("GitHub returned an invalid installation token expiry");
+  }
+  return { token: response.token, expiresAtEpochSeconds };
 }
 
 async function createAppJwt(env: GitHubEnvironment): Promise<string> {

@@ -1,8 +1,10 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 11;
+export const PROTOCOL_VERSION = 12;
 
 export const repositoryTokenPurposeSchema = z.enum([
+  "source",
+  "environment",
   "shared_source",
   "checkout",
 ]);
@@ -77,6 +79,11 @@ const workflowTokenRequestSchema = z
 
 const uuid = z.string().uuid();
 const sha = z.string().regex(/^[0-9a-fA-F]{40}$/);
+const tokenExpiryEpochSeconds = z
+  .number()
+  .int()
+  .positive()
+  .max(Number.MAX_SAFE_INTEGER);
 const gitExecutionRef = z
   .string()
   .min(1)
@@ -161,9 +168,24 @@ export const runSpecSchema = queuedJobSchema
     }),
     check_run_id: z.number().int().positive().nullable().optional(),
     checkout_token: z.string(),
-    environment_token: z.string().default(""),
+    checkout_token_expires_at_epoch_seconds: tokenExpiryEpochSeconds
+      .nullable()
+      .default(null),
     github_api_version: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
     changed_paths: z.array(z.string().min(1).max(4_096)).max(3_000).optional(),
+  })
+  .superRefine((run, context) => {
+    if (
+      (run.checkout_token.length === 0) !==
+      (run.checkout_token_expires_at_epoch_seconds === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["checkout_token_expires_at_epoch_seconds"],
+        message:
+          "checkout token and expiry must either both be present or absent",
+      });
+    }
   });
 
 export type RunSpec = z.infer<typeof runSpecSchema>;
@@ -381,9 +403,19 @@ export type ServerMessage =
   | { type: "cancel_job"; job_id: string; reason: string }
   | { type: "concurrency_granted"; request_id: string }
   | { type: "concurrency_cancelled"; request_id: string; reason: string }
-  | { type: "repository_token_granted"; request_id: string; token: string }
+  | {
+      type: "repository_token_granted";
+      request_id: string;
+      token: string;
+      expires_at_epoch_seconds: number;
+    }
   | { type: "repository_token_denied"; request_id: string; reason: string }
-  | { type: "workflow_token_granted"; request_id: string; token: string }
+  | {
+      type: "workflow_token_granted";
+      request_id: string;
+      token: string;
+      expires_at_epoch_seconds: number;
+    }
   | { type: "workflow_token_denied"; request_id: string; reason: string }
   | { type: "ack"; message_id: string }
   | { type: "error"; code: string; message: string };

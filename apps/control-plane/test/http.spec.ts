@@ -1,6 +1,15 @@
 import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+const INSTALLATION_TOKEN_EXPIRY = "2100-01-01T00:00:00Z";
+
+function installationToken(token: string): {
+  token: string;
+  expires_at: string;
+} {
+  return { token, expires_at: INSTALLATION_TOKEN_EXPIRY };
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -93,12 +102,13 @@ describe("HTTP entrypoint", () => {
             firstToken = false;
             await tokenGate;
           }
-          return Response.json({
-            token:
+          return Response.json(
+            installationToken(
               permissions.checks === "write"
                 ? "check-token"
                 : "variables-token",
-          });
+            ),
+          );
         }
         if (url.pathname.endsWith("/actions/variables")) {
           return Response.json({ total_count: 0, variables: [] });
@@ -286,14 +296,15 @@ describe("HTTP entrypoint", () => {
         if (url.pathname.endsWith("/access_tokens")) {
           const permissions = JSON.parse(String(init?.body))
             .permissions as Record<string, string>;
-          return Response.json({
-            token:
+          return Response.json(
+            installationToken(
               permissions.administration === "write"
                 ? "onboarding-token"
                 : permissions.administration === "read"
                   ? "readiness-token"
                   : "check-token",
-          });
+            ),
+          );
         }
         if (
           method === "POST" &&
@@ -353,7 +364,7 @@ describe("HTTP entrypoint", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 11,
+          protocol_version: 12,
           agent_id: "readiness-mini",
           name: "readiness-mini",
           version: "0.1.0",

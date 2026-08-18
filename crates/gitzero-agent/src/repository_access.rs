@@ -3,6 +3,7 @@ use gitzero_protocol::{AgentMessage, RepositoryTokenPurpose};
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -12,9 +13,38 @@ pub(crate) struct RepositoryAccessClient {
     remote: Option<Arc<RemoteRepositoryAccessClient>>,
 }
 
+const TOKEN_REFRESH_SAFETY_SECONDS: u64 = 5 * 60;
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ExpiringToken {
+    pub(crate) token: String,
+    pub(crate) expires_at_epoch_seconds: u64,
+}
+
+impl ExpiringToken {
+    pub(crate) fn is_usable(&self) -> bool {
+        self.expires_at_epoch_seconds
+            > current_epoch_seconds().saturating_add(TOKEN_REFRESH_SAFETY_SECONDS)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.token.clear();
+    }
+}
+
+impl std::fmt::Debug for ExpiringToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExpiringToken")
+            .field("token", &"[REDACTED]")
+            .field("expires_at_epoch_seconds", &self.expires_at_epoch_seconds)
+            .finish()
+    }
+}
+
 struct RemoteRepositoryAccessClient {
     outbound: mpsc::Sender<AgentMessage>,
-    requests: Mutex<HashMap<Uuid, oneshot::Sender<std::result::Result<String, String>>>>,
+    requests: Mutex<HashMap<Uuid, oneshot::Sender<std::result::Result<ExpiringToken, String>>>>,
 }
 
 impl RepositoryAccessClient {
@@ -39,7 +69,7 @@ impl RepositoryAccessClient {
         owner: &str,
         repository: &str,
         cancel: &watch::Receiver<bool>,
-    ) -> Result<String> {
+    ) -> Result<ExpiringToken> {
         let request_id = Uuid::new_v4();
         self.request(
             request_id,
@@ -52,6 +82,8 @@ impl RepositoryAccessClient {
                 repository: repository.to_owned(),
             },
             match purpose {
+                RepositoryTokenPurpose::Source => "source repository access",
+                RepositoryTokenPurpose::Environment => "environment metadata access",
                 RepositoryTokenPurpose::SharedSource => "private shared repository access",
                 RepositoryTokenPurpose::Checkout => "private checkout repository access",
             },
@@ -66,7 +98,7 @@ impl RepositoryAccessClient {
         read_permissions: &BTreeSet<String>,
         write_permissions: &BTreeSet<String>,
         cancel: &watch::Receiver<bool>,
-    ) -> Result<String> {
+    ) -> Result<ExpiringToken> {
         if read_permissions.is_empty() && write_permissions.is_empty() {
             bail!("workflow token request must contain at least one permission");
         }
@@ -92,7 +124,7 @@ impl RepositoryAccessClient {
         message: AgentMessage,
         operation: &str,
         cancel: &watch::Receiver<bool>,
-    ) -> Result<String> {
+    ) -> Result<ExpiringToken> {
         let Some(remote) = &self.remote else {
             bail!("{operation} requires the connected control plane");
         };
@@ -119,8 +151,13 @@ impl RepositoryAccessClient {
             }
         };
         match response {
-            Ok(Ok(token)) if !token.is_empty() => Ok(token),
-            Ok(Ok(_)) => bail!("control plane returned an empty token for {operation}"),
+            Ok(Ok(token)) if token.token.is_empty() => {
+                bail!("control plane returned an empty token for {operation}")
+            }
+            Ok(Ok(token)) if !token.is_usable() => {
+                bail!("control plane returned a token that expires too soon for {operation}")
+            }
+            Ok(Ok(token)) => Ok(token),
             Ok(Err(reason)) => bail!("{reason}"),
             Err(_) => {
                 remote.requests.lock().await.remove(&request_id);
@@ -129,12 +166,20 @@ impl RepositoryAccessClient {
         }
     }
 
-    pub(crate) async fn handle_granted(&self, request_id: Uuid, token: String) {
+    pub(crate) async fn handle_granted(
+        &self,
+        request_id: Uuid,
+        token: String,
+        expires_at_epoch_seconds: u64,
+    ) {
         let Some(remote) = &self.remote else {
             return;
         };
         if let Some(request) = remote.requests.lock().await.remove(&request_id) {
-            let _ = request.send(Ok(token));
+            let _ = request.send(Ok(ExpiringToken {
+                token,
+                expires_at_epoch_seconds,
+            }));
         }
     }
 
@@ -162,6 +207,12 @@ impl RepositoryAccessClient {
             let _ = request.send(Err("Control plane connection closed.".to_owned()));
         }
     }
+}
+
+fn current_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 #[cfg(test)]
@@ -206,11 +257,18 @@ mod tests {
             message => panic!("unexpected event: {message:?}"),
         };
         client
-            .handle_granted(request_id, "scoped-installation-token".to_owned())
+            .handle_granted(
+                request_id,
+                "scoped-installation-token".to_owned(),
+                4_102_444_800,
+            )
             .await;
         assert_eq!(
             request.await.expect("join request").expect("token"),
-            "scoped-installation-token"
+            ExpiringToken {
+                token: "scoped-installation-token".to_owned(),
+                expires_at_epoch_seconds: 4_102_444_800,
+            }
         );
     }
 
@@ -256,6 +314,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_tokens_that_expire_too_soon_are_rejected() {
+        let (outbound, mut events) = mpsc::channel(4);
+        let client = RepositoryAccessClient::remote(outbound);
+        let run_id = Uuid::new_v4();
+        let (_, cancel) = watch::channel(false);
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .request_token(
+                        run_id,
+                        RepositoryTokenPurpose::Source,
+                        "owner",
+                        "repository",
+                        &cancel,
+                    )
+                    .await
+            })
+        };
+        let request_id = match events.recv().await.expect("token request") {
+            AgentMessage::RepositoryTokenRequest { request_id, .. } => request_id,
+            message => panic!("unexpected event: {message:?}"),
+        };
+        client
+            .handle_granted(request_id, "nearly-expired-token".to_owned(), 1)
+            .await;
+        let error = request
+            .await
+            .expect("join request")
+            .expect_err("near-expiry token should fail closed");
+        assert!(error.to_string().contains("expires too soon"));
+    }
+
+    #[tokio::test]
     async fn remote_workflow_requests_preserve_exact_read_and_write_scopes() {
         let (outbound, mut events) = mpsc::channel(4);
         let client = RepositoryAccessClient::remote(outbound);
@@ -289,14 +381,21 @@ mod tests {
             message => panic!("unexpected event: {message:?}"),
         };
         client
-            .handle_granted(request_id, "read-scoped-workflow-token".to_owned())
+            .handle_granted(
+                request_id,
+                "read-scoped-workflow-token".to_owned(),
+                4_102_444_800,
+            )
             .await;
         assert_eq!(
             request
                 .await
                 .expect("join request")
                 .expect("workflow token"),
-            "read-scoped-workflow-token"
+            ExpiringToken {
+                token: "read-scoped-workflow-token".to_owned(),
+                expires_at_epoch_seconds: 4_102_444_800,
+            }
         );
     }
 }

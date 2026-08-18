@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  createAgentTokens,
+  createAgentToken,
   createCheckRun,
+  createEnvironmentToken,
   createPrivateCheckoutToken,
   createSharedRepositoryToken,
   createWorkflowToken,
@@ -15,13 +16,22 @@ import {
 import type { CheckAnnotation, QueuedJob } from "../src/protocol";
 
 const githubEnvironment = { GITHUB_API_VERSION: "2026-03-10" } as const;
+const INSTALLATION_TOKEN_EXPIRY = "2100-01-01T00:00:00Z";
+const INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS = 4_102_444_800;
+
+function installationToken(token: string): {
+  token: string;
+  expires_at: string;
+} {
+  return { token, expires_at: INSTALLATION_TOKEN_EXPIRY };
+}
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe("GitHub Actions variables", () => {
-  it("mints separate workflow and environment tokens from one app authorization", async () => {
+  it("mints separately scoped source and environment tokens with authoritative expiry", async () => {
     const privateKey = await testPrivateKeyPem("pkcs1");
     const requests: Array<{ url: URL; init?: RequestInit }> = [];
     vi.stubGlobal(
@@ -30,29 +40,47 @@ describe("GitHub Actions variables", () => {
         requests.push({ url: new URL(String(input)), init });
         const permissions = JSON.parse(String(init?.body))
           .permissions as Record<string, string>;
-        return Response.json({
-          token:
+        return Response.json(
+          installationToken(
             permissions.environments === "read"
               ? "environment-token"
               : "checkout-token",
-        });
+          ),
+        );
       }),
     );
 
     await expect(
-      createAgentTokens(
-        {
-          GITHUB_API_VERSION: "2026-03-10",
-          GITHUB_APP_ID: "1234",
-          GITHUB_APP_PRIVATE_KEY: privateKey,
-        },
-        7001,
-        "hello-world",
-      ),
-    ).resolves.toEqual({
-      checkoutToken: "checkout-token",
-      environmentToken: "environment-token",
-    });
+      Promise.all([
+        createAgentToken(
+          {
+            GITHUB_API_VERSION: "2026-03-10",
+            GITHUB_APP_ID: "1234",
+            GITHUB_APP_PRIVATE_KEY: privateKey,
+          },
+          7001,
+          "hello-world",
+        ),
+        createEnvironmentToken(
+          {
+            GITHUB_API_VERSION: "2026-03-10",
+            GITHUB_APP_ID: "1234",
+            GITHUB_APP_PRIVATE_KEY: privateKey,
+          },
+          7001,
+          "hello-world",
+        ),
+      ]),
+    ).resolves.toEqual([
+      {
+        token: "checkout-token",
+        expiresAtEpochSeconds: INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS,
+      },
+      {
+        token: "environment-token",
+        expiresAtEpochSeconds: INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS,
+      },
+    ]);
 
     expect(requests).toHaveLength(2);
     expect(
@@ -72,8 +100,31 @@ describe("GitHub Actions variables", () => {
     const authorizations = requests.map((request) =>
       new Headers(request.init?.headers).get("Authorization"),
     );
-    expect(authorizations[0]).toBe(authorizations[1]);
     expect(authorizations[0]).toMatch(/^Bearer eyJ/);
+    expect(authorizations[1]).toMatch(/^Bearer eyJ/);
+  });
+
+  it("rejects installation credentials without a valid authoritative expiry", async () => {
+    const privateKey = await testPrivateKeyPem();
+    let response: unknown = { token: "missing-expiry" };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Response.json(response)),
+    );
+    const create = () =>
+      createAgentToken(
+        {
+          GITHUB_API_VERSION: "2026-03-10",
+          GITHUB_APP_ID: "1234",
+          GITHUB_APP_PRIVATE_KEY: privateKey,
+        },
+        7001,
+        "hello-world",
+      );
+
+    await expect(create()).rejects.toThrow();
+    response = { token: "malformed-expiry", expires_at: "not-a-date" };
+    await expect(create()).rejects.toThrow();
   });
 
   it("mints a separate repository-scoped Variables read token", async () => {
@@ -85,7 +136,7 @@ describe("GitHub Actions variables", () => {
         const url = new URL(String(input));
         requests.push({ url, init });
         if (url.pathname.endsWith("/access_tokens")) {
-          return Response.json({ token: "variables-token" });
+          return Response.json(installationToken("variables-token"));
         }
         return Response.json({ total_count: 0, variables: [] });
       }),
@@ -237,7 +288,7 @@ describe("pull request merge snapshots", () => {
         const url = new URL(String(input));
         requests.push({ url, init });
         if (url.pathname.endsWith("/access_tokens")) {
-          return Response.json({ token: "pull-request-token" });
+          return Response.json(installationToken("pull-request-token"));
         }
         return Response.json({
           head: { sha: "A".repeat(40) },
@@ -290,7 +341,7 @@ describe("pull request merge snapshots", () => {
       "fetch",
       vi.fn(async (input: RequestInfo | URL) =>
         new URL(String(input)).pathname.endsWith("/access_tokens")
-          ? Response.json({ token: "pull-request-token" })
+          ? Response.json(installationToken("pull-request-token"))
           : Response.json(response),
       ),
     );
@@ -345,7 +396,7 @@ describe("GitHub production API contracts", () => {
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         requests.push({ url: new URL(String(input)), init });
-        return Response.json({ token: "exact-scoped-token" });
+        return Response.json(installationToken("exact-scoped-token"));
       }),
     );
 
@@ -361,7 +412,10 @@ describe("GitHub production API contracts", () => {
         ["artifact-metadata", "security-events"],
         ["pull-requests"],
       ),
-    ).resolves.toBe("exact-scoped-token");
+    ).resolves.toEqual({
+      token: "exact-scoped-token",
+      expiresAtEpochSeconds: INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS,
+    });
     expect(requests).toHaveLength(1);
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
       repositories: ["widget"],
@@ -399,12 +453,13 @@ describe("GitHub production API contracts", () => {
         if (url.pathname.endsWith("/access_tokens")) {
           const permissions = JSON.parse(String(init?.body))
             .permissions as Record<string, string>;
-          return Response.json({
-            token:
+          return Response.json(
+            installationToken(
               permissions.administration === "read"
                 ? "policy-token"
                 : "shared-contents-token",
-          });
+            ),
+          );
         }
         expect(url.pathname).toBe(
           "/repos/ACME/shared-actions/actions/permissions/access",
@@ -430,7 +485,10 @@ describe("GitHub production API contracts", () => {
         "ACME",
         "shared-actions",
       ),
-    ).resolves.toBe("shared-contents-token");
+    ).resolves.toEqual({
+      token: "shared-contents-token",
+      expiresAtEpochSeconds: INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS,
+    });
 
     expect(requests).toHaveLength(3);
     expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
@@ -456,7 +514,7 @@ describe("GitHub production API contracts", () => {
         const url = new URL(String(input));
         requests.push({ url, init });
         return url.pathname.endsWith("/access_tokens")
-          ? Response.json({ token: "policy-token" })
+          ? Response.json(installationToken("policy-token"))
           : Response.json({ access_level: "none" });
       }),
     );
@@ -486,7 +544,7 @@ describe("GitHub production API contracts", () => {
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         requests.push({ url: new URL(String(input)), init });
-        return Response.json({ token: "private-checkout-token" });
+        return Response.json(installationToken("private-checkout-token"));
       }),
     );
 
@@ -503,7 +561,10 @@ describe("GitHub production API contracts", () => {
         "ACME",
         "private-dependency",
       ),
-    ).resolves.toBe("private-checkout-token");
+    ).resolves.toEqual({
+      token: "private-checkout-token",
+      expiresAtEpochSeconds: INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS,
+    });
 
     expect(requests).toHaveLength(1);
     expect(requests[0]?.url.pathname).toBe(
@@ -578,7 +639,7 @@ describe("GitHub production API contracts", () => {
         const url = new URL(String(input));
         requests.push({ url, init });
         if (url.pathname.endsWith("/access_tokens")) {
-          return Response.json({ token: "readiness-token" });
+          return Response.json(installationToken("readiness-token"));
         }
         return Response.json({
           enabled: true,
@@ -642,7 +703,7 @@ describe("GitHub production API contracts", () => {
         const url = new URL(String(input));
         requests.push({ url, init });
         if (url.pathname.endsWith("/access_tokens")) {
-          return Response.json({ token: "readiness-token" });
+          return Response.json(installationToken("readiness-token"));
         }
         if (url.pathname.endsWith("/actions/permissions")) {
           return Response.json({ enabled: true, allowed_actions: "all" });
@@ -707,7 +768,7 @@ describe("GitHub production API contracts", () => {
         const url = new URL(String(input));
         requests.push({ url, init });
         if (url.pathname.endsWith("/access_tokens")) {
-          return Response.json({ token: "onboarding-token" });
+          return Response.json(installationToken("onboarding-token"));
         }
         if (init?.method === "PUT") {
           return new Response(null, { status: 204 });
@@ -765,7 +826,7 @@ describe("GitHub production API contracts", () => {
         const url = new URL(String(input));
         requests.push({ url, init });
         return url.pathname.endsWith("/access_tokens")
-          ? Response.json({ token: "check-token" })
+          ? Response.json(installationToken("check-token"))
           : Response.json({ id: 44 }, { status: 201 });
       }),
     );
@@ -825,7 +886,7 @@ describe("GitHub production API contracts", () => {
         const url = new URL(String(input));
         requests.push({ url, init });
         if (url.pathname.endsWith("/access_tokens")) {
-          return Response.json({ token: "check-token" });
+          return Response.json(installationToken("check-token"));
         }
         if (url.pathname.endsWith("/annotations")) {
           return Response.json(existing);
@@ -898,7 +959,7 @@ describe("GitHub production API contracts", () => {
         const url = new URL(String(input));
         requests.push({ url, init });
         if (url.pathname.endsWith("/access_tokens")) {
-          return Response.json({ token: "check-token" });
+          return Response.json(installationToken("check-token"));
         }
         return Response.json({
           total_count: 2,

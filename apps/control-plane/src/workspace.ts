@@ -1,13 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
 import {
-  createAgentTokens,
+  createAgentToken,
   createCheckRun,
+  createEnvironmentToken,
   createPrivateCheckoutToken,
   createSharedRepositoryToken,
   createWorkflowToken,
   fetchActionsVariables,
   fetchPullRequestMergeSnapshot,
   updateCheckRun,
+  type InstallationAccessToken,
 } from "./github";
 import {
   PROTOCOL_VERSION,
@@ -1269,26 +1271,66 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
           return;
         }
         const job = parseJob(row.job_json);
+        if (!job.requires_github_token) {
+          sendServer(socket, {
+            type: "repository_token_denied",
+            request_id: message.request_id,
+            reason:
+              "The parent GitZero run is not authorized for GitHub tokens.",
+          });
+          return;
+        }
         try {
-          const token =
-            message.purpose === "shared_source"
-              ? await createSharedRepositoryToken(
-                  this.env,
-                  job.installation_id,
-                  job.repository.owner,
-                  job.repository.name,
-                  eventRepositoryOwnerType(this.eventPayload(job.id)),
-                  message.owner,
-                  message.repository,
-                )
-              : await createPrivateCheckoutToken(
-                  this.env,
-                  job.installation_id,
-                  job.repository.owner,
-                  job.repository.name,
-                  message.owner,
-                  message.repository,
-                );
+          let credential: InstallationAccessToken;
+          switch (message.purpose) {
+            case "source":
+            case "environment": {
+              if (
+                message.owner.toLowerCase() ===
+                  job.repository.owner.toLowerCase() &&
+                message.repository.toLowerCase() ===
+                  job.repository.name.toLowerCase()
+              ) {
+                credential =
+                  message.purpose === "source"
+                    ? await createAgentToken(
+                        this.env,
+                        job.installation_id,
+                        job.repository.name,
+                      )
+                    : await createEnvironmentToken(
+                        this.env,
+                        job.installation_id,
+                        job.repository.name,
+                      );
+                break;
+              }
+              throw new Error(
+                `${message.purpose} token target does not match the assigned repository`,
+              );
+            }
+            case "shared_source":
+              credential = await createSharedRepositoryToken(
+                this.env,
+                job.installation_id,
+                job.repository.owner,
+                job.repository.name,
+                eventRepositoryOwnerType(this.eventPayload(job.id)),
+                message.owner,
+                message.repository,
+              );
+              break;
+            case "checkout":
+              credential = await createPrivateCheckoutToken(
+                this.env,
+                job.installation_id,
+                job.repository.owner,
+                job.repository.name,
+                message.owner,
+                message.repository,
+              );
+              break;
+          }
           const stillOwned = this.ctx.storage.sql
             .exec<{ id: string }>(
               `SELECT id FROM jobs
@@ -1303,7 +1345,8 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
           sendServer(socket, {
             type: "repository_token_granted",
             request_id: message.request_id,
-            token,
+            token: credential.token,
+            expires_at_epoch_seconds: credential.expiresAtEpochSeconds,
           });
         } catch (error) {
           console.error(
@@ -1317,13 +1360,16 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
             }),
           );
           if (socket.readyState === WebSocket.OPEN) {
+            const reason =
+              message.purpose === "source" || message.purpose === "environment"
+                ? "Internal repository credential access was denied because the target does not match the active run."
+                : message.purpose === "shared_source"
+                  ? "Private source access was denied. Confirm the target Actions sharing policy and GitHub App installation include this repository."
+                  : "Private checkout access was denied. Confirm the target has the same owner and the GitHub App installation includes this repository.";
             sendServer(socket, {
               type: "repository_token_denied",
               request_id: message.request_id,
-              reason:
-                message.purpose === "shared_source"
-                  ? "Private source access was denied. Confirm the target Actions sharing policy and GitHub App installation include this repository."
-                  : "Private checkout access was denied. Confirm the target has the same owner and the GitHub App installation includes this repository.",
+              reason,
             });
           }
         }
@@ -1340,6 +1386,15 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
           return;
         }
         const job = parseJob(row.job_json);
+        if (!job.requires_github_token) {
+          sendServer(socket, {
+            type: "workflow_token_denied",
+            request_id: message.request_id,
+            reason:
+              "The parent GitZero run is not authorized for GitHub tokens.",
+          });
+          return;
+        }
         let effectivePermissions: { read: string[]; write: string[] } = {
           read: [...message.read_permissions],
           write: [],
@@ -1357,7 +1412,7 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
                   message.read_permissions,
                   message.write_permissions,
                 );
-          const token = await createWorkflowToken(
+          const credential = await createWorkflowToken(
             this.env,
             job.installation_id,
             job.repository.name,
@@ -1378,7 +1433,8 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
           sendServer(socket, {
             type: "workflow_token_granted",
             request_id: message.request_id,
-            token,
+            token: credential.token,
+            expires_at_epoch_seconds: credential.expiresAtEpochSeconds,
           });
         } catch (error) {
           console.error(
@@ -1550,15 +1606,17 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
       const job = parseJob(queued.job_json);
 
       let checkoutToken = "";
-      let environmentToken = "";
+      let checkoutTokenExpiresAtEpochSeconds: number | null = null;
       try {
         const event = this.eventPayload(job.id);
         if (job.requires_github_token) {
-          ({ checkoutToken, environmentToken } = await createAgentTokens(
+          const credential = await createAgentToken(
             this.env,
             job.installation_id,
             job.repository.name,
-          ));
+          );
+          checkoutToken = credential.token;
+          checkoutTokenExpiresAtEpochSeconds = credential.expiresAtEpochSeconds;
         }
         const runSpec: RunSpec = runSpecSchema.parse({
           id: job.id,
@@ -1570,7 +1628,8 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
           check_run_id: job.check_run_id ?? undefined,
           event,
           checkout_token: checkoutToken,
-          environment_token: environmentToken,
+          checkout_token_expires_at_epoch_seconds:
+            checkoutTokenExpiresAtEpochSeconds,
           github_api_version: this.env.GITHUB_API_VERSION,
           environment: job.environment,
           variables: job.variables,

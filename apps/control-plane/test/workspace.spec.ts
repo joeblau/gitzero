@@ -3,6 +3,16 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { QueuedJob } from "../src/protocol";
 
+const INSTALLATION_TOKEN_EXPIRY = "2100-01-01T00:00:00Z";
+const INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS = 4_102_444_800;
+
+function installationToken(token: string): {
+  token: string;
+  expires_at: string;
+} {
+  return { token, expires_at: INSTALLATION_TOKEN_EXPIRY };
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -26,15 +36,12 @@ describe("Workspace Durable Object", () => {
           const permissions = JSON.parse(String(init?.body))
             .permissions as Record<string, string>;
           if (permissions.variables === "read") {
-            return Response.json({ token: "variables-token" });
+            return Response.json(installationToken("variables-token"));
           }
           if (permissions.checks === "write") {
-            return Response.json({ token: "check-token" });
+            return Response.json(installationToken("check-token"));
           }
-          if (permissions.environments === "read") {
-            return Response.json({ token: "environment-token" });
-          }
-          return Response.json({ token: "checkout-token" });
+          return Response.json(installationToken("checkout-token"));
         }
         if (url.pathname.endsWith("/actions/variables")) {
           return Response.json({
@@ -94,7 +101,8 @@ describe("Workspace Durable Object", () => {
             check_run_id: 44,
             variables: { RUNTIME: "24" },
             checkout_token: "checkout-token",
-            environment_token: "environment-token",
+            checkout_token_expires_at_epoch_seconds:
+              INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS,
           }),
         }),
       ]);
@@ -120,14 +128,13 @@ describe("Workspace Durable Object", () => {
         if (url.pathname.endsWith("/access_tokens")) {
           const permissions = JSON.parse(String(init?.body))
             .permissions as Record<string, string>;
-          return Response.json({
-            token:
-              permissions.environments === "read"
-                ? "environment-token"
-                : permissions.contents === "read"
-                  ? "checkout-token"
-                  : "variables-token",
-          });
+          return Response.json(
+            installationToken(
+              permissions.contents === "read"
+                ? "checkout-token"
+                : "variables-token",
+            ),
+          );
         }
         if (url.pathname.endsWith("/actions/variables")) {
           return failVariables
@@ -233,15 +240,12 @@ describe("Workspace Durable Object", () => {
           const permissions = JSON.parse(String(init?.body))
             .permissions as Record<string, string>;
           if (permissions.variables === "read") {
-            return Response.json({ token: "variables-token" });
-          }
-          if (permissions.environments === "read") {
-            return Response.json({ token: "environment-token" });
+            return Response.json(installationToken("variables-token"));
           }
           if (permissions.contents === "read") {
-            return Response.json({ token: "checkout-token" });
+            return Response.json(installationToken("checkout-token"));
           }
-          return Response.json({ token: "merge-token" });
+          return Response.json(installationToken("merge-token"));
         }
         if (url.pathname.endsWith("/pulls/1")) {
           expect(new Headers(init?.headers).get("Authorization")).toBe(
@@ -317,7 +321,7 @@ describe("Workspace Durable Object", () => {
         const url = new URL(String(input));
         requests.push(url);
         if (url.pathname.endsWith("/access_tokens")) {
-          return Response.json({ token: "merge-token" });
+          return Response.json(installationToken("merge-token"));
         }
         if (url.pathname.endsWith("/pulls/1")) {
           return Response.json({
@@ -456,7 +460,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 11,
+          protocol_version: 12,
           agent_id: "mini-1",
           name: "Test Mini",
           version: "0.1.0",
@@ -467,7 +471,7 @@ describe("Workspace Durable Object", () => {
     );
 
     const [welcome, assignment] = await messages;
-    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 11 });
+    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 12 });
     expect(assignment).toMatchObject({
       type: "run_job",
       job: {
@@ -754,7 +758,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 11,
+          protocol_version: 12,
           agent_id: "mini-1",
           name: "duplicate",
           version: "0.1.0",
@@ -1038,6 +1042,57 @@ describe("Workspace Durable Object", () => {
     socket.close(1000, "test complete");
   });
 
+  it("denies repository and workflow credentials for runs without token authority", async () => {
+    const workspaceId = crypto.randomUUID();
+    const workspace = env.WORKSPACES.getByName(workspaceId);
+    const agent = await connectAgent(workspace, workspaceId, "mini-1", 1);
+    const job = fixtureJob(workspaceId);
+    const assignment = collectMessageOfType(agent, "run_job");
+    await workspace.enqueue(job, "no-token-authority");
+    await assignment;
+
+    const repositoryRequestId = crypto.randomUUID();
+    const repositoryDenied = collectMessageOfType(
+      agent,
+      "repository_token_denied",
+    );
+    agent.send(
+      JSON.stringify({
+        type: "repository_token_request",
+        message_id: crypto.randomUUID(),
+        job_id: job.id,
+        request_id: repositoryRequestId,
+        purpose: "source",
+        owner: job.repository.owner,
+        repository: job.repository.name,
+      }),
+    );
+    await expect(repositoryDenied).resolves.toEqual({
+      type: "repository_token_denied",
+      request_id: repositoryRequestId,
+      reason: "The parent GitZero run is not authorized for GitHub tokens.",
+    });
+
+    const workflowRequestId = crypto.randomUUID();
+    const workflowDenied = collectMessageOfType(agent, "workflow_token_denied");
+    agent.send(
+      JSON.stringify({
+        type: "workflow_token_request",
+        message_id: crypto.randomUUID(),
+        job_id: job.id,
+        request_id: workflowRequestId,
+        read_permissions: ["contents"],
+        write_permissions: [],
+      }),
+    );
+    await expect(workflowDenied).resolves.toEqual({
+      type: "workflow_token_denied",
+      request_id: workflowRequestId,
+      reason: "The parent GitZero run is not authorized for GitHub tokens.",
+    });
+    agent.close(1000, "test complete");
+  });
+
   it("returns target- and permission-scoped tokens only for authorized active runs", async () => {
     const privateKey = await testPrivateKeyPem();
     const originalAppId = env.GITHUB_APP_ID;
@@ -1055,14 +1110,26 @@ describe("Workspace Durable Object", () => {
             repositories: string[];
             permissions: Record<string, string>;
           };
-          return Response.json({
-            token:
+          return Response.json(
+            installationToken(
               body.permissions.administration === "read"
                 ? "policy-token"
-                : body.repositories[0] === "caller"
-                  ? "workflow-write-token"
-                  : "target-contents-token",
-          });
+                : body.permissions.environments === "read"
+                  ? "environment-token"
+                  : body.repositories[0] === "caller" &&
+                      body.permissions.pull_requests === "read"
+                    ? "source-token"
+                    : body.repositories[0] === "caller"
+                      ? "workflow-write-token"
+                      : "target-contents-token",
+            ),
+          );
+        }
+        if (
+          url.pathname.endsWith("/actions/variables") ||
+          url.pathname.endsWith("/actions/organization-variables")
+        ) {
+          return Response.json({ total_count: 0, variables: [] });
         }
         return Response.json({ access_level: "organization" });
       }),
@@ -1075,6 +1142,7 @@ describe("Workspace Durable Object", () => {
       const assignment = collectMessageOfType(agent, "run_job");
       const job = fixtureJob(workspaceId);
       job.installation_id = 7010;
+      job.requires_github_token = true;
       job.repository.owner = "acme";
       job.repository.name = "caller";
       job.repository.clone_url = "https://github.com/acme/caller.git";
@@ -1090,6 +1158,7 @@ describe("Workspace Durable Object", () => {
       };
       await workspace.enqueue(job, "shared-repository-token");
       await assignment;
+      requests.length = 0;
 
       const requestId = crypto.randomUUID();
       const granted = collectMessageOfType(agent, "repository_token_granted");
@@ -1108,6 +1177,7 @@ describe("Workspace Durable Object", () => {
         type: "repository_token_granted",
         request_id: requestId,
         token: "target-contents-token",
+        expires_at_epoch_seconds: INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS,
       });
       expect(requests.map((request) => request.url.pathname)).toEqual([
         "/app/installations/7010/access_tokens",
@@ -1143,6 +1213,7 @@ describe("Workspace Durable Object", () => {
         type: "repository_token_granted",
         request_id: checkoutRequestId,
         token: "target-contents-token",
+        expires_at_epoch_seconds: INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS,
       });
       expect(JSON.parse(String(requests[3]?.init?.body))).toEqual({
         repositories: ["private-dependency"],
@@ -1168,11 +1239,72 @@ describe("Workspace Durable Object", () => {
         type: "workflow_token_granted",
         request_id: workflowRequestId,
         token: "workflow-write-token",
+        expires_at_epoch_seconds: INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS,
       });
       expect(JSON.parse(String(requests[4]?.init?.body))).toEqual({
         repositories: ["caller"],
         permissions: { checks: "write", contents: "read" },
       });
+
+      for (const [purpose, token, permissions] of [
+        ["source", "source-token", { contents: "read", pull_requests: "read" }],
+        [
+          "environment",
+          "environment-token",
+          { actions: "read", environments: "read" },
+        ],
+      ] as const) {
+        const internalRequestId = crypto.randomUUID();
+        const internalGranted = collectMessageOfType(
+          agent,
+          "repository_token_granted",
+        );
+        agent.send(
+          JSON.stringify({
+            type: "repository_token_request",
+            message_id: crypto.randomUUID(),
+            job_id: job.id,
+            request_id: internalRequestId,
+            purpose,
+            owner: "ACME",
+            repository: "CALLER",
+          }),
+        );
+        await expect(internalGranted).resolves.toEqual({
+          type: "repository_token_granted",
+          request_id: internalRequestId,
+          token,
+          expires_at_epoch_seconds: INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS,
+        });
+        expect(JSON.parse(String(requests.at(-1)?.init?.body))).toEqual({
+          repositories: ["caller"],
+          permissions,
+        });
+      }
+
+      const mismatchedSourceRequestId = crypto.randomUUID();
+      const mismatchedSourceDenied = collectMessageOfType(
+        agent,
+        "repository_token_denied",
+      );
+      agent.send(
+        JSON.stringify({
+          type: "repository_token_request",
+          message_id: crypto.randomUUID(),
+          job_id: job.id,
+          request_id: mismatchedSourceRequestId,
+          purpose: "source",
+          owner: "acme",
+          repository: "another-repository",
+        }),
+      );
+      await expect(mismatchedSourceDenied).resolves.toEqual({
+        type: "repository_token_denied",
+        request_id: mismatchedSourceRequestId,
+        reason:
+          "Internal repository credential access was denied because the target does not match the active run.",
+      });
+      expect(requests).toHaveLength(7);
 
       const deniedRequestId = crypto.randomUUID();
       const denied = collectMessageOfType(agent, "repository_token_denied");
@@ -1192,7 +1324,7 @@ describe("Workspace Durable Object", () => {
         request_id: deniedRequestId,
         reason: expect.stringContaining("access was denied"),
       });
-      expect(requests).toHaveLength(5);
+      expect(requests).toHaveLength(7);
       agent.close(1000, "test complete");
     } finally {
       Reflect.set(env, "GITHUB_APP_ID", originalAppId);
@@ -1210,8 +1342,12 @@ describe("Workspace Durable Object", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        requests.push({ url: new URL(String(input)), init });
-        return Response.json({ token: "downgraded-read-token" });
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        if (url.pathname.endsWith("/actions/variables")) {
+          return Response.json({ total_count: 0, variables: [] });
+        }
+        return Response.json(installationToken("downgraded-read-token"));
       }),
     );
 
@@ -1238,6 +1374,7 @@ describe("Workspace Durable Object", () => {
       ];
       for (const { job, headRepository, author } of jobs) {
         job.installation_id = 7011;
+        job.requires_github_token = true;
         job.repository.owner = "acme";
         job.repository.name = "caller";
         job.repository.clone_url = "https://github.com/acme/caller.git";
@@ -1252,6 +1389,7 @@ describe("Workspace Durable Object", () => {
         await workspace.enqueue(job, `write-downgrade:${author}`);
         await assignment;
       }
+      requests.length = 0;
 
       for (const { job } of jobs) {
         const requestId = crypto.randomUUID();
@@ -1270,6 +1408,7 @@ describe("Workspace Durable Object", () => {
           type: "workflow_token_granted",
           request_id: requestId,
           token: "downgraded-read-token",
+          expires_at_epoch_seconds: INSTALLATION_TOKEN_EXPIRY_EPOCH_SECONDS,
         });
       }
       expect(requests).toHaveLength(3);
@@ -1594,7 +1733,7 @@ async function connectAgentWithTargeting(
     JSON.stringify({
       type: "hello",
       hello: {
-        protocol_version: 11,
+        protocol_version: 12,
         agent_id: agentId,
         name: agentId,
         version: "0.1.0",

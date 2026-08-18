@@ -14,8 +14,8 @@ const baseRequest = {
 };
 
 describe("agent protocol", () => {
-  it("requires protocol v11 run assignments to carry an exact execution snapshot", () => {
-    expect(PROTOCOL_VERSION).toBe(11);
+  it("requires protocol v12 run assignments to carry an exact execution snapshot and credential expiry", () => {
+    expect(PROTOCOL_VERSION).toBe(12);
     const queued = queuedJobSchema.parse({
       id: "11111111-1111-4111-8111-111111111111",
       workspace_id: "7001",
@@ -45,6 +45,7 @@ describe("agent protocol", () => {
         execution_ref: "refs/pull/42/merge",
       },
       checkout_token: "checkout-token",
+      checkout_token_expires_at_epoch_seconds: 4_102_444_800,
       github_api_version: "2022-11-28",
     };
     expect(runSpecSchema.parse(run).pull_request.merge_sha).toBe(
@@ -54,6 +55,18 @@ describe("agent protocol", () => {
       "refs/pull/42/merge",
     );
     expect(runSpecSchema.safeParse(queued).success).toBe(false);
+    expect(
+      runSpecSchema.safeParse({
+        ...run,
+        checkout_token_expires_at_epoch_seconds: null,
+      }).success,
+    ).toBe(false);
+    expect(
+      runSpecSchema.safeParse({
+        ...run,
+        checkout_token: "",
+      }).success,
+    ).toBe(false);
     expect(
       runSpecSchema.safeParse({
         ...run,
@@ -85,7 +98,12 @@ describe("agent protocol", () => {
       owner: "acme",
       repository: "shared-source",
     };
-    for (const purpose of ["shared_source", "checkout"] as const) {
+    for (const purpose of [
+      "source",
+      "environment",
+      "shared_source",
+      "checkout",
+    ] as const) {
       expect(agentMessageSchema.parse({ ...request, purpose })).toMatchObject({
         purpose,
       });
