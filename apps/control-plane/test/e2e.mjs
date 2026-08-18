@@ -42,7 +42,7 @@ try {
     await verifyGitRewrite(
       gitWrapperDirectory,
       fixture.remoteUrl,
-      fixture.headSha,
+      fixture.mergeSha,
     );
 
     const adminToken = randomSecret();
@@ -193,13 +193,14 @@ try {
                 action: "opened",
                 head_sha: fixture.headSha,
                 base_sha: fixture.baseSha,
+                merge_sha: fixture.mergeSha,
                 head_ref: "acceptance",
                 base_ref: "main",
               },
               variables: {},
               environment: {
                 GITZERO_E2E_SENTINEL: "worker-agent-roundtrip",
-                GITZERO_E2E_HEAD_SHA: fixture.headSha,
+                GITZERO_E2E_EXECUTION_SHA: fixture.mergeSha,
                 GITZERO_E2E_RUN: runLabel,
               },
               requires_github_token: false,
@@ -354,7 +355,7 @@ jobs:
       - name: Prove Worker-to-agent execution
         run: |
           test "$GITZERO_E2E_SENTINEL" = "worker-agent-roundtrip"
-          test "$GITHUB_SHA" = "$GITZERO_E2E_HEAD_SHA"
+          test "$GITHUB_SHA" = "$GITZERO_E2E_EXECUTION_SHA"
           sleep 2
           printf 'gitzero-e2e-log\\n'
           printf '::add-matcher::.github/gitzero-e2e-matcher.json\\n'
@@ -367,10 +368,12 @@ jobs:
   await git(source, "commit", "-m", "add acceptance workflow");
   const headSha = (await gitOutput(source, "rev-parse", "HEAD")).trim();
   await git(source, "push", "origin", "HEAD:refs/pull/1/head");
+  await git(source, "push", "origin", "HEAD:refs/pull/1/merge");
 
   return {
     baseSha,
     headSha,
+    mergeSha: headSha,
     remoteUrl: pathToFileURL(remote).href,
   };
 }
@@ -395,7 +398,7 @@ exec /usr/bin/git \\
   return directory;
 }
 
-async function verifyGitRewrite(directory, remoteUrl, headSha) {
+async function verifyGitRewrite(directory, remoteUrl, mergeSha) {
   const output = await run(
     path.join(directory, "git"),
     ["ls-remote", cloneUrl],
@@ -406,7 +409,7 @@ async function verifyGitRewrite(directory, remoteUrl, headSha) {
       returnOutput: true,
     },
   );
-  assert.match(output, new RegExp(`^${headSha}\\s+refs/pull/1/head$`, "m"));
+  assert.match(output, new RegExp(`^${mergeSha}\\s+refs/pull/1/merge$`, "m"));
 }
 
 function assertObserverLifecycle(events, jobId) {

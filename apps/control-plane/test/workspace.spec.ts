@@ -217,6 +217,153 @@ describe("Workspace Durable Object", () => {
     }
   });
 
+  it("pins a missing webhook merge snapshot before creating credentials or dispatching", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const originalAppId = env.GITHUB_APP_ID;
+    const originalPrivateKey = env.GITHUB_APP_PRIVATE_KEY;
+    Reflect.set(env, "GITHUB_APP_ID", "1234");
+    Reflect.set(env, "GITHUB_APP_PRIVATE_KEY", privateKey);
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        if (url.pathname.endsWith("/access_tokens")) {
+          const permissions = JSON.parse(String(init?.body))
+            .permissions as Record<string, string>;
+          if (permissions.variables === "read") {
+            return Response.json({ token: "variables-token" });
+          }
+          if (permissions.environments === "read") {
+            return Response.json({ token: "environment-token" });
+          }
+          if (permissions.contents === "read") {
+            return Response.json({ token: "checkout-token" });
+          }
+          return Response.json({ token: "merge-token" });
+        }
+        if (url.pathname.endsWith("/pulls/1")) {
+          expect(new Headers(init?.headers).get("Authorization")).toBe(
+            "Bearer merge-token",
+          );
+          return Response.json({
+            head: { sha: "0".repeat(40) },
+            base: { sha: "a".repeat(40) },
+            mergeable: true,
+            merge_commit_sha: "b".repeat(40),
+          });
+        }
+        if (url.pathname.endsWith("/actions/variables")) {
+          return Response.json({ total_count: 0, variables: [] });
+        }
+        throw new Error(`unexpected GitHub request: ${url.pathname}`);
+      }),
+    );
+
+    try {
+      const workspaceId = "7090";
+      const workspace = env.WORKSPACES.getByName(workspaceId);
+      const agent = await connectAgent(workspace, workspaceId, "mini-merge", 1);
+      const assignment = collectMessages(agent, 1);
+      const job = fixtureJob(workspaceId);
+      job.installation_id = 7090;
+      job.pull_request.head_sha = "0".repeat(40);
+      job.pull_request.base_sha = "a".repeat(40);
+      job.pull_request.merge_sha = null;
+      job.requires_github_token = true;
+      job.event = { repository: { owner: { type: "User" } } };
+
+      await workspace.enqueue(job, "resolve-merge-snapshot");
+      await expect(assignment).resolves.toEqual([
+        expect.objectContaining({
+          type: "run_job",
+          job: expect.objectContaining({
+            id: job.id,
+            pull_request: expect.objectContaining({
+              head_sha: "0".repeat(40),
+              base_sha: "a".repeat(40),
+              merge_sha: "b".repeat(40),
+            }),
+          }),
+        }),
+      ]);
+      const mergeAuthorization = requests.find((request) =>
+        request.url.pathname.endsWith("/access_tokens"),
+      );
+      expect(JSON.parse(String(mergeAuthorization?.init?.body))).toEqual({
+        repositories: ["Hello-World"],
+        permissions: { pull_requests: "read" },
+      });
+      agent.close(1000, "test complete");
+    } finally {
+      Reflect.set(env, "GITHUB_APP_ID", originalAppId);
+      Reflect.set(env, "GITHUB_APP_PRIVATE_KEY", originalPrivateKey);
+    }
+  });
+
+  it("finishes a conflicted pull request neutrally without creating a Check", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const originalAppId = env.GITHUB_APP_ID;
+    const originalPrivateKey = env.GITHUB_APP_PRIVATE_KEY;
+    Reflect.set(env, "GITHUB_APP_ID", "1234");
+    Reflect.set(env, "GITHUB_APP_PRIVATE_KEY", privateKey);
+    const requests: URL[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        requests.push(url);
+        if (url.pathname.endsWith("/access_tokens")) {
+          return Response.json({ token: "merge-token" });
+        }
+        if (url.pathname.endsWith("/pulls/1")) {
+          return Response.json({
+            head: { sha: "0".repeat(40) },
+            base: { sha: "a".repeat(40) },
+            mergeable: false,
+            merge_commit_sha: null,
+          });
+        }
+        throw new Error(`unexpected GitHub request: ${url.pathname}`);
+      }),
+    );
+
+    try {
+      const workspaceId = "7091";
+      const workspace = env.WORKSPACES.getByName(workspaceId);
+      const job = fixtureJob(workspaceId);
+      job.installation_id = 7091;
+      job.pull_request.head_sha = "0".repeat(40);
+      job.pull_request.base_sha = "a".repeat(40);
+      job.pull_request.merge_sha = null;
+      job.requires_github_token = true;
+      job.report_to_github = true;
+      await workspace.enqueue(job, "conflicted-merge-snapshot");
+
+      await vi.waitFor(async () => {
+        await expect(workspace.getSnapshot()).resolves.toMatchObject({
+          jobs: [
+            expect.objectContaining({
+              id: job.id,
+              status: "completed",
+              conclusion: "neutral",
+              check_run_id: null,
+              summary: expect.stringContaining("cannot be merged"),
+            }),
+          ],
+        });
+      });
+      expect(requests.map((url) => url.pathname)).toEqual([
+        "/app/installations/7091/access_tokens",
+        "/repos/octocat/Hello-World/pulls/1",
+      ]);
+    } finally {
+      Reflect.set(env, "GITHUB_APP_ID", originalAppId);
+      Reflect.set(env, "GITHUB_APP_PRIVATE_KEY", originalPrivateKey);
+    }
+  });
+
   it("deduplicates webhook delivery IDs", async () => {
     const workspaceId = crypto.randomUUID();
     const workspace = env.WORKSPACES.getByName(workspaceId);
@@ -306,7 +453,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 9,
+          protocol_version: 10,
           agent_id: "mini-1",
           name: "Test Mini",
           version: "0.1.0",
@@ -317,7 +464,7 @@ describe("Workspace Durable Object", () => {
     );
 
     const [welcome, assignment] = await messages;
-    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 9 });
+    expect(welcome).toMatchObject({ type: "welcome", protocol_version: 10 });
     expect(assignment).toMatchObject({
       type: "run_job",
       job: {
@@ -604,7 +751,7 @@ describe("Workspace Durable Object", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 9,
+          protocol_version: 10,
           agent_id: "mini-1",
           name: "duplicate",
           version: "0.1.0",
@@ -1444,7 +1591,7 @@ async function connectAgentWithTargeting(
     JSON.stringify({
       type: "hello",
       hello: {
-        protocol_version: 9,
+        protocol_version: 10,
         agent_id: agentId,
         name: agentId,
         version: "0.1.0",
@@ -1555,6 +1702,7 @@ function fixtureJob(workspaceId: string): QueuedJob {
       action: "opened",
       head_sha: "0123456789012345678901234567890123456789",
       base_sha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+      merge_sha: "1111111111111111111111111111111111111111",
       head_ref: "feature",
       base_ref: "main",
     },

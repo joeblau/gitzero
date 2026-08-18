@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const PROTOCOL_VERSION = 9;
+export const PROTOCOL_VERSION = 10;
 
 export const repositoryTokenPurposeSchema = z.enum([
   "shared_source",
@@ -98,6 +98,7 @@ export const pullRequestSchema = z.object({
   action: z.string().min(1),
   head_sha: sha,
   base_sha: sha,
+  merge_sha: sha.nullable().default(null),
   head_ref: z.string().min(1),
   base_ref: z.string().min(1),
 });
@@ -125,6 +126,7 @@ export const runSpecSchema = queuedJobSchema
     report_to_github: true,
   })
   .extend({
+    pull_request: pullRequestSchema.extend({ merge_sha: sha }),
     check_run_id: z.number().int().positive().nullable().optional(),
     checkout_token: z.string(),
     environment_token: z.string().default(""),

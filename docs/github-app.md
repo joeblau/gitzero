@@ -83,7 +83,7 @@ It returns `200` only when the App ID and either supported PEM format can mint a
 
 For no workflow changes and no duplicate hosted execution, native Actions must be disabled on each onboarded repository. Keep Actions enabled until `/healthz`, `/readyz`, an agent connection, and a test Check Run have all been verified. One duplicate native Actions run during this validation is expected. Changing repository Actions policy is potentially disruptive, so GitZero performs it only through the administrator-authenticated onboarding endpoint described below; the webhook handler never invokes that endpoint or changes repository policy.
 
-A new signed delivery returns after durable persistence, before repository-variable reads and Check creation. The workspace snapshot reports `initialization_status` as `pending`, `running`, or `ready`, plus the attempt count and last bounded error. A job is never assigned before it is `ready`; transient initialization failures retry from Durable Object alarms and become a visible terminal failure after eight attempts.
+A new signed delivery returns after durable persistence, before merge-snapshot resolution, repository-variable reads, and Check creation. The workspace snapshot reports `initialization_status` as `pending`, `running`, or `ready`, plus the attempt count and last bounded error. When the webhook does not contain a merge SHA, the Worker obtains a single-repository `pull_requests: read` token, verifies the current PR head and base still match the signed event, and pins GitHub's test merge commit. Pending mergeability retries from Durable Object alarms, a merge conflict completes without agent execution, and changed head/base identity fails closed. A job is never assigned before it is `ready`; other transient initialization failures also retry and become a visible terminal failure after eight attempts.
 
 After the test pull request finishes, use the administrator-authenticated, read-only readiness endpoint:
 
@@ -93,7 +93,7 @@ curl -fsS \
   "https://<control-plane>/v1/workspaces/<installation-id>/readiness?owner=<owner>&repository=<repository>"
 ```
 
-The endpoint mints one short-lived, single-repository installation token with `administration: read` and, when a local candidate exists, `checks: read`. It reads the repository Actions policy and verifies the successful Check Run back from GitHub against GitZero's local job ID and exact pull-request head SHA. It never changes repository state or returns the GitHub token. Continue only when `safe_to_disable_native_actions` is `true` and `next_action` is `disable_native_actions`.
+The endpoint mints one short-lived, single-repository installation token with `administration: read` and, when a local candidate exists, `checks: read`. It reads the repository Actions policy and verifies the successful Check Run back from GitHub against GitZero's local job ID and exact pull-request execution merge SHA. It never changes repository state or returns the GitHub token. Continue only when `safe_to_disable_native_actions` is `true` and `next_action` is `disable_native_actions`.
 
 Copy the three exact values from `successful_check` into an explicit onboarding request:
 

@@ -8,6 +8,7 @@ import {
   disableRepositoryActions,
   fetchActionsVariables,
   fetchActionsVariablesWithToken,
+  fetchPullRequestMergeSnapshot,
   fetchRepositoryOnboardingEvidence,
   updateCheckRun,
 } from "../src/github";
@@ -223,6 +224,103 @@ describe("GitHub Actions variables", () => {
 
     expect(Object.keys(variables)).toEqual(["A", "B", "C", "D", "E"]);
     expect(variables).not.toHaveProperty("F");
+  });
+});
+
+describe("pull request merge snapshots", () => {
+  it("resolves the exact tested merge commit with a pull-requests-read token", async () => {
+    const privateKey = await testPrivateKeyPem();
+    const requests: Array<{ url: URL; init?: RequestInit }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        requests.push({ url, init });
+        if (url.pathname.endsWith("/access_tokens")) {
+          return Response.json({ token: "pull-request-token" });
+        }
+        return Response.json({
+          head: { sha: "A".repeat(40) },
+          base: { sha: "B".repeat(40) },
+          mergeable: true,
+          merge_commit_sha: "C".repeat(40),
+        });
+      }),
+    );
+
+    await expect(
+      fetchPullRequestMergeSnapshot(
+        {
+          GITHUB_API_VERSION: "2026-03-10",
+          GITHUB_APP_ID: "1234",
+          GITHUB_APP_PRIVATE_KEY: privateKey,
+        },
+        7001,
+        "acme corp",
+        "hello world",
+        42,
+        "a".repeat(40),
+        "b".repeat(40),
+      ),
+    ).resolves.toEqual({ status: "ready", merge_sha: "C".repeat(40) });
+
+    expect(JSON.parse(String(requests[0]?.init?.body))).toEqual({
+      repositories: ["hello world"],
+      permissions: { pull_requests: "read" },
+    });
+    expect(requests[1]?.url.pathname).toBe(
+      "/repos/acme%20corp/hello%20world/pulls/42",
+    );
+    expect(new Headers(requests[1]?.init?.headers).get("Authorization")).toBe(
+      "Bearer pull-request-token",
+    );
+  });
+
+  it("distinguishes pending, conflicted, and changed snapshots", async () => {
+    const privateKey = await testPrivateKeyPem();
+    let response = {
+      head: { sha: "1".repeat(40) },
+      base: { sha: "2".repeat(40) },
+      mergeable: null as boolean | null,
+      merge_commit_sha: null as string | null,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) =>
+        new URL(String(input)).pathname.endsWith("/access_tokens")
+          ? Response.json({ token: "pull-request-token" })
+          : Response.json(response),
+      ),
+    );
+    const resolve = () =>
+      fetchPullRequestMergeSnapshot(
+        {
+          GITHUB_API_VERSION: "2026-03-10",
+          GITHUB_APP_ID: "1234",
+          GITHUB_APP_PRIVATE_KEY: privateKey,
+        },
+        7001,
+        "acme",
+        "widget",
+        42,
+        "1".repeat(40),
+        "2".repeat(40),
+      );
+
+    await expect(resolve()).resolves.toEqual({ status: "pending" });
+    response = { ...response, mergeable: false };
+    await expect(resolve()).resolves.toEqual({ status: "conflicted" });
+    response = {
+      ...response,
+      head: { sha: "4".repeat(40) },
+      mergeable: true,
+      merge_commit_sha: "3".repeat(40),
+    };
+    await expect(resolve()).resolves.toEqual({
+      status: "changed",
+      current_head_sha: "4".repeat(40),
+      current_base_sha: "2".repeat(40),
+    });
   });
 });
 
@@ -645,7 +743,7 @@ describe("GitHub production API contracts", () => {
     }
   });
 
-  it("creates Check Runs with only Checks write permission and the exact PR head", async () => {
+  it("creates Check Runs with only Checks write permission and the exact PR merge snapshot", async () => {
     const privateKey = await testPrivateKeyPem();
     const requests: Array<{ url: URL; init?: RequestInit }> = [];
     vi.stubGlobal(
@@ -677,7 +775,7 @@ describe("GitHub production API contracts", () => {
     expect(requests[1]?.url.pathname).toBe("/repos/acme/widget/check-runs");
     expect(JSON.parse(String(requests[1]?.init?.body))).toMatchObject({
       name: "GitZero",
-      head_sha: "1".repeat(40),
+      head_sha: "3".repeat(40),
       status: "queued",
       external_id: "11111111-1111-4111-8111-111111111111",
     });
@@ -801,7 +899,7 @@ describe("GitHub production API contracts", () => {
             {
               id: 44,
               name: "GitZero",
-              head_sha: "1".repeat(40),
+              head_sha: "3".repeat(40),
               external_id: "11111111-1111-4111-8111-111111111111",
             },
           ],
@@ -824,7 +922,7 @@ describe("GitHub production API contracts", () => {
     expect(requests).toHaveLength(2);
     expect(requests[1]?.init?.method).toBe("GET");
     expect(requests[1]?.url.pathname).toBe(
-      `/repos/acme/widget/commits/${"1".repeat(40)}/check-runs`,
+      `/repos/acme/widget/commits/${"3".repeat(40)}/check-runs`,
     );
     expect(Object.fromEntries(requests[1]?.url.searchParams ?? [])).toEqual({
       check_name: "GitZero",
@@ -879,6 +977,7 @@ function fixtureJob(): QueuedJob {
       action: "synchronize",
       head_sha: "1".repeat(40),
       base_sha: "2".repeat(40),
+      merge_sha: "3".repeat(40),
       head_ref: "feature/readiness",
       base_ref: "main",
     },

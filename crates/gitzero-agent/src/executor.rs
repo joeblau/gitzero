@@ -293,12 +293,13 @@ impl Executor {
     ) -> Result<()> {
         validate_sha(&run.pull_request.head_sha)?;
         validate_sha(&run.pull_request.base_sha)?;
+        validate_sha(&run.pull_request.merge_sha)?;
         let run_dir = self.config.work_root.join(run.id.to_string());
         let repository_dir = run_dir.join("repository");
         prepare_directory(&run_dir).await?;
         tokio::fs::create_dir_all(&repository_dir).await?;
         let repository = format!("{}/{}", run.repository.owner, run.repository.name);
-        let cache_scope = format!("refs/pull/{}/head", run.pull_request.number);
+        let cache_scope = format!("refs/pull/{}/merge", run.pull_request.number);
         let workflow_run_backend_id = run.id.to_string();
         let workflow_job_run_backend_id = Uuid::new_v4().to_string();
         let runtime_token =
@@ -384,7 +385,7 @@ impl Executor {
             .await?;
             if plans.is_empty() {
                 return Ok(ExecutionDisposition::Completed(
-                    "No pull_request workflows were found at the PR head SHA.".to_owned(),
+                    "No pull_request workflows were found at the PR merge SHA.".to_owned(),
                 ));
             }
 
@@ -597,7 +598,6 @@ async fn checkout(
     .context("configure repository remote")?;
 
     let credential = STANDARD.encode(format!("x-access-token:{}", run.checkout_token));
-    let pull_request_ref = format!("refs/pull/{}/head", run.pull_request.number);
     let mut fetch = Command::new("git");
     fetch
         .args([
@@ -606,7 +606,7 @@ async fn checkout(
             "--no-tags",
             "--depth=1",
             "origin",
-            &pull_request_ref,
+            &run.pull_request.merge_sha,
         ])
         .env("GIT_TERMINAL_PROMPT", "0")
         .current_dir(repository_dir);
@@ -629,7 +629,7 @@ async fn checkout(
         sequence.clone(),
     )
     .await
-    .context("fetch pull request head")?;
+    .context("fetch exact pull request merge snapshot")?;
 
     run_process(
         run.id,
@@ -643,7 +643,7 @@ async fn checkout(
         sequence.clone(),
     )
     .await
-    .context("checkout pull request head")?;
+    .context("checkout pull request merge snapshot")?;
 
     let output = Command::new("git")
         .args(["rev-parse", "HEAD"])
@@ -652,10 +652,10 @@ async fn checkout(
         .await
         .context("verify checkout")?;
     let actual = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if !output.status.success() || actual != run.pull_request.head_sha {
+    if !output.status.success() || !actual.eq_ignore_ascii_case(&run.pull_request.merge_sha) {
         bail!(
             "checkout verification failed: expected {}, got {actual}",
-            run.pull_request.head_sha
+            run.pull_request.merge_sha
         );
     }
 
@@ -3874,12 +3874,11 @@ async fn execute_checkout_step_with_repository(
     let mut managed_checkout_token = None;
     let (expected_sha, immutable_snapshot, output_ref) = if checkout_repository.same_repository {
         let selected_target = checkout_target(requested_ref, run).context(
-            "actions/checkout ref must identify an authenticated pull-request head or base snapshot",
+            "actions/checkout ref must identify an authenticated pull-request merge, head, or base snapshot",
         )?;
         (
             selected_target.commit(run).to_owned(),
-            (selected_target == CheckoutTarget::PullRequestHead)
-                .then(|| source_repository_dir.to_owned()),
+            (selected_target == CheckoutTarget::Merge).then(|| source_repository_dir.to_owned()),
             checkout_output_ref(inputs.get("ref"), run),
         )
     } else {
@@ -4106,6 +4105,10 @@ async fn execute_checkout_step_with_repository(
             if checkout_repository.same_repository {
                 command.arg(format!(
                     "+refs/pull/{}/head:refs/remotes/pull/{}/head",
+                    run.pull_request.number, run.pull_request.number
+                ));
+                command.arg(format!(
+                    "+refs/pull/{}/merge:refs/remotes/pull/{}/merge",
                     run.pull_request.number, run.pull_request.number
                 ));
             }
@@ -4420,15 +4423,17 @@ async fn finish_cross_repository_checkout(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CheckoutTarget {
-    PullRequestHead,
-    PullRequestBase,
+    Merge,
+    Head,
+    Base,
 }
 
 impl CheckoutTarget {
     fn commit(self, run: &RunSpec) -> &str {
         match self {
-            Self::PullRequestHead => &run.pull_request.head_sha,
-            Self::PullRequestBase => &run.pull_request.base_sha,
+            Self::Merge => &run.pull_request.merge_sha,
+            Self::Head => &run.pull_request.head_sha,
+            Self::Base => &run.pull_request.base_sha,
         }
     }
 }
@@ -4438,9 +4443,10 @@ fn checkout_output_ref(input: Option<&String>, run: &RunSpec) -> String {
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
     {
-        None => format!("refs/pull/{}/head", run.pull_request.number),
+        None => format!("refs/pull/{}/merge", run.pull_request.number),
         Some(git_ref)
-            if git_ref.eq_ignore_ascii_case(&run.pull_request.head_sha)
+            if git_ref.eq_ignore_ascii_case(&run.pull_request.merge_sha)
+                || git_ref.eq_ignore_ascii_case(&run.pull_request.head_sha)
                 || git_ref.eq_ignore_ascii_case(&run.pull_request.base_sha) =>
         {
             String::new()
@@ -4451,17 +4457,21 @@ fn checkout_output_ref(input: Option<&String>, run: &RunSpec) -> String {
 
 fn checkout_target(git_ref: &str, run: &RunSpec) -> Option<CheckoutTarget> {
     if git_ref.is_empty()
-        || git_ref.eq_ignore_ascii_case(&run.pull_request.head_sha)
+        || git_ref.eq_ignore_ascii_case(&run.pull_request.merge_sha)
+        || git_ref == format!("refs/pull/{}/merge", run.pull_request.number)
+    {
+        Some(CheckoutTarget::Merge)
+    } else if git_ref.eq_ignore_ascii_case(&run.pull_request.head_sha)
         || git_ref == run.pull_request.head_ref
         || git_ref == format!("refs/heads/{}", run.pull_request.head_ref)
         || git_ref == format!("refs/pull/{}/head", run.pull_request.number)
     {
-        Some(CheckoutTarget::PullRequestHead)
+        Some(CheckoutTarget::Head)
     } else if git_ref.eq_ignore_ascii_case(&run.pull_request.base_sha)
         || git_ref == run.pull_request.base_ref
         || git_ref == format!("refs/heads/{}", run.pull_request.base_ref)
     {
-        Some(CheckoutTarget::PullRequestBase)
+        Some(CheckoutTarget::Base)
     } else {
         None
     }
@@ -6164,7 +6174,7 @@ fn expression_context_with_variables(
     github_token: Option<&str>,
 ) -> Result<EvaluationContext> {
     let repository = format!("{}/{}", run.repository.owner, run.repository.name);
-    let github_ref = format!("refs/pull/{}/head", run.pull_request.number);
+    let github_ref = format!("refs/pull/{}/merge", run.pull_request.number);
     let event = github_event(run);
     let actor = event_scalar(&event, "/sender/login");
     let actor_id = event_scalar(&event, "/sender/id");
@@ -6198,9 +6208,9 @@ fn expression_context_with_variables(
             "event_name": "pull_request",
             "event_path": run_dir.join("event.json").display().to_string(),
             "graphql_url": "https://api.github.com/graphql",
-            "sha": run.pull_request.head_sha,
+            "sha": run.pull_request.merge_sha,
             "ref": github_ref,
-            "ref_name": format!("{}/head", run.pull_request.number),
+            "ref_name": format!("{}/merge", run.pull_request.number),
             "ref_protected": false,
             "ref_type": "branch",
             "head_ref": run.pull_request.head_ref,
@@ -6218,7 +6228,7 @@ fn expression_context_with_variables(
             "triggering_actor": actor,
             "workflow": environment.get("GITHUB_WORKFLOW").cloned().unwrap_or_default(),
             "workflow_ref": environment.get("GITHUB_WORKFLOW_REF").cloned().unwrap_or_default(),
-            "workflow_sha": environment.get("GITHUB_WORKFLOW_SHA").cloned().unwrap_or_else(|| run.pull_request.head_sha.clone()),
+            "workflow_sha": environment.get("GITHUB_WORKFLOW_SHA").cloned().unwrap_or_else(|| run.pull_request.merge_sha.clone()),
             "workspace": workspace.display().to_string(),
             "job": job.base_id,
             "token": github_token.map_or(JsonValue::Null, |token| JsonValue::String(token.to_owned())),
@@ -7036,14 +7046,14 @@ async fn github_environment(
             "GITHUB_EVENT_PATH".to_owned(),
             event_path.display().to_string(),
         ),
-        ("GITHUB_SHA".to_owned(), run.pull_request.head_sha.clone()),
+        ("GITHUB_SHA".to_owned(), run.pull_request.merge_sha.clone()),
         (
             "GITHUB_REF".to_owned(),
-            format!("refs/pull/{}/head", run.pull_request.number),
+            format!("refs/pull/{}/merge", run.pull_request.number),
         ),
         (
             "GITHUB_REF_NAME".to_owned(),
-            format!("{}/head", run.pull_request.number),
+            format!("{}/merge", run.pull_request.number),
         ),
         ("GITHUB_REF_PROTECTED".to_owned(), "false".to_owned()),
         ("GITHUB_REF_TYPE".to_owned(), "branch".to_owned()),
@@ -7111,13 +7121,13 @@ fn github_workflow_environment(run: &RunSpec, plan: &ExecutionPlan) -> BTreeMap<
         (
             "GITHUB_WORKFLOW_REF".to_owned(),
             format!(
-                "{repository}/{}@refs/pull/{}/head",
+                "{repository}/{}@refs/pull/{}/merge",
                 plan.workflow_path, run.pull_request.number
             ),
         ),
         (
             "GITHUB_WORKFLOW_SHA".to_owned(),
-            run.pull_request.head_sha.clone(),
+            run.pull_request.merge_sha.clone(),
         ),
     ])
 }
@@ -7132,6 +7142,7 @@ fn github_event(run: &RunSpec) -> JsonValue {
         "installation": {"id": run.installation_id},
         "pull_request": {
             "number": run.pull_request.number,
+            "merge_commit_sha": run.pull_request.merge_sha,
             "head": {"sha": run.pull_request.head_sha, "ref": run.pull_request.head_ref},
             "base": {"sha": run.pull_request.base_sha, "ref": run.pull_request.base_ref}
         },
@@ -7510,7 +7521,7 @@ fn actions_runtime_token(
 
 fn validate_sha(value: &str) -> Result<()> {
     if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("pull request head SHA must be exactly 40 hexadecimal characters");
+        bail!("pull request snapshot SHA must be exactly 40 hexadecimal characters");
     }
     Ok(())
 }
@@ -8668,6 +8679,7 @@ jobs:
         );
         git(&repository, ["push", "origin", "main"]);
         git(&repository, ["push", "origin", "HEAD:refs/pull/1/head"]);
+        git(&repository, ["push", "origin", "HEAD:refs/pull/1/merge"]);
 
         let work_root = fixture.path().join("work");
         let executor = Executor::new(ExecutorConfig {
@@ -9152,14 +9164,21 @@ jobs:
 
     #[test]
     fn checkout_ref_aliases_select_only_authenticated_snapshots() {
-        let run = fixture_run(
+        let mut run = fixture_run(
             Uuid::nil(),
             "a".repeat(40),
             "b".repeat(40),
             "https://github.com/local/fixture.git".to_owned(),
         );
+        run.pull_request.merge_sha = "c".repeat(40);
+        for git_ref in ["", &run.pull_request.merge_sha, "refs/pull/1/merge"] {
+            assert_eq!(
+                checkout_target(git_ref, &run),
+                Some(CheckoutTarget::Merge),
+                "rejected safe PR-merge alias {git_ref:?}"
+            );
+        }
         for git_ref in [
-            "",
             &run.pull_request.head_sha,
             "feature",
             "refs/heads/feature",
@@ -9167,20 +9186,20 @@ jobs:
         ] {
             assert_eq!(
                 checkout_target(git_ref, &run),
-                Some(CheckoutTarget::PullRequestHead),
+                Some(CheckoutTarget::Head),
                 "rejected safe PR-head alias {git_ref:?}"
             );
         }
         for git_ref in [&run.pull_request.base_sha, "main", "refs/heads/main"] {
             assert_eq!(
                 checkout_target(git_ref, &run),
-                Some(CheckoutTarget::PullRequestBase),
+                Some(CheckoutTarget::Base),
                 "rejected safe PR-base alias {git_ref:?}"
             );
         }
         for git_ref in [
-            "refs/pull/1/merge",
             "refs/pull/2/head",
+            "refs/pull/2/merge",
             "release",
             "refs/heads/release",
         ] {
@@ -9189,7 +9208,11 @@ jobs:
                 "accepted unauthenticated ref {git_ref:?}"
             );
         }
-        assert_eq!(checkout_output_ref(None, &run), "refs/pull/1/head");
+        assert_eq!(checkout_output_ref(None, &run), "refs/pull/1/merge");
+        assert_eq!(
+            checkout_output_ref(Some(&run.pull_request.merge_sha), &run),
+            ""
+        );
         assert_eq!(
             checkout_output_ref(Some(&run.pull_request.head_sha), &run),
             ""
@@ -10951,7 +10974,7 @@ jobs:
                 .evaluate_json("github.workflow_ref")
                 .expect("workflow ref"),
             JsonValue::String(
-                "acme/widget/.github/workflows/metadata.yml@refs/pull/1/head".to_owned()
+                "acme/widget/.github/workflows/metadata.yml@refs/pull/1/merge".to_owned()
             )
         );
         assert_eq!(environment["GITHUB_WORKFLOW"], "Metadata");
@@ -11401,6 +11424,7 @@ jobs:
         );
         git(&repository, ["push", "origin", "main"]);
         git(&repository, ["push", "origin", "HEAD:refs/pull/1/head"]);
+        git(&repository, ["push", "origin", "HEAD:refs/pull/1/merge"]);
 
         let executor = Executor::new(ExecutorConfig {
             work_root: fixture.path().join("runs"),
@@ -11567,6 +11591,7 @@ jobs:
         );
         git(&repository, ["push", "origin", "main"]);
         git(&repository, ["push", "origin", "HEAD:refs/pull/1/head"]);
+        git(&repository, ["push", "origin", "HEAD:refs/pull/1/merge"]);
 
         let executor = Executor::new(ExecutorConfig {
             work_root: fixture.path().join("runs"),
@@ -12446,6 +12471,139 @@ jobs:
 
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    async fn executes_the_exact_pull_request_merge_snapshot_by_default() {
+        let fixture = tempfile::tempdir().expect("fixture tempdir");
+        let source = fixture.path().join("source");
+        let remote = fixture.path().join("remote.git");
+        std::fs::create_dir_all(source.join(".github/workflows")).expect("workflow directory");
+        git(&source, ["init", "--initial-branch=main"]);
+        git(&source, ["config", "user.email", "gitzero@example.test"]);
+        git(&source, ["config", "user.name", "GitZero Test"]);
+        std::fs::write(source.join("common.txt"), "common\n").expect("common file");
+        git(&source, ["add", "."]);
+        git(&source, ["commit", "-m", "common base"]);
+
+        git(&source, ["checkout", "-b", "feature"]);
+        std::fs::write(source.join("head-only.txt"), "head\n").expect("head file");
+        std::fs::write(
+            source.join(".github/workflows/merge.yml"),
+            r#"
+name: Merge snapshot parity
+on: pull_request
+jobs:
+  merge:
+    runs-on: macos-latest
+    steps:
+      - id: merge
+        uses: actions/checkout@v4
+        with:
+          show-progress: false
+      - run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_REF" = refs/pull/1/merge
+          test "$GITHUB_REF_NAME" = 1/merge
+          test "$GITHUB_WORKFLOW_SHA" = "$GITHUB_SHA"
+          test "$GITHUB_WORKFLOW_REF" = local/fixture/.github/workflows/merge.yml@refs/pull/1/merge
+          test "${{ github.sha }}" = "$GITHUB_SHA"
+          test "${{ github.ref }}" = refs/pull/1/merge
+          test "${{ steps.merge.outputs.commit }}" = "$GITHUB_SHA"
+          test "${{ steps.merge.outputs.ref }}" = refs/pull/1/merge
+          test -f head-only.txt
+          test -f base-only.txt
+      - id: head
+        uses: actions/checkout@v4
+        with:
+          path: head-snapshot
+          ref: ${{ github.event.pull_request.head.sha }}
+          show-progress: false
+      - run: |
+          test "$(git -C head-snapshot rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          test -f head-snapshot/head-only.txt
+          test ! -e head-snapshot/base-only.txt
+          test -z "${{ steps.head.outputs.ref }}"
+          echo exact-merge-snapshot-parity
+"#,
+        )
+        .expect("merge workflow");
+        git(&source, ["add", "."]);
+        git(&source, ["commit", "-m", "feature head"]);
+        let head_sha = git_output(&source, ["rev-parse", "HEAD"]);
+
+        git(&source, ["checkout", "main"]);
+        std::fs::write(source.join("base-only.txt"), "base\n").expect("base file");
+        git(&source, ["add", "."]);
+        git(&source, ["commit", "-m", "advance base"]);
+        let base_sha = git_output(&source, ["rev-parse", "HEAD"]);
+        git(&source, ["checkout", "-b", "merge-snapshot"]);
+        git(&source, ["merge", "--no-ff", "feature", "-m", "test merge"]);
+        let merge_sha = git_output(&source, ["rev-parse", "HEAD"]);
+        assert_ne!(merge_sha, head_sha);
+        assert_ne!(merge_sha, base_sha);
+
+        git(
+            fixture.path(),
+            ["init", "--bare", remote.to_str().expect("remote path")],
+        );
+        git(
+            &source,
+            [
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        git(&source, ["push", "origin", "main"]);
+        git(&source, ["push", "origin", "feature:refs/pull/1/head"]);
+        git(
+            &source,
+            ["push", "origin", "merge-snapshot:refs/pull/1/merge"],
+        );
+
+        let executor = Executor::new(ExecutorConfig {
+            work_root: fixture.path().join("runs"),
+            runner_name: "GitZero Merge Test".to_owned(),
+            keep_failed_workspaces: false,
+            max_parallelism: 2,
+            cache_max_bytes: 10 * 1024 * 1024,
+            cache_max_entry_bytes: 1024 * 1024,
+            artifact_max_bytes: 10 * 1024 * 1024,
+            artifact_max_entry_bytes: 1024 * 1024,
+        });
+        let mut run = fixture_run(
+            Uuid::new_v4(),
+            head_sha,
+            base_sha,
+            remote.display().to_string(),
+        );
+        run.pull_request.merge_sha = merge_sha;
+        let (outbound, mut incoming) = mpsc::channel(256);
+        let (_cancel_tx, cancel) = watch::channel(false);
+
+        executor
+            .execute(run, cancel, outbound)
+            .await
+            .expect("execute merge snapshot workflow");
+        let mut events = Vec::new();
+        while let Ok(message) = incoming.try_recv() {
+            events.push(message);
+        }
+        assert!(events.iter().any(|message| matches!(
+            message,
+            AgentMessage::LogChunk { data, .. }
+                if data == "exact-merge-snapshot-parity\n"
+        )));
+        assert!(events.iter().any(|message| matches!(
+            message,
+            AgentMessage::JobFinished {
+                conclusion: Conclusion::Success,
+                ..
+            }
+        )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
     async fn executes_a_supported_workflow_from_an_exact_pull_request_ref() {
         let fixture = tempfile::tempdir().expect("fixture tempdir");
         let source = fixture.path().join("source");
@@ -12493,6 +12651,7 @@ jobs:
         );
         git(&source, ["push", "origin", "main"]);
         git(&source, ["push", "origin", "HEAD:refs/pull/1/head"]);
+        git(&source, ["push", "origin", "HEAD:refs/pull/1/merge"]);
 
         let work_root = fixture.path().join("runs");
         let executor = Executor::new(ExecutorConfig {
@@ -12812,7 +12971,7 @@ jobs:
           test "$(git -C sparse-cone config --get remote.origin.partialclonefilter)" = blob:none
           test "$(git -C sparse-cone rev-list --objects --missing=print HEAD | grep -c '^?')" -gt 0
           test "${{ steps.sparse.outputs.commit }}" = "$GITHUB_SHA"
-          test "${{ steps.sparse.outputs.ref }}" = refs/pull/1/head
+          test "${{ steps.sparse.outputs.ref }}" = refs/pull/1/merge
           echo sparse-cone-exact
       - name: Non-cone single-file checkout
         id: sparse_file
@@ -12887,6 +13046,7 @@ jobs:
         );
         git(&source, ["push", "origin", "main"]);
         git(&source, ["push", "origin", "HEAD:refs/pull/1/head"]);
+        git(&source, ["push", "origin", "HEAD:refs/pull/1/merge"]);
 
         let executor = Executor::new(ExecutorConfig {
             work_root: fixture.path().join("runs"),
@@ -13128,6 +13288,7 @@ jobs:
         );
         git(&source, ["push", "origin", "main"]);
         git(&source, ["push", "origin", "HEAD:refs/pull/1/head"]);
+        git(&source, ["push", "origin", "HEAD:refs/pull/1/merge"]);
 
         let executor = Executor::new(ExecutorConfig {
             work_root: fixture.path().join("runs"),
@@ -13290,6 +13451,7 @@ jobs:
         );
         git(&source, ["push", "origin", "main"]);
         git(&source, ["push", "origin", "HEAD:refs/pull/1/head"]);
+        git(&source, ["push", "origin", "HEAD:refs/pull/1/merge"]);
 
         let executor = Executor::new(ExecutorConfig {
             work_root: fixture.path().join("runs"),
@@ -13423,6 +13585,7 @@ jobs:
         );
         git(&source, ["push", "origin", "main"]);
         git(&source, ["push", "origin", "HEAD:refs/pull/1/head"]);
+        git(&source, ["push", "origin", "HEAD:refs/pull/1/merge"]);
 
         let executor = Executor::new(ExecutorConfig {
             work_root: fixture.path().join("runs"),
@@ -13531,6 +13694,7 @@ jobs:
             pull_request: PullRequestSpec {
                 number: 1,
                 action: "opened".to_owned(),
+                merge_sha: head_sha.clone(),
                 head_sha,
                 base_sha,
                 head_ref: "feature".to_owned(),

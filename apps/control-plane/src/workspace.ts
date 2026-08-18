@@ -6,6 +6,7 @@ import {
   createSharedRepositoryToken,
   createWorkflowToken,
   fetchActionsVariables,
+  fetchPullRequestMergeSnapshot,
   updateCheckRun,
 } from "./github";
 import {
@@ -573,18 +574,68 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
 
     const job = parseJob(claim.job_json);
     try {
-      const variables = job.requires_github_token
+      let initializedJob = job;
+      if (initializedJob.pull_request.merge_sha === null) {
+        if (!initializedJob.requires_github_token) {
+          initializedJob = {
+            ...initializedJob,
+            pull_request: {
+              ...initializedJob.pull_request,
+              merge_sha: initializedJob.pull_request.head_sha,
+            },
+          };
+        } else {
+          const snapshot = await fetchPullRequestMergeSnapshot(
+            this.env,
+            initializedJob.installation_id,
+            initializedJob.repository.owner,
+            initializedJob.repository.name,
+            initializedJob.pull_request.number,
+            initializedJob.pull_request.head_sha,
+            initializedJob.pull_request.base_sha,
+          );
+          if (snapshot.status === "pending") {
+            throw new Error(
+              "GitHub is still computing the pull request merge snapshot",
+            );
+          }
+          if (snapshot.status === "conflicted") {
+            this.completeInitializingJob(
+              claim,
+              "neutral",
+              "GitZero did not create a run because GitHub reports that the pull request cannot be merged into its base branch.",
+            );
+            return;
+          }
+          if (snapshot.status === "changed") {
+            this.completeInitializingJob(
+              claim,
+              "failure",
+              "GitZero could not pin the webhook's merge snapshot because the pull request head or base changed before GitHub finished computing it.",
+            );
+            return;
+          }
+          initializedJob = {
+            ...initializedJob,
+            pull_request: {
+              ...initializedJob.pull_request,
+              merge_sha: snapshot.merge_sha,
+            },
+          };
+        }
+      }
+      const variables = initializedJob.requires_github_token
         ? await fetchActionsVariables(
             this.env,
-            job.installation_id,
-            job.repository.owner,
-            job.repository.name,
-            eventRepositoryOwnerType(this.eventPayload(job.id)) ===
+            initializedJob.installation_id,
+            initializedJob.repository.owner,
+            initializedJob.repository.name,
+            eventRepositoryOwnerType(this.eventPayload(initializedJob.id)) ===
               "Organization",
           )
-        : job.variables;
-      let initializedJob = { ...job, variables };
-      if (job.report_to_github) {
+        : initializedJob.variables;
+      initializedJob = { ...initializedJob, variables };
+      if (initializedJob.report_to_github) {
         const checkRunId = await createCheckRun(
           this.env,
           initializedJob,
@@ -667,6 +718,35 @@ export class Workspace extends DurableObject<Cloudflare.Env> {
     if (stored !== workspaceId) {
       throw new Error("workspace ID does not match Durable Object identity");
     }
+  }
+
+  private completeInitializingJob(
+    row: JobRow,
+    conclusion: Extract<Conclusion, "failure" | "neutral">,
+    summary: string,
+  ): void {
+    const completed = this.ctx.storage.sql
+      .exec<{ id: string }>(
+        `UPDATE jobs SET status = 'completed', completed_at = ?,
+           conclusion = ?, summary = ?, check_sync_needed = 0,
+           last_error = ?, initialization_needed = 0,
+           initialization_retry_at = NULL
+         WHERE id = ? AND status = 'queued' AND initialization_needed = 2
+         RETURNING id`,
+        Date.now(),
+        conclusion,
+        summary,
+        summary,
+        row.id,
+      )
+      .toArray();
+    if (completed.length === 0) return;
+    this.broadcast("job_finished", {
+      job_id: row.id,
+      agent_id: null,
+      conclusion,
+      summary,
+    });
   }
 
   private workspaceId(): string {
@@ -2044,12 +2124,15 @@ function publicAgent(hello: AgentHello): Record<string, unknown> {
 }
 
 function publicJob(job: QueuedJob): Record<string, unknown> {
+  const executionSha = job.pull_request.merge_sha ?? job.pull_request.head_sha;
   return {
     id: job.id,
     workspace_id: job.workspace_id,
     repository: `${job.repository.owner}/${job.repository.name}`,
     pull_request: job.pull_request.number,
-    head_sha: job.pull_request.head_sha,
+    head_sha: executionSha,
+    execution_sha: executionSha,
+    pull_request_head_sha: job.pull_request.head_sha,
     check_run_id: job.check_run_id,
   };
 }

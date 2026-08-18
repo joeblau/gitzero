@@ -3,7 +3,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 pub const MAX_RUNNER_LABELS: usize = 32;
 pub const MAX_RUNNER_REQUIREMENTS: usize = 512;
 pub const MAX_RUNNER_SELECTOR_BYTES: usize = 256;
@@ -44,6 +44,7 @@ pub struct PullRequestSpec {
     pub action: String,
     pub head_sha: String,
     pub base_sha: String,
+    pub merge_sha: String,
     pub head_ref: String,
     pub base_ref: String,
 }
@@ -330,6 +331,7 @@ mod tests {
         };
         let json = serde_json::to_string(&message).expect("serialize");
         assert!(json.contains(r#""type":"run_job""#));
+        assert!(json.contains(r#""merge_sha":"1111111111111111111111111111111111111111""#));
         let decoded: ServerMessage = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded, message);
 
@@ -471,6 +473,7 @@ mod tests {
                 action: "opened".into(),
                 head_sha: "0123456789012345678901234567890123456789".into(),
                 base_sha: "abcdefabcdefabcdefabcdefabcdefabcdefabcd".into(),
+                merge_sha: "1111111111111111111111111111111111111111".into(),
                 head_ref: "feature".into(),
                 base_ref: "main".into(),
             },

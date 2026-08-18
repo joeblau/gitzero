@@ -17,6 +17,7 @@ describe("GitHub webhook ingestion", () => {
       pull_request: {
         number: 42,
         draft: false,
+        merge_commit_sha: "3".repeat(40),
         title: "Preserve webhook metadata",
         labels: [{ name: "ci" }],
         head: {
@@ -44,6 +45,7 @@ describe("GitHub webhook ingestion", () => {
           name: "widget",
           clone_url: "https://github.com/acme/widget.git",
         },
+        pull_request: expect.objectContaining({ merge_sha: "3".repeat(40) }),
       },
     });
     expect(parsed.job.event).toEqual(event);

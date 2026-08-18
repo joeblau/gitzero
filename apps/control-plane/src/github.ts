@@ -71,6 +71,16 @@ const checkRunAnnotationsSchema = z.array(
   }),
 );
 
+const pullRequestMergeSchema = z.object({
+  head: z.object({ sha: z.string().regex(/^[0-9a-fA-F]{40}$/) }),
+  base: z.object({ sha: z.string().regex(/^[0-9a-fA-F]{40}$/) }),
+  mergeable: z.boolean().nullable(),
+  merge_commit_sha: z
+    .string()
+    .regex(/^[0-9a-fA-F]{40}$/)
+    .nullable(),
+});
+
 type ActionsVariable = z.infer<
   typeof actionsVariablePageSchema
 >["variables"][number];
@@ -85,6 +95,16 @@ export interface RepositoryOnboardingEvidence {
   actions: RepositoryActionsPermissions;
   check_run: RepositoryCheckRun | null;
 }
+
+export type PullRequestMergeSnapshot =
+  | { status: "ready"; merge_sha: string }
+  | { status: "pending" }
+  | { status: "conflicted" }
+  | {
+      status: "changed";
+      current_head_sha: string;
+      current_base_sha: string;
+    };
 
 export async function validateGitHubAppCredentials(
   env: GitHubEnvironment,
@@ -105,6 +125,7 @@ export async function createCheckRun(
   job: QueuedJob,
   recoverExisting = false,
 ): Promise<number> {
+  const executionSha = jobExecutionSha(job);
   const token = await createCheckToken(
     env,
     job.installation_id,
@@ -122,7 +143,7 @@ export async function createCheckRun(
       await githubRequest(
         env,
         token,
-        `${repositoryPath}/commits/${encodeURIComponent(job.pull_request.head_sha)}/check-runs?${query.toString()}`,
+        `${repositoryPath}/commits/${encodeURIComponent(executionSha)}/check-runs?${query.toString()}`,
         { method: "GET" },
       ),
     );
@@ -130,8 +151,7 @@ export async function createCheckRun(
       (checkRun) =>
         checkRun.name === "GitZero" &&
         checkRun.external_id === job.id &&
-        checkRun.head_sha.toLowerCase() ===
-          job.pull_request.head_sha.toLowerCase(),
+        checkRun.head_sha.toLowerCase() === executionSha.toLowerCase(),
     );
     if (existing) return existing.id;
   }
@@ -141,7 +161,7 @@ export async function createCheckRun(
     method: "POST",
     body: JSON.stringify({
       name: "GitZero",
-      head_sha: job.pull_request.head_sha,
+      head_sha: executionSha,
       status: "queued",
       external_id: job.id,
       output: {
@@ -420,6 +440,49 @@ export async function createPrivateCheckoutToken(
   return createInstallationToken(env, installationId, targetRepository, {
     contents: "read",
   });
+}
+
+export async function fetchPullRequestMergeSnapshot(
+  env: GitHubEnvironment,
+  installationId: number,
+  owner: string,
+  repository: string,
+  pullRequestNumber: number,
+  expectedHeadSha: string,
+  expectedBaseSha: string,
+): Promise<PullRequestMergeSnapshot> {
+  if (!Number.isSafeInteger(pullRequestNumber) || pullRequestNumber <= 0) {
+    throw new Error("a positive pull request number is required");
+  }
+  const token = await createInstallationToken(env, installationId, repository, {
+    pull_requests: "read",
+  });
+  const repositoryPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}`;
+  const pullRequest = pullRequestMergeSchema.parse(
+    await githubRequest(
+      env,
+      token,
+      `${repositoryPath}/pulls/${pullRequestNumber}`,
+      { method: "GET" },
+    ),
+  );
+  if (
+    pullRequest.head.sha.toLowerCase() !== expectedHeadSha.toLowerCase() ||
+    pullRequest.base.sha.toLowerCase() !== expectedBaseSha.toLowerCase()
+  ) {
+    return {
+      status: "changed",
+      current_head_sha: pullRequest.head.sha,
+      current_base_sha: pullRequest.base.sha,
+    };
+  }
+  if (pullRequest.mergeable === false) {
+    return { status: "conflicted" };
+  }
+  if (pullRequest.mergeable === null || pullRequest.merge_commit_sha === null) {
+    return { status: "pending" };
+  }
+  return { status: "ready", merge_sha: pullRequest.merge_commit_sha };
 }
 
 function validateCrossRepositoryTarget(
@@ -770,6 +833,14 @@ function githubConclusion(conclusion: Conclusion): string {
     case "timed_out":
       return "timed_out";
   }
+}
+
+function jobExecutionSha(job: QueuedJob): string {
+  const mergeSha = job.pull_request.merge_sha;
+  if (mergeSha === null) {
+    throw new Error("pull request merge snapshot is not initialized");
+  }
+  return mergeSha;
 }
 
 function normalizePrivateKeyPem(value: string): string {

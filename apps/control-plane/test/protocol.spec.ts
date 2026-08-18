@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { agentMessageSchema } from "../src/protocol";
+import {
+  PROTOCOL_VERSION,
+  agentMessageSchema,
+  queuedJobSchema,
+  runSpecSchema,
+} from "../src/protocol";
 
 const baseRequest = {
   type: "workflow_token_request" as const,
@@ -9,6 +14,40 @@ const baseRequest = {
 };
 
 describe("agent protocol", () => {
+  it("requires protocol v10 run assignments to carry an exact merge snapshot", () => {
+    expect(PROTOCOL_VERSION).toBe(10);
+    const queued = queuedJobSchema.parse({
+      id: "11111111-1111-4111-8111-111111111111",
+      workspace_id: "7001",
+      installation_id: 7001,
+      repository: {
+        owner: "acme",
+        name: "widget",
+        clone_url: "https://github.com/acme/widget.git",
+      },
+      pull_request: {
+        number: 42,
+        action: "synchronize",
+        head_sha: "1".repeat(40),
+        base_sha: "2".repeat(40),
+        head_ref: "feature/merge-snapshot",
+        base_ref: "main",
+      },
+      check_run_id: null,
+    });
+    expect(queued.pull_request.merge_sha).toBeNull();
+    const run = {
+      ...queued,
+      pull_request: { ...queued.pull_request, merge_sha: "3".repeat(40) },
+      checkout_token: "checkout-token",
+      github_api_version: "2022-11-28",
+    };
+    expect(runSpecSchema.parse(run).pull_request.merge_sha).toBe(
+      "3".repeat(40),
+    );
+    expect(runSpecSchema.safeParse(queued).success).toBe(false);
+  });
+
   it("requires an explicit bounded repository token purpose", () => {
     const request = {
       type: "repository_token_request",

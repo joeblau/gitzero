@@ -43,6 +43,11 @@ const webhookSchema = z.object({
   pull_request: z.object({
     number: z.number().int().positive(),
     draft: z.boolean().nullable(),
+    merge_commit_sha: z
+      .string()
+      .regex(/^[0-9a-fA-F]{40}$/)
+      .nullable()
+      .optional(),
     head: z.object({ sha: z.string(), ref: z.string().min(1) }),
     base: z.object({ sha: z.string(), ref: z.string().min(1) }),
   }),
@@ -299,6 +304,7 @@ export function createGitHubWebhookJob(input: unknown): {
       action: payload.action,
       head_sha: payload.pull_request.head.sha,
       base_sha: payload.pull_request.base.sha,
+      merge_sha: payload.pull_request.merge_commit_sha ?? null,
       head_ref: payload.pull_request.head.ref,
       base_ref: payload.pull_request.base.ref,
     },

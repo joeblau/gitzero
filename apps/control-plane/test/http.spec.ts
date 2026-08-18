@@ -122,6 +122,7 @@ describe("HTTP entrypoint", () => {
       pull_request: {
         number: 42,
         draft: false,
+        merge_commit_sha: "3".repeat(40),
         head: { sha: "1".repeat(40), ref: "feature/fast-ack" },
         base: { sha: "2".repeat(40), ref: "main" },
       },
@@ -351,7 +352,7 @@ describe("HTTP entrypoint", () => {
       JSON.stringify({
         type: "hello",
         hello: {
-          protocol_version: 9,
+          protocol_version: 10,
           agent_id: "readiness-mini",
           name: "readiness-mini",
           version: "0.1.0",
@@ -380,6 +381,7 @@ describe("HTTP entrypoint", () => {
             action: "opened",
             head_sha: headSha,
             base_sha: "4".repeat(40),
+            merge_sha: headSha,
             head_ref: "feature/readiness",
             base_ref: "main",
           },
